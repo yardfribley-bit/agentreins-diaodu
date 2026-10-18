@@ -32,9 +32,9 @@ class ChatAPI(unittest.TestCase):
         self.assertEqual(self.req('GET',file['url'],user=1,binary=True)[1],b'secretvideo')
         status,reply=self.req('POST',path+'/chat',{'text':'回复','reply_to':message['id']},user=1)
         self.assertEqual(status,201)
-        status,data=self.req('GET',path+'/chat?after=1',user=0)
+        status,data=self.req('GET',path+'/chat?after=2',user=0)
         self.assertEqual(len(data['messages']),1)
-        self.assertEqual(data['next_cursor'],2)
+        self.assertEqual(data['next_cursor'],3)
         self.assertEqual(self.req('POST',path+'/chat',{'text':'坏引用','reply_to':'missing'},user=1)[0],400)
 
     def test_run_join_membership_is_instance_bound(self):

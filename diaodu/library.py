@@ -121,6 +121,8 @@ class Library:
             task["entries"][-1].update(status=status, remaining=remaining, next_step=next_step,
                                        references=references, request_id=request_id, request_payload=payload, identity=actor)
             task["updated"] = now()
+            from diaodu.chat import system
+            system(task, name+" 提交了成果 "+task["entries"][-1]["id"],task["entries"][-1]["id"])
             self._save(data)
             return self._public(task)
 
@@ -265,6 +267,7 @@ def _public(task: dict) -> dict:
         "cursor": len(task["entries"]),
         "id": task["id"],
         "number": task["number"],
+        "title": task.get("title") or task["requirement"].split("\n")[0][:40],
         "requirement": task["requirement"],
         "status": task["status"],
         "created": task["created"],
@@ -287,6 +290,7 @@ def _public(task: dict) -> dict:
                 "next_step": item.get("next_step", ""),
                 "references": item.get("references", []),
                 "request_id": item.get("request_id"),
+                "review": item.get("review", {"state": "pending", "note": "", "at": None}) if item["kind"]=="report" else None,
             }
             for index, item in enumerate(task["entries"])
         ],
@@ -295,7 +299,7 @@ def _public(task: dict) -> dict:
     columns = {}
     for entry in shown["entries"]:
         actor = entry.get("identity")
-        key = actor["agent_id"] if actor else "legacy_" + entry["id"]
+        key = (actor.get("agent_id") or actor.get("user_id")) if actor else "legacy_" + entry["id"]
         column = columns.setdefault(key, {"column_id": key, "identity": actor,
             "entry_ids": [], "latest_entry_id": None, "latest_report_id": None,
             "status": None, "attachments": []})

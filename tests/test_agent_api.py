@@ -19,7 +19,7 @@ class AgentAPI(unittest.TestCase):
   _,context=self.req('GET',path+'/context',agent=0)
   self.assertEqual(context['columns'][0]['latest_report']['text'],'done')
   self.assertEqual(len(context['chat']['mentions_me']),1)
-  _,updates=self.req('GET',path+'/updates?entry_after=1&chat_after=2',agent=0)
+  _,updates=self.req('GET',path+'/updates?entry_after=1&chat_after='+str(context['chat']['next_cursor']),agent=0)
   self.assertEqual(updates['entries'],[]);self.assertEqual(updates['chat']['messages'],[])
   _,other=self.req('GET',path+'/context',agent=1);self.assertIsNone(other['chat'])
   self.assertEqual(self.req('GET',path+'/updates?chat_after=1',agent=1)[0],403)

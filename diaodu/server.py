@@ -112,6 +112,12 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             if parsed.path == "/":
                 self._file(STATIC / "index.html")
                 return
+            if parsed.path == "/share.png":
+                self._file(STATIC / "share.png")
+                return
+            if parsed.path == "/favicon.svg":
+                self._file(STATIC / "favicon.svg")
+                return
             if parsed.path == "/style.css":
                 self._file(STATIC / "style.css")
                 return
@@ -210,6 +216,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
 
         def _v1_get(self, parsed):
             try:
+                if parsed.path=="/v1/mcp":
+                    self._json(405,{"name":"diaodu","version":"2026.10.19","transport":"Streamable HTTP JSON","method":"POST","guide":library.public_base_path+"/v1/agent-guide.md"},{"Allow":"POST"})
+                    return
                 base_url=(public_origin or ("http://"+self.headers.get("Host","localhost")))+library.public_base_path+"/v1"
                 if parsed.path in ("/v1/discover","/v1/tasks.md","/v1/agent-guide.md"):
                     query=parse_qs(parsed.query)
@@ -298,6 +307,19 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
         def _v1_post(self, parts):
             try:
                 self._origin()
+                if parts==["v1","mcp"]:
+                    from diaodu import mcp
+                    length=int(self.headers.get("Content-Length","0"))
+                    if length<0 or length>15*1024*1024:raise ValueError("MCP请求最大15MB")
+                    body=json.loads(self.rfile.read(length))
+                    if not isinstance(body,dict):raise ValueError("JSON-RPC请求须为对象")
+                    actor=self._actor(mutation=True) if self.headers.get("Authorization") or self.headers.get("Cookie") else None
+                    base=(public_origin or ("http://"+self.headers.get("Host","localhost")))+library.public_base_path+"/v1"
+                    result,sid=mcp.handle(body,self.headers.get("Mcp-Session-Id"),actor,identity,library,base,lambda:identity.throttle(self.headers.get("X-Real-IP",self.client_address[0])))
+                    if result is None:
+                        self.send_response(202);self.send_header("Content-Length","0");self.end_headers()
+                    else:self._json(200,result,{"Mcp-Session-Id":sid} if sid else None)
+                    return
                 if parts[:2] == ["v1", "auth"] and len(parts) == 3 and parts[2] in ("register", "login"):
                     identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]) if public_origin else self.client_address[0])
                     body = self._body()
@@ -311,19 +333,25 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if parts == ["v1", "connect"]:
                     identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]) if public_origin else self.client_address[0])
                     body = self._body()
-                    result = identity.connect(body.get("alias"),body.get("agent_type","访客"))
+                    result = identity.connect(body.get("alias"),body.get("agent_type","访客"),body.get("member_kind","agent"))
                     result["csrf"] = digest("csrf:"+result["token"])
                     self._json(201,result,{"Set-Cookie":self._cookie(result["token"])})
                     return
                 actor = self._actor(mutation=True)
                 if len(parts) >= 3 and parts[:2] == ["v1", "tasks"]:
                     parts[2] = library.read_task(parts[2])["id"]
+                if len(parts)==6 and parts[:2]==["v1","tasks"] and parts[3]=="entries" and parts[5]=="review":
+                    self._json(200,chat.review(library,parts[2],parts[4],actor,self._body()))
+                    return
                 if len(parts) == 4 and parts[:2] == ["v1", "tasks"] and parts[3] == "join":
                     self._json(200,chat.join(library,parts[2],actor))
                     return
                 if len(parts) >= 4 and parts[:2] == ["v1", "tasks"] and parts[3] == "chat":
                     if len(parts) == 4:
                         self._json(201,chat.post(library,parts[2],actor,self._body()))
+                        return
+                    if len(parts)==6 and parts[5] in ("pin","promote"):
+                        self._json(200,chat.action(library,parts[2],parts[4],actor,parts[5]))
                         return
                     if len(parts) == 5 and parts[4] == "files":
                         chat.read(library,parts[2],actor)

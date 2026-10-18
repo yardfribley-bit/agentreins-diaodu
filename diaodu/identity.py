@@ -50,6 +50,8 @@ class Identity:
             CREATE TABLE IF NOT EXISTS attempts (
               key TEXT PRIMARY KEY, count INTEGER NOT NULL, started REAL NOT NULL);
             ''')
+            columns={r[1] for r in db.execute('PRAGMA table_info(agents)')}
+            if 'member_kind' not in columns: db.execute("ALTER TABLE agents ADD COLUMN member_kind TEXT NOT NULL DEFAULT 'agent'")
         path.chmod(0o600)
 
     @contextmanager
@@ -120,7 +122,7 @@ class Identity:
         name, agent_type = text(name, "实例名称", 60), text(agent_type, "工具类型", 40)
         token, agent_id = "da_"+secrets.token_urlsafe(32), "ag_"+secrets.token_hex(12)
         with self.db() as db:
-            db.execute("INSERT INTO agents VALUES (?,?,?,?,?,0,?)", (agent_id,user_id,name,agent_type,digest(token),time.time()))
+            db.execute("INSERT INTO agents (id,user_id,name,type,token_hash,revoked,created) VALUES (?,?,?,?,?,0,?)", (agent_id,user_id,name,agent_type,digest(token),time.time()))
         return {"agent_id": agent_id, "user_id":user_id, "agent_name":name,"agent_type":agent_type,"token":token}
 
     def agents(self, user_id):
@@ -137,14 +139,15 @@ class Identity:
 
     def agent(self, token):
         with self.db() as db:
-            row = db.execute("SELECT a.id agent_id,a.name agent_name,a.type agent_type,u.id user_id,u.display_name user_name,u.username FROM agents a JOIN users u ON u.id=a.user_id WHERE a.token_hash=? AND a.revoked=0", (digest(token),)).fetchone()
+            row = db.execute("SELECT a.id agent_id,a.name agent_name,a.type agent_type,a.member_kind,u.id user_id,u.display_name user_name,u.username FROM agents a JOIN users u ON u.id=a.user_id WHERE a.token_hash=? AND a.revoked=0", (digest(token),)).fetchone()
         if not row:
             raise AuthError("智能体凭证无效或已撤销")
         result=dict(row, kind="agent")
         result["guest"] = result.pop("username").startswith("__guest_")
         return result
 
-    def connect(self, alias, agent_type="访客"):
+    def connect(self, alias, agent_type="访客", member_kind="agent"):
+        if member_kind not in ("human","agent"): raise ValueError("member_kind 必须为 human 或 agent")
         alias = text(alias, "别名", 60)
         agent_type = text(agent_type, "工具类型", 40)
         user_id = "us_" + secrets.token_hex(12)
@@ -152,7 +155,8 @@ class Identity:
         token = "da_" + secrets.token_urlsafe(32)
         with self.db() as db:
             db.execute("INSERT INTO users VALUES (?,?,?,?,?,?)", (user_id,"__guest_"+secrets.token_hex(16),alias,secrets.token_hex(16),"disabled",time.time()))
-            db.execute("INSERT INTO agents VALUES (?,?,?,?,?,0,?)", (agent_id,user_id,alias,agent_type,digest(token),time.time()))
+            db.execute("INSERT INTO agents (id,user_id,name,type,token_hash,revoked,created) VALUES (?,?,?,?,?,0,?)", (agent_id,user_id,alias,agent_type,digest(token),time.time()))
+        with self.db() as db: db.execute("UPDATE agents SET member_kind=? WHERE id=?",(member_kind,agent_id))
         return dict(self.agent(token), token=token)
 
     def rename(self, actor, alias):
