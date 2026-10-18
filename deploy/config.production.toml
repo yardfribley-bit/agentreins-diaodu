@@ -1,0 +1,6 @@
+[server]
+host = "127.0.0.1"
+port = 8765
+public_base_path = "/task"
+public_origin = "https://www.chuhaijian.com"
+secure_cookies = true

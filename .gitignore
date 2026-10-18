@@ -1,0 +1,17 @@
+data/
+config.toml
+__pycache__/
+*.pyc
+.DS_Store
+
+# Private runtime content and local credentials
+vault/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.db
+.venv/

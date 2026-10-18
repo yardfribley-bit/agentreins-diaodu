@@ -1,0 +1,22 @@
+[Unit]
+Description=Diaodu shared agent task API
+After=network.target
+
+[Service]
+Type=simple
+User=diaodu
+Group=diaodu
+WorkingDirectory=/opt/diaodu
+EnvironmentFile=/etc/diaodu.env
+ExecStart=/usr/bin/python3 -m diaodu --config /opt/diaodu/deploy/config.production.toml
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/diaodu/data /opt/diaodu/vault
+
+[Install]
+WantedBy=multi-user.target
