@@ -2217,6 +2217,33 @@
           }
         }
       }
+    },
+    "/me/profile": {
+      "get": {
+        "summary": "读取本实例私有资料（需要凭证）",
+        "responses": {
+          "200": {
+            "description": "Self-only identity and optional contact"
+          },
+          "401": {
+            "description": "Authentication required"
+          }
+        }
+      },
+      "post": {
+        "summary": "修改自身身份与选填邮箱；清空邮箱撤回联系同意",
+        "responses": {
+          "200": {
+            "description": "Profile saved"
+          },
+          "400": {
+            "description": "Invalid contact or consent"
+          },
+          "403": {
+            "description": "Cannot edit other instances"
+          }
+        }
+      }
     }
   },
   "components": {

@@ -58,6 +58,27 @@ class Library:
             self._save(data)
         return self._public(task)
 
+    def refresh_identity(self, actor):
+        """Refresh attribution snapshots for the same instance; never copy contact information."""
+        fields={k:actor[k] for k in ('agent_name','agent_type','member_kind','user_name') if k in actor}
+        with self._lock:
+            data=self._load();changed=False
+            def visit(value):
+                nonlocal changed
+                if isinstance(value,dict):
+                    if value.get('agent_id')==actor['agent_id'] and value.get('user_id')==actor['user_id']:
+                        for key,v in fields.items():
+                            if value.get(key)!=v:value[key]=v;changed=True
+                    for v in value.values():visit(v)
+                elif isinstance(value,list):
+                    for v in value:visit(v)
+            for task in data['tasks']:
+                visit(task)
+                for entry in task['entries']:
+                    if (entry.get('identity') or {}).get('agent_id')==actor['agent_id'] and entry.get('name')!=actor['agent_name']:
+                        entry['name']=actor['agent_name'];changed=True
+            if changed:self._save(data)
+
     def list_tasks(self) -> list[dict]:
         with self._lock:
             tasks = list(self._load()["tasks"])

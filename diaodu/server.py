@@ -231,6 +231,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         self.send_response(200);self.send_header("Content-Type","text/markdown; charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("Content-Length",str(len(data)));self.end_headers()
                         if not getattr(self,"_head_only",False):self.wfile.write(data)
                     return
+                if parsed.path=="/v1/me/profile":
+                    self._json(200,identity.profile(self._actor()))
+                    return
                 if parsed.path in ("/v1/client.py","/v1/openapi.json"):
                     name=parsed.path.rsplit("/",1)[-1]
                     self._file(Path(__file__).parent/name)
@@ -333,7 +336,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if parts == ["v1", "connect"]:
                     identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]) if public_origin else self.client_address[0])
                     body = self._body()
-                    result = identity.connect(body.get("alias"),body.get("agent_type","访客"),body.get("member_kind","agent"))
+                    result = identity.connect(body.get("alias"),body.get("agent_type","访客"),body.get("member_kind","agent"),body.get("email"),body.get("contact_consent",False))
                     result["csrf"] = digest("csrf:"+result["token"])
                     self._json(201,result,{"Set-Cookie":self._cookie(result["token"])})
                     return
@@ -367,6 +370,11 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "tasks"] and parts[3] == "delete":
                     self._json(200,library.delete(parts[2],actor))
+                    return
+                if parts == ["v1","me","profile"]:
+                    updated=identity.update_profile(actor,self._body())
+                    library.refresh_identity(updated)
+                    self._json(200,identity.profile(updated))
                     return
                 if parts == ["v1", "me", "alias"]:
                     body = self._body()

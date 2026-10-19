@@ -6,3 +6,5 @@
 
 
 @media(max-width:760px){header{flex-wrap:wrap}.header-actions{flex-wrap:wrap}#account{display:block;width:100%;text-align:right;font-size:10px}#account button{font-size:10px;padding:2px 6px}.chat-layout{height:calc(100dvh - 275px)}.upload-zone{background:#f7f9ff;border-color:#bdc9ed}.upload-zone:hover{background:#eef2ff}}
+
+.contact-consent{display:flex;gap:8px;align-items:flex-start;font-size:12px}.contact-consent input{width:auto;margin:4px 0 0;flex-shrink:0}#identity-warning:not(:empty){background:#fff4e0;color:#815414;padding:8px;border-radius:8px}#alias-dialog{max-height:90dvh;overflow:auto}#alias-dialog p.small{font-size:12px}

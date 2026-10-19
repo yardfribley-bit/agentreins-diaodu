@@ -1,6 +1,7 @@
 """Credential-backed users, agent instances and execution IDs."""
 from __future__ import annotations
 import hashlib
+import re
 import hmac
 import secrets
 import sqlite3
@@ -52,6 +53,7 @@ class Identity:
             ''')
             columns={r[1] for r in db.execute('PRAGMA table_info(agents)')}
             if 'member_kind' not in columns: db.execute("ALTER TABLE agents ADD COLUMN member_kind TEXT NOT NULL DEFAULT 'agent'")
+            db.execute("CREATE TABLE IF NOT EXISTS contacts (agent_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, email TEXT NOT NULL, purpose TEXT NOT NULL, consent_at REAL NOT NULL)")
         path.chmod(0o600)
 
     @contextmanager
@@ -146,7 +148,8 @@ class Identity:
         result["guest"] = result.pop("username").startswith("__guest_")
         return result
 
-    def connect(self, alias, agent_type="访客", member_kind="agent"):
+    def connect(self, alias, agent_type="访客", member_kind="agent", email=None, contact_consent=False):
+        contact_email = validate_contact(email, contact_consent)
         if member_kind not in ("human","agent"): raise ValueError("member_kind 必须为 human 或 agent")
         alias = text(alias, "别名", 60)
         agent_type = text(agent_type, "工具类型", 40)
@@ -157,6 +160,8 @@ class Identity:
             db.execute("INSERT INTO users VALUES (?,?,?,?,?,?)", (user_id,"__guest_"+secrets.token_hex(16),alias,secrets.token_hex(16),"disabled",time.time()))
             db.execute("INSERT INTO agents (id,user_id,name,type,token_hash,revoked,created) VALUES (?,?,?,?,?,0,?)", (agent_id,user_id,alias,agent_type,digest(token),time.time()))
         with self.db() as db: db.execute("UPDATE agents SET member_kind=? WHERE id=?",(member_kind,agent_id))
+        if contact_email:
+            with self.db() as db: db.execute("INSERT INTO contacts VALUES (?,?,?,?,?)",(agent_id,user_id,contact_email,"task_followup",time.time()))
         return dict(self.agent(token), token=token)
 
     def rename(self, actor, alias):
@@ -167,6 +172,27 @@ class Identity:
             db.execute("UPDATE agents SET name=? WHERE id=?",(alias,actor["agent_id"]))
             db.execute("UPDATE users SET display_name=? WHERE id=?",(alias,actor["user_id"]))
         return dict(actor, user_name=alias, agent_name=alias)
+
+    def profile(self, actor):
+        if actor.get("kind")!="agent":raise AuthError("需要实例凭证",403)
+        with self.db() as db:
+            row=db.execute("SELECT email,consent_at FROM contacts WHERE agent_id=?",(actor["agent_id"],)).fetchone()
+        return {"alias":actor["agent_name"],"agent_type":actor["agent_type"],"member_kind":actor.get("member_kind","agent"),"email":row["email"] if row else "","contact_consent":bool(row),"email_verified":False,"visibility":"self_and_platform_only"}
+
+    def update_profile(self, actor, body):
+        if actor.get("kind")!="agent" or not actor.get("guest"):raise AuthError("仅可修改自己的免注册实例",403)
+        alias=text(body.get("alias",actor["agent_name"]),"别名",60)
+        kind=body.get("member_kind",actor.get("member_kind","agent"))
+        if kind not in ("human","agent"):raise ValueError("请选择人或智能体")
+        tool=text(body.get("agent_type",actor["agent_type"]),"工具类型",40)
+        email=validate_contact(body.get("email"),body.get("contact_consent"))
+        with self.db() as db:
+            db.execute("UPDATE agents SET name=?,type=?,member_kind=? WHERE id=? AND user_id=?",(alias,tool,kind,actor["agent_id"],actor["user_id"]))
+            db.execute("UPDATE users SET display_name=? WHERE id=?",(alias,actor["user_id"]))
+            if "email" in body:
+                if email:db.execute("INSERT INTO contacts VALUES (?,?,?,?,?) ON CONFLICT(agent_id) DO UPDATE SET email=excluded.email, consent_at=excluded.consent_at",(actor["agent_id"],actor["user_id"],email,"task_followup",time.time()))
+                else:db.execute("DELETE FROM contacts WHERE agent_id=?",(actor["agent_id"],))
+        return dict(actor,agent_name=alias,user_name=alias,agent_type=tool,member_kind=kind)
 
     def start_run(self, actor, task_id):
         run_id = "run_"+secrets.token_hex(16)
@@ -182,3 +208,12 @@ class Identity:
         if not row:
             raise AuthError("本次执行不属于该智能体或该任务",403)
         return dict(actor,run_id=run_id)
+
+
+def validate_contact(email, consent):
+    if email is None or email == "": return ""
+    if not isinstance(email,str) or len(email)>254:raise ValueError("邮箱格式不正确")
+    email=email.strip()
+    if not re.fullmatch(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+",email):raise ValueError("邮箱格式不正确")
+    if consent is not True:raise ValueError("请同意平台仅通过邮箱进行任务相关沟通，或不填邮箱")
+    return email
