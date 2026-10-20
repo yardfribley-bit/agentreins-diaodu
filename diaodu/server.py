@@ -7,6 +7,7 @@ import mimetypes
 import re
 import os
 import hmac
+import secrets
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -266,6 +267,8 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 parts = parsed.path.strip("/").split("/")
                 if len(parts) >= 3 and parts[:2] == ["v1", "tasks"]:
                     parts[2] = library.read_task(parts[2])["id"]
+                    if len(parts)==3 or (len(parts)==4 and parts[3]=='context'):
+                        library.attention.record(parts[2],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
                 if len(parts)==4 and parts[:2]==["v1","tasks"] and parts[3] in ("context","updates"):
                     actor=None
                     if self.headers.get("Authorization") or "diaodu_session=" in self.headers.get("Cookie",""):
@@ -319,6 +322,13 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     actor=self._actor(mutation=True) if self.headers.get("Authorization") or self.headers.get("Cookie") else None
                     base=(public_origin or ("http://"+self.headers.get("Host","localhost")))+library.public_base_path+"/v1"
                     result,sid=mcp.handle(body,self.headers.get("Mcp-Session-Id"),actor,identity,library,base,lambda:identity.throttle(self.headers.get("X-Real-IP",self.client_address[0])))
+                    if result and not result.get('error') and not result.get('result',{}).get('isError'):
+                        params=body.get('params') or {};task_ref=None
+                        if body.get('method')=='tools/call' and params.get('name')=='diaodu_read_task':task_ref=(params.get('arguments') or {}).get('task')
+                        if body.get('method')=='resources/read' and str(params.get('uri','')).startswith('diaodu://task/'):task_ref=params['uri'][len('diaodu://task/'):]
+                        if task_ref:
+                            task=library.read_task(task_ref)
+                            library.attention.record(task['id'],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
                     if result is None:
                         self.send_response(202);self.send_header("Content-Length","0");self.end_headers()
                     else:self._json(200,result,{"Mcp-Session-Id":sid} if sid else None)
@@ -339,6 +349,17 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     result = identity.connect(body.get("alias"),body.get("agent_type","访客"),body.get("member_kind","agent"),body.get("email"),body.get("contact_consent",False))
                     result["csrf"] = digest("csrf:"+result["token"])
                     self._json(201,result,{"Set-Cookie":self._cookie(result["token"])})
+                    return
+                if len(parts)==4 and parts[:2]==['v1','tasks'] and parts[3]=='view':
+                    task=library.read_task(parts[2])
+                    cookie=SimpleCookie();cookie.load(self.headers.get('Cookie',''))
+                    value=cookie.get('diaodu_visitor');visitor=value.value if value else ''
+                    if not re.fullmatch(r'[a-f0-9]{32}',visitor):visitor=secrets.token_hex(16)
+                    ua=self.headers.get('User-Agent','').lower()
+                    if not any(bot in ua for bot in ('bot','spider','crawler','curl','python','headless')):
+                        library.attention.record(task['id'],'browser',visitor)
+                    header=f"diaodu_visitor={visitor}; HttpOnly; SameSite=Lax; Path={library.public_base_path}/; Max-Age=31536000"+('; Secure' if secure_cookies else '')
+                    self._json(200,library.attention.stats(task['id']),{'Set-Cookie':header})
                     return
                 actor = self._actor(mutation=True)
                 if len(parts) >= 3 and parts[:2] == ["v1", "tasks"]:

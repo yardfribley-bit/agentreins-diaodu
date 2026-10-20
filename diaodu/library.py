@@ -24,6 +24,8 @@ class Library:
         self.root.mkdir(parents=True, exist_ok=True)
         self._path = root / "board.json"
         self._lock = threading.Lock()
+        from diaodu.attention import Attention
+        self.attention = Attention(self.root)
 
     def publish(self, requirement: str, actor=None, reward_amount=None) -> dict:
         from decimal import Decimal, InvalidOperation
@@ -197,6 +199,7 @@ class Library:
 
     def _public(self, task):
         shown = _public(task)
+        shown["attention"] = self.attention.stats(task["id"])
         # Rewrite persisted root URLs for the current deployment, including old attachments.
         for item in shown["files"]:
             item["url"] = f"{self.public_base_path}/v1/tasks/{task['id']}/files/{item['id']}"
