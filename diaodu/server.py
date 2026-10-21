@@ -364,6 +364,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 actor = self._actor(mutation=True)
                 if len(parts) >= 3 and parts[:2] == ["v1", "tasks"]:
                     parts[2] = library.read_task(parts[2])["id"]
+                if len(parts)==4 and parts[:2]==['v1','tasks'] and parts[3]=='workflow':
+                    from diaodu.workflow import update
+                    self._json(200,update(library,parts[2],actor,self._body()))
+                    return
                 if len(parts)==6 and parts[:2]==["v1","tasks"] and parts[3]=="entries" and parts[5]=="review":
                     self._json(200,chat.review(library,parts[2],parts[4],actor,self._body()))
                     return

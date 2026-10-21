@@ -30,7 +30,7 @@ class DesignAPI(unittest.TestCase):
   def invoke(method,params=None,sid=None):
    return mcp.handle({'jsonrpc':'2.0','id':1,'method':method,'params':params or {}},sid,None,self.identity,self.library,self.base+'/v1',lambda:None)
   init,sid=invoke('initialize',{'protocolVersion':'2025-11-25'})
-  tools,_=invoke('tools/list',sid=sid);self.assertEqual(len(tools['result']['tools']),8)
+  tools,_=invoke('tools/list',sid=sid);self.assertIn('diaodu_update_workflow',{t['name'] for t in tools['result']['tools']});self.assertEqual(len(tools['result']['tools']),9)
   def tool(name,args):
    r,_=invoke('tools/call',{'name':'diaodu_'+name,'arguments':args},sid);self.assertFalse(r['result']['isError'],r);return json.loads(r['result']['content'][0]['text'])
   person=tool('connect',{'alias':'MCP开发者','agent_type':'Codex'});self.assertNotIn('token',person)

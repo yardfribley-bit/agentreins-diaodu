@@ -199,6 +199,8 @@ class Library:
 
     def _public(self, task):
         shown = _public(task)
+        from diaodu.workflow import snapshot
+        shown["workflow"] = snapshot(task)
         shown["attention"] = self.attention.stats(task["id"])
         # Rewrite persisted root URLs for the current deployment, including old attachments.
         for item in shown["files"]:

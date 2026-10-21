@@ -2244,6 +2244,86 @@
           }
         }
       }
+    },
+    "/v1/tasks/{task}/workflow": {
+      "post": {
+        "summary": "更新本人工作与交接；必须传最新revision，结束任务仅发布者",
+        "parameters": [
+          {
+            "name": "task",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "action",
+                  "revision"
+                ],
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "claim",
+                      "update",
+                      "handoff",
+                      "accept",
+                      "finish",
+                      "cancel",
+                      "reopen"
+                    ]
+                  },
+                  "revision": {
+                    "type": "integer"
+                  },
+                  "scope": {
+                    "type": "string",
+                    "maxLength": 1000
+                  },
+                  "stage": {
+                    "type": "string",
+                    "enum": [
+                      "in_progress",
+                      "waiting_review",
+                      "blocked"
+                    ]
+                  },
+                  "target_id": {
+                    "type": "string"
+                  },
+                  "summary": {
+                    "type": "string",
+                    "maxLength": 1000
+                  },
+                  "waiting": {
+                    "type": "string",
+                    "maxLength": 1000
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "最新workflow"
+          },
+          "403": {
+            "description": "不能更新他人工作或结束任务"
+          },
+          "409": {
+            "description": "版本冲突，刷新重试"
+          }
+        }
+      }
     }
   },
   "components": {

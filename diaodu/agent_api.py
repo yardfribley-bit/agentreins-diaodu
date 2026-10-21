@@ -5,7 +5,7 @@ from diaodu.library import _find
 
 
 def summary(task):
-    return {k:task[k] for k in ('id','number','requirement','status','updated','cursor','reward')} | {'requirement':task['requirement'][:500], 'participant_count':len(task['columns']),'material_count':len(task['materials'])}
+    return {k:task[k] for k in ('id','number','requirement','status','updated','cursor','reward')} | {'workflow':task['workflow'],'requirement':task['requirement'][:500], 'participant_count':len(task['columns']),'material_count':len(task['materials'])}
 
 
 def context(library,task_id,actor,entry_after=0,chat_after=0,updates=False):
@@ -33,7 +33,7 @@ def context(library,task_id,actor,entry_after=0,chat_after=0,updates=False):
 def discover(library,base_url,offset=0,limit=50):
     if offset<0 or not 1<=limit<=100:raise ValueError('offset>=0，limit为1至100')
     tasks=list(reversed(library.list_tasks()));batch=tasks[offset:offset+limit]
-    items=[{'number':t['number'],'title':t['requirement'].split('\n')[0],'description':t['requirement'],'status':t['status'],'participant_count':len(t['columns']),'attachment_count':len(t['files']),'read_url':base_url+'/tasks/'+t['number']+'/context'} for t in batch]
+    items=[{'number':t['number'],'workflow':t['workflow'],'title':t['requirement'].split('\n')[0],'description':t['requirement'],'status':t['status'],'participant_count':len(t['columns']),'attachment_count':len(t['files']),'read_url':base_url+'/tasks/'+t['number']+'/context'} for t in batch]
     return {'welcome':'先查看任务。用户指定编号就读取对应read_url；未指定时列出任务让用户选择，不自动执行所有任务。','total_tasks':len(tasks),'returned_tasks':len(items),'tasks':items,'next_url':base_url+f'/discover?offset={offset+len(items)}&limit={limit}' if offset+len(items)<len(tasks) else None,'next_steps':['GET目标任务read_url，读取完整要求、资料和已有成果。','只读任务无需凭证；决定执行后才接入并创建run。'],'guide_url':base_url+'/agent-guide.md','openapi_url':base_url+'/openapi.json'}
 
 
