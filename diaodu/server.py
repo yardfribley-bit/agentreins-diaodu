@@ -68,9 +68,15 @@ def view(store, job: dict) -> dict:
     return shown
 
 
-def make_handler(service, library=None, identity=None, secure_cookies=False, public_origin=""):
+def make_handler(service, library=None, identity=None, secure_cookies=False, public_origin="", mailbox=None):
     if library is not None and identity is None:
         identity = Identity(library.root / "identity.sqlite3")
+    if library is not None:
+        from diaodu.mailbox import Mailbox
+        mailbox = mailbox or Mailbox(library.root)
+        library.mailbox = mailbox
+        from diaodu.outreach import Outreach
+        library.outreach = Outreach(mailbox,(public_origin or "http://127.0.0.1")+library.public_base_path,identity)
     class Handler(BaseHTTPRequestHandler):
         def _actor(self, mutation=False, kind=None):
             authorization = self.headers.get("Authorization", "")
@@ -121,6 +127,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 return
             if parsed.path == "/style.css":
                 self._file(STATIC / "style.css")
+                return
+            if parsed.path == "/mail.js":
+                self._file(STATIC / "mail.js")
                 return
             if parsed.path == "/app.js":
                 self._file(STATIC / "app.js")
@@ -232,6 +241,19 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         self.send_response(200);self.send_header("Content-Type","text/markdown; charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("Content-Length",str(len(data)));self.end_headers()
                         if not getattr(self,"_head_only",False):self.wfile.write(data)
                     return
+                if parsed.path=='/v1/mail/unsubscribe':
+                    self._json(200,library.outreach.unsubscribe(parse_qs(parsed.query).get('token',[''])[0]));return
+                if parsed.path.startswith('/v1/mail/'):
+
+                    actor=self._actor();query=parse_qs(parsed.query);owner=query.get('owner_id',[None])[0]
+                    if parsed.path=='/v1/mail/assignments':result=library.outreach.assignments(actor)
+                    elif parsed.path=='/v1/mail/outreach':result=library.outreach.status(actor,owner)
+                    elif parsed.path=='/v1/mail/status':result=dict(mailbox.status(actor),recommended_agent_id=os.environ.get('DIAODU_OUTREACH_AGENT_ID',''))
+                    elif parsed.path=='/v1/mail/inbox':result=mailbox.inbox(actor,owner,query.get('before',[None])[0])
+                    elif parsed.path=='/v1/mail/message':result=mailbox.read(actor,query.get('id',[''])[0],owner)
+                    elif parsed.path=='/v1/mail/outbox':result=mailbox.outbox(actor)
+                    else:raise ValueError('未知邮件地址')
+                    self._json(200,result);return
                 if parsed.path=="/v1/me/profile":
                     self._json(200,identity.profile(self._actor()))
                     return
@@ -313,6 +335,11 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
         def _v1_post(self, parts):
             try:
                 self._origin()
+                if parts==['v1','mail','unsubscribe']:
+                    length=int(self.headers.get('Content-Length','0'))
+                    if not 0<=length<=1024:raise ValueError('退订请求过大')
+                    self.rfile.read(length)
+                    self._json(200,library.outreach.unsubscribe(parse_qs(urlparse(self.path).query).get('token',[''])[0]));return
                 if parts==["v1","mcp"]:
                     from diaodu import mcp
                     length=int(self.headers.get("Content-Length","0"))
@@ -362,6 +389,26 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     self._json(200,library.attention.stats(task['id']),{'Set-Cookie':header})
                     return
                 actor = self._actor(mutation=True)
+                if parts[:2]==['v1','mail']:
+                    body=self._body(limit=8*1024*1024);mail_headers=None
+                    if parts==['v1','mail','connect']:
+                        result=mailbox.connect(actor,body)
+                        cookie=SimpleCookie(self.headers.get('Cookie',''));saved=cookie.get('diaodu_session')
+                        if saved and saved.value.startswith('da_'):mail_headers={'Set-Cookie':self._cookie(saved.value).replace('Max-Age=86400','Max-Age=31536000')}
+                    elif parts==['v1','mail','disconnect']:
+                        library.outreach.configure(actor,False)
+                        result=mailbox.disconnect(actor)
+                    elif parts==['v1','mail','grant']:
+                        with identity.db() as db:target=db.execute('SELECT id FROM agents WHERE id=? AND revoked=0',(body.get('agent_id'),)).fetchone()
+                        if not target:raise ValueError('实例不存在或已撤销')
+                        result=mailbox.grant(actor,body.get('agent_id'),body.get('allow'))
+                    elif parts==['v1','mail','outreach']:result=library.outreach.configure(actor,body.get('enabled'))
+                    elif parts==['v1','mail','leads']:result=library.outreach.add(actor,body)
+                    elif parts==['v1','mail','suppress']:result=library.outreach.remove(actor,body.get('lead_id'))
+                    elif parts==['v1','mail','drafts']:result=mailbox.draft(actor,body)
+                    elif len(parts)==5 and parts[2]=='drafts' and parts[4]=='send':result=mailbox.send(actor,parts[3],body.get('confirmed'))
+                    else:raise ValueError('未知邮件操作')
+                    self._json(200,result,mail_headers);return
                 if len(parts) >= 3 and parts[:2] == ["v1", "tasks"]:
                     parts[2] = library.read_task(parts[2])["id"]
                 if len(parts)==4 and parts[:2]==['v1','tasks'] and parts[3]=='workflow':
@@ -406,6 +453,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     self._json(200,identity.rename(actor,body.get("alias")))
                     return
                 if parts == ["v1", "auth", "logout"]:
+                    with mailbox.db() as db:has_mail=db.execute('SELECT 1 FROM accounts WHERE owner=?',((actor.get('agent_id') or actor['user_id']),)).fetchone()
+                    if has_mail:
+                        library.outreach.configure(actor,False)
+                        mailbox.disconnect(actor)
                     cookie = SimpleCookie(self.headers.get("Cookie", ""))
                     if actor["kind"] == "user":
                         identity.logout(cookie["diaodu_session"].value)
@@ -556,9 +607,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             except (KeyError, FileNotFoundError, ValueError) as exc:
                 self._json(404, {"error": str(exc)})
 
-        def _body(self) -> dict:
+        def _body(self, limit=1_200_000) -> dict:
             length = int(self.headers.get("Content-Length", "0"))
-            if length < 0 or length > 1_200_000:
+            if length < 0 or length > limit:
                 raise ValueError("请求过大")
             if length == 0:
                 return {}
@@ -599,5 +650,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
 
 def serve(service, host: str, port: int, library=None, identity=None, secure_cookies=False, public_origin=""):
     server = ThreadingHTTPServer((host, port), make_handler(service, library, identity, secure_cookies, public_origin))
+    if library is not None:library.outreach.start()
     print(f"任务 http://{host}:{port}", flush=True)
     server.serve_forever()

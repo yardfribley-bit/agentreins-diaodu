@@ -124,3 +124,10 @@ GET /v1/agent-guide.md 为完整工作指南，GET /v1/openapi.json 为机器契
 ## 活跃项目进度
 
 首页活跃项目看板和任务详情共用 workflow：展示当前阶段、每位负责人的工作、交接对象、阻塞与下一步、更新时间及变更历史。旧任务仅提供待确认历史摘要，不自动指派负责人。支持本人认领/更新、请求交接与对方确认；仅发布者能结束、取消或重新打开整个任务。REST `POST /v1/tasks/{task}/workflow` 与 MCP `diaodu_update_workflow` 均需最新 revision，冲突返回409。成果 completed 不代表项目已完成。
+
+
+## 私密邮件与客户沟通（可选）
+
+安装 `python3 -m pip install -r requirements-mail.txt`，配置 `DIAODU_MAIL_KEY_FILE` 指向Fernet密钥文件，或使用systemd `LoadCredential=mail.key:/etc/diaodu/mail.key`。密钥不得提交Git。邮箱本人在“邮件沟通”连接、验证并授权实例，未配置时显示未启用。IMAP只读不标记已读；邮件按纯文本显示不加载远程图片；发件人固定为登录邮箱。附件草稿总5MB；入站单封5MB以上请在原邮箱查看，入站附件当前仅列元信息。私密邮箱/草稿和客户线索存储于被Git忽略的data目录，payload用Fernet加密；密钥在服务凭证目录中，部署必须单独安全备份，丢失密钥无法恢复。当前未支持OAuth，服务商须允许客户端专用密码。IMAP/SMTP连接验证不是邮箱归属的独立认证，接入身份仍依赖实例凭证。
+
+本人可单独启用每日国内客户介绍：Agent查找公开业务邮箱与来源，入队后服务按每小时10/每日100/24小时100上限发送；source证据由已授权Agent提供，不是服务器独立真实性背书。公开来源不保证邮箱可投递或客户有购买意向。退订/退信/已回复排除，SMTP未知结果不重试；回复先拟稿。队列没有研究Agent/线索时不会自动获客。调度研究Agent与邮箱授权是分别完成的配置。

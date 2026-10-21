@@ -2324,6 +2324,235 @@
           }
         }
       }
+    },
+    "/v1/mail/status": {
+      "get": {
+        "summary": "本人私密邮箱连接状态",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/inbox": {
+      "get": {
+        "summary": "私密收件箱，每页20封；owner_id需明确授权，before为前页next_before",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/message": {
+      "get": {
+        "summary": "只读获取私密邮件纯文本；id=UIDVALIDITY.UID，不标记已读",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/outbox": {
+      "get": {
+        "summary": "本人私密草稿与发送记录",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/assignments": {
+      "get": {
+        "summary": "本人已获授权且启用的每日客户沟通任务",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/outreach": {
+      "get": {
+        "summary": "私密客户来源队列与发送状态",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      },
+      "post": {
+        "summary": "本人enabled布尔值明确启用或暂停每日100位国内客户自动介绍",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/connect": {
+      "post": {
+        "summary": "验证IMAP/SMTP并加密保存本人授权；email/provider/password/consent=true",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/disconnect": {
+      "post": {
+        "summary": "停止自动沟通并断开邮箱、清除凭证与草稿",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/grant": {
+      "post": {
+        "summary": "本人授权或撤销指定agent_id的读信拟稿权限；allow布尔值",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/drafts": {
+      "post": {
+        "summary": "创建私密草稿，request_id/to数组/subject/text；reply_id/attachments可选；不发送",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/leads": {
+      "post": {
+        "summary": "本人或获授权Agent提交公开业务邮箱来源、匹配理由和介绍文案",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/suppress": {
+      "post": {
+        "summary": "本人按lead_id排除后续联系",
+        "responses": {
+          "200": {
+            "description": "私密响应，不得转发到公开任务"
+          },
+          "401": {
+            "description": "需要实例凭证"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
+    },
+    "/v1/mail/drafts/{draft_id}/send": {
+      "post": {
+        "summary": "仅邮箱本人确认具体草稿发送，confirmed=true；accepted非送达，unknown禁止自动重试",
+        "parameters": [
+          {
+            "name": "draft_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "草稿与发送结果"
+          },
+          "403": {
+            "description": "不能发送他人的草稿"
+          }
+        }
+      }
     }
   },
   "components": {
