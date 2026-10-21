@@ -14,8 +14,8 @@ def snapshot(task):
  'en_d595e9da':('退回修复；含截图与 Codex 实测受阻项','建议 Cursor 继续修复；截图需 Mac 主人解锁'),
  'en_a24ff795':('最新部署已提交，申请复测','建议 Grok 复测，之后由发布者确认'),
  'en_161cea1c':('P0 代码已提交，真机验证未完成','真机测试负责人尚未确认')}
- summary,waiting=hints.get((latest or {}).get('id'),('已有交付记录，当前分工尚未确认' if latest else '等待参与者认领',(latest or {}).get('next_step','')))
- return {'revision':0,'stage':'unconfirmed','summary':summary,'waiting':waiting[:1000],'work':[],'history':[],'confirmed':False,'updated_at':(latest or {}).get('at',task['created']),'source_entry_id':(latest or {}).get('id')}
+ summary,waiting=hints.get((latest or {}).get('id'),((latest.get('text','').split('\n')[0][:240] or '已有交付记录，当前分工尚未确认') if latest else '等待参与者认领',(latest or {}).get('next_step','')))
+ return {'revision':0,'stage':'unconfirmed','summary':summary,'waiting':waiting[:1000],'work':[],'history':[],'confirmed':False,'updated_at':(latest or {}).get('at',task['created']),'source_entry_id':(latest or {}).get('id'),'source_actor':person((latest or {}).get('identity') or {})}
 def update(library,task_id,actor,body):
  if not isinstance(body,dict):raise ValueError('需要 JSON 对象')
  action=body.get('action');key=mid(actor)
