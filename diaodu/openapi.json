@@ -2553,6 +2553,22 @@
           }
         }
       }
+    },
+    "/v1/mail/reply": {
+      "post": {
+        "summary": "已明确开启enabled和auto_reply的邮箱，可自动答疑真实已联系客户；owner_id/reply_id/text，收件人不能另填，每人24小时最多3封",
+        "responses": {
+          "200": {
+            "description": "发送记录或停止联系状态"
+          },
+          "400": {
+            "description": "未授权、超限或不是已联系客户"
+          },
+          "403": {
+            "description": "邮箱未授权"
+          }
+        }
+      }
     }
   },
   "components": {

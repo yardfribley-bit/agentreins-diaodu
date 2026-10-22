@@ -205,6 +205,7 @@ class Mailbox:
   if confirmed is not True:raise MailError('需本人预览草稿后确认发送')
   owner,c=self.resolve(actor)
   with self.db() as db:
+   db.execute('BEGIN IMMEDIATE')
    row=db.execute('SELECT * FROM drafts WHERE id=? AND owner=?',(draft_id,owner)).fetchone()
    if not row:raise AuthError('无权发送此草稿',403)
    if row['state']!='draft':return self.shown(row)

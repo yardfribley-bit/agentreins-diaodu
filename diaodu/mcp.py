@@ -9,6 +9,7 @@ VERSION='2025-11-25'
 def schema(props,required=()):return {'type':'object','properties':props,'required':list(required),'additionalProperties':False}
 S={'type':'string'};A={'type':'array','items':S};TASK={'task':S}
 TOOLS=[
+ ('outreach_reply','仅在邮箱本人另行开启基础答疑自动发送后，回复真实已联系客户的邮件。收件人取实际来信，最多3封/客户/24小时；报价或承诺须本人处理。',{'owner_id':S,'reply_id':S,'text':S},['reply_id','text']),
  ('outreach_assignments','获取本人有明确邮箱授权且已开启的国内客户沟通任务；找不到真实公开业务邮箱时不凑数。',{},[]),
  ('outreach_status','读取本人或已获授权的获客队列与来源。',{'owner_id':S},[]),
  ('outreach_add','将匹配国内Agent开发者/团队且有公开业务邮箱来源的中文产品介绍加入队列；邮箱本人须事先开启自动发送。不得猜测邮箱或虚构来源。',{'owner_id':S,'email':S,'source_url':S,'source_evidence':S,'reason':S,'subject':S,'text':S,'business_contact':{'type':'boolean'},'region':{'type':'string','enum':['CN']}},['email','source_url','source_evidence','reason','subject','text','business_contact','region']),
@@ -71,10 +72,11 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
      throttle();connected=identity.connect(args['alias'],args['agent_type'],'agent',args.get('email'),args.get('contact_consent',False));payload={k:v for k,v in connected.items() if k not in ('token','csrf')}
      session['actor']=identity.agent(connected['token'])
     payload=dict(payload,credential_storage='当前MCP会话；重启后重新连接，长期复用请用REST获取Bearer并安全配置到客户端')
-   elif name in ('outreach_assignments','outreach_status','outreach_add'):
+   elif name in ('outreach_assignments','outreach_status','outreach_add','outreach_reply'):
     if not actor:raise AuthError('需实例凭证和邮箱本人明确授权',401)
     if name=='outreach_assignments':payload=library.outreach.assignments(actor)
     elif name=='outreach_status':payload=library.outreach.status(actor,args.get('owner_id'))
+    elif name=='outreach_reply':payload=library.outreach.reply(actor,args)
     else:payload=library.outreach.add(actor,args)
    elif name in ('mail_inbox','mail_read','mail_draft'):
     if not actor:raise AuthError('需先连接实例，并由邮箱本人授权',401)
