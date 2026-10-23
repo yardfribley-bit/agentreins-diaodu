@@ -75,6 +75,7 @@ class Relay:
     PAGE_SIZE = 100
     INVITE_SECONDS = 30 * 60
     ONLINE_SECONDS = 60
+    TOUCH_SECONDS = 60
 
     def __init__(self, root: Path):
         root = Path(root)
@@ -133,7 +134,7 @@ class Relay:
             db.close()
 
     @contextmanager
-    def _write(self):
+    def _write(self, notify=True):
         with self._condition:
             db = self._connect()
             committed = False
@@ -147,8 +148,18 @@ class Relay:
                 raise
             finally:
                 db.close()
-                if committed:
+                if committed and notify:
                     self._condition.notify_all()
+
+    def _touch(self, sid, key):
+        """Keep a listening client online without waking every long poll."""
+        now = time.time()
+        with self._write(notify=False) as db:
+            row = db.execute("SELECT last_seen FROM members WHERE session_id=? AND actor_key=?",
+                             (sid, key)).fetchone()
+            if row is not None and now - row["last_seen"] >= self.TOUCH_SECONDS:
+                db.execute("UPDATE members SET last_seen=? WHERE session_id=? AND actor_key=?",
+                           (now, sid, key))
 
     def _access(self, db, actor, sid):
         key = _actor(actor)
@@ -193,12 +204,14 @@ class Relay:
         result.update(json.loads(row["payload"]))
         return result
 
-    def _append(self, db, sid, member, kind, payload, *, request_id=None, content_hash=None, allow_full=False):
+    def _append(self, db, sid, member, kind, payload, *, request_id=None, content_hash=None,
+                optional=False, critical=False):
         last = db.execute("SELECT last_seq FROM sessions WHERE id=?", (sid,)).fetchone()[0]
-        closing = kind == "state" and payload.get("status") == "closed"
-        limit = self.MAX_EVENTS if closing else self.MAX_EVENTS - 1
-        if last >= limit:
-            if allow_full:
+        # Ordinary content stops one slot before the cap; control events (state, revoke)
+        # may still land so a full session can always be paused or closed. Optional
+        # events (environment refresh) are dropped silently instead of failing.
+        if not critical and last >= self.MAX_EVENTS - 1:
+            if optional:
                 return None
             raise AuthError("会话事件数量已达上限，请结束后新建会话", 409)
         now = time.time()
@@ -324,6 +337,9 @@ class Relay:
                 while True:
                     result = self._page(actor, sid, after)
                     if result["events"] or not wait or result["session"]["status"] == "closed" or time.monotonic() >= deadline:
+                        # A listening client is alive even when it never sends: refresh
+                        # presence (60s throttle) before the final membership recheck.
+                        self._touch(sid, key)
                         # Recheck in a fresh transaction immediately before returning data.
                         with self._read() as db:
                             result["session"] = self._view(db, actor, sid)
@@ -344,8 +360,8 @@ class Relay:
         kind = body.get("kind")
         if kind not in ("instruction", "progress", "result", "question", "note"):
             raise ValueError("未知消息类型")
-        _text(body.get("text"), "消息", 8000)
-        message = {"kind": kind, "text": body["text"], "reply_to": body.get("reply_to")}
+        text = _text(body.get("text"), "消息", 8000)
+        message = {"kind": kind, "text": text, "reply_to": body.get("reply_to")}
         request_id = _text(body.get("request_id"), "request_id", 160)
         reply = message["reply_to"]
         if reply is not None and (isinstance(reply, bool) or not isinstance(reply, int) or reply < 1):
@@ -397,7 +413,8 @@ class Relay:
                 environment = _environment(body["environment"])
                 current = json.loads(member["environment"]) if member["environment"] else None
                 if environment != current:
-                    self._append(db, sid, member, "environment", {"role": "worker", "environment": environment})
+                    self._append(db, sid, member, "environment", {"role": "worker", "environment": environment},
+                                 optional=True)
                     db.execute("UPDATE members SET environment=? WHERE session_id=? AND role='worker'",
                                (json.dumps(environment, sort_keys=True, ensure_ascii=False), sid))
             db.execute("UPDATE members SET last_seen=? WHERE session_id=? AND actor_key=?", (time.time(), sid, member["actor_key"]))
@@ -414,7 +431,7 @@ class Relay:
             if session["status"] == "closed" and status != "closed":
                 raise AuthError("已结束的会话不能重新开启", 409)
             if status != session["status"]:
-                self._append(db, sid, member, "state", {"status": status})
+                self._append(db, sid, member, "state", {"status": status}, critical=True)
                 db.execute("UPDATE sessions SET status=? WHERE id=?", (status, sid))
                 if status == "closed":
                     db.execute("DELETE FROM invites WHERE session_id=?", (sid,))
@@ -457,7 +474,11 @@ class Relay:
             person = db.execute("SELECT actor_key FROM members WHERE session_id=? AND role=?", (sid, role)).fetchone()
             db.execute("DELETE FROM invites WHERE session_id=? AND role=?", (sid, role))
             if person:
-                self._append(db, sid, member, "revoked", {"role": role}, allow_full=True)
+                # After close the history is read-only and the revoked member can no
+                # longer read it anyway, so no new event is needed; while the session
+                # is open the revocation event must survive a full event log.
+                if session["status"] != "closed":
+                    self._append(db, sid, member, "revoked", {"role": role}, critical=True)
                 db.execute("DELETE FROM members WHERE session_id=? AND role=?", (sid, role))
                 db.execute("INSERT INTO revoked VALUES (?,?,?,?) ON CONFLICT(session_id,actor_key) "
                            "DO UPDATE SET role=excluded.role, revoked_at=excluded.revoked_at",

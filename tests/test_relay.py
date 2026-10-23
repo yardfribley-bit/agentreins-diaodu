@@ -194,8 +194,10 @@ class RelayStoreTests(unittest.TestCase):
         self.paired()
         first = self.send(self.owner, text="内容")
         self.assertFalse(first["duplicate"])
+        self.assertEqual(first["event"]["message"]["text"], "内容")
         self.assertEqual(self.send(self.owner, text="内容"), {"event": first["event"], "duplicate": True})
-        self.error(409, lambda: self.send(self.owner, text="内容 "))
+        # Text is normalized before hashing, so whitespace variants are the same message.
+        self.assertEqual(self.send(self.owner, text="  内容  "), {"event": first["event"], "duplicate": True})
         self.error(409, lambda: self.send(self.owner, text="另一个内容"))
         self.assertFalse(self.send(self.mentor, text="内容")["duplicate"])
         second = self.relay.create(self.owner, {"title": "另一会话", "goal": "隔离"})["session"]["id"]
@@ -324,6 +326,43 @@ class RelayStoreTests(unittest.TestCase):
         self.error(403, lambda: reopened.join(
             self.worker, {"code": self.created["topic_code"], "role": "worker",
                           "environment": dict(ENVIRONMENT)}))
+
+    def test_events_refresh_presence_with_throttle(self):
+        self.paired()
+        with sqlite3.connect(self.relay.path) as db:
+            db.execute("UPDATE members SET last_seen=0 WHERE session_id=? AND role='mentor'", (self.sid,))
+        self.relay.events(self.mentor, self.sid, after=0, wait=0)
+        with sqlite3.connect(self.relay.path) as db:
+            first = db.execute("SELECT last_seen FROM members WHERE session_id=? AND role='mentor'",
+                               (self.sid,)).fetchone()[0]
+        self.assertGreater(first, 0)
+        peers = {peer["role"]: peer for peer in self.relay.get(self.mentor, self.sid)["session"]["peers"]}
+        self.assertTrue(peers["mentor"]["online"])
+        # A second read inside the throttle window must not write again.
+        self.relay.events(self.mentor, self.sid, after=0, wait=0)
+        with sqlite3.connect(self.relay.path) as db:
+            second = db.execute("SELECT last_seen FROM members WHERE session_id=? AND role='mentor'",
+                                (self.sid,)).fetchone()[0]
+        self.assertEqual(second, first)
+
+    def test_critical_events_land_at_capacity_and_environment_updates_still_apply(self):
+        self.paired()
+        self.relay.MAX_EVENTS = 6
+        for index in range(3):
+            self.send(request_id="fill-" + str(index))
+        self.error(409, lambda: self.send(request_id="over"))
+        changed = {**ENVIRONMENT, "architecture": "aarch64"}
+        heartbeat = self.relay.heartbeat(self.worker, self.sid, {"environment": changed})
+        self.assertEqual(heartbeat["session"]["last_seq"], 5)
+        peers = {peer["role"]: peer for peer in heartbeat["session"]["peers"]}
+        self.assertEqual(peers["worker"]["environment"], changed)
+        revoked = self.relay.revoke(self.owner, self.sid, {"role": "worker"})
+        self.assertEqual(revoked["session"]["last_seq"], 6)
+        self.assertEqual([event["kind"] for event in self.relay.events(self.owner, self.sid, after=5)["events"]],
+                         ["revoked"])
+        closed = self.relay.state(self.owner, self.sid, {"status": "closed"})
+        self.assertEqual(closed["session"]["last_seq"], 7)
+        self.assertEqual(closed["session"]["status"], "closed")
 
     def test_waiter_limits_release_on_timeout_and_input_is_bounded(self):
         self.paired()
