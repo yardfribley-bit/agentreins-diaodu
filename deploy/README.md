@@ -12,7 +12,9 @@
 
 服务文件兼容读取 /etc/diaodu.env；文件 root 所有、0600，可留空。DIAODU_INVITE_CODE 只影响旧账号注册接口，不影响当前接入流程。
 
-在已有 www.chuhaijian.com HTTPS server 中 include nginx-task.conf，修改前备份；nginx -t 通过后 reload。/task 自动跳转 /task/，代理剥离前缀转发，附件 URL 保留 /task；旧 /task/api/ 接口不对外开放。
+在已有 www.chuhaijian.com HTTPS server 中 include nginx-task.conf，修改前备份；nginx -t 通过后 reload。/task 自动跳转 /task/，代理剥离前缀转发，附件 URL 保留 /task；旧 /task/api/ 接口不对外开放。relay 附件单文件上限 100MB，因此 `client_max_body_size` 已调到 110m；升级这版配置后必须执行 `nginx -t` 并 `systemctl reload nginx`，否则 100MB 附近的上传会在 Nginx 层被拦成 HTML 413。
+
+relay 私有附件保存在 data/library/relay-files/（SQLite 记录在 data/library/relay.sqlite3），随 data/library 一起备份；不要单独公开该目录。
 
 ## 验证与备份
 

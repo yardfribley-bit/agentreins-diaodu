@@ -1,6 +1,6 @@
 """Private relay REST routes; the shared handler owns authentication and CSRF."""
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 
 def get(handler, library, parsed):
@@ -13,6 +13,10 @@ def get(handler, library, parsed):
         return
     actor = handler._actor()
     relay = library.relay
+    if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'sessions'] and parts[4] == 'files':
+        item, path = relay.locate_file(actor, parts[3], parts[5])
+        handler._stream_file(item, path, content_type=item.get('type'), inline=item.get('inline', False))
+        return
     if parts == ['v1', 'relay', 'sessions']:
         result = relay.list_sessions(actor)
     elif len(parts) == 4 and parts[:3] == ['v1', 'relay', 'sessions']:
@@ -36,7 +40,25 @@ def get(handler, library, parsed):
         pass
 
 
+def _upload(handler, library, parts):
+    """Raw-byte upload; streaming to disk and hashing happen before the store lock."""
+    actor = handler._actor(mutation=True)
+    relay = library.relay
+    sid = parts[3]
+    length = int(handler.headers.get('Content-Length', '0'))
+    if length <= 0:
+        raise ValueError('上传内容不能为空')
+    if length > relay.MAX_FILE_BYTES:
+        raise ValueError('单个文件不能超过 100 MB')
+    name = parse_qs(urlparse(handler.path).query).get('name', [''])[0]
+    result = relay.receive(actor, sid, name, handler.rfile, length)
+    handler._json(201, result)
+
+
 def post(handler, library, parts):
+    if len(parts) == 5 and parts[:3] == ['v1', 'relay', 'sessions'] and parts[4] == 'files':
+        _upload(handler, library, parts)
+        return
     actor = handler._actor(mutation=True)
     body = handler._body(limit=65536)
     relay = library.relay

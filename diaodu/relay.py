@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import math
 import os
@@ -68,6 +69,38 @@ def _environment(value):
     return result
 
 
+def _safe_name(value):
+    """Reject traversal, separators and control characters; the name is display-only."""
+    if not isinstance(value, str):
+        raise ValueError("文件名不合法")
+    name = value.strip()
+    if not name or len(name) > 240 or name in (".", ".."):
+        raise ValueError("文件名不合法")
+    if "/" in name or "\\" in name or any(ord(char) < 32 for char in name):
+        raise ValueError("文件名不能包含路径分隔符或控制字符")
+    return name
+
+
+def _content_type(name, head):
+    """Both extension and magic bytes must agree; anything else downloads as octet-stream."""
+    extension = os.path.splitext(name)[1].lower()
+    if extension == ".png" and head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if extension in (".jpg", ".jpeg") and head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if extension == ".gif" and head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if extension == ".webp" and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if extension in (".mp4", ".m4v") and head[4:8] == b"ftyp":
+        return "video/mp4"
+    if extension == ".webm" and head.startswith(b"\x1aE\xdf\xa3"):
+        return "video/webm"
+    if extension in (".txt", ".log", ".md", ".csv", ".json", ".yaml", ".yml") and b"\x00" not in head:
+        return "text/plain"
+    return "application/octet-stream"
+
+
 class Relay:
     MAX_EVENTS = 5000
     MAX_OPEN_SESSIONS = 20
@@ -76,10 +109,17 @@ class Relay:
     INVITE_SECONDS = 30 * 60
     ONLINE_SECONDS = 60
     TOUCH_SECONDS = 60
+    MAX_FILE_BYTES = 100 * 1024 * 1024
+    MAX_ATTACHMENTS = 20
+    CONTENT_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp",
+                     "video/mp4", "video/webm", "text/plain", "application/octet-stream")
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, public_base_path: str = ""):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
+        self.public_base_path = (public_base_path or "").rstrip("/")
+        self.files_dir = root / "relay-files"
+        self.files_dir.mkdir(parents=True, exist_ok=True)
         self.path = root / "relay.sqlite3"
         # Create privately before SQLite opens it; the caller's umask is irrelevant.
         descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -112,6 +152,11 @@ class Relay:
                 CREATE TABLE IF NOT EXISTS revoked (
                   session_id TEXT NOT NULL, actor_key TEXT NOT NULL, role TEXT NOT NULL,
                   revoked_at REAL NOT NULL, PRIMARY KEY(session_id,actor_key));
+                CREATE TABLE IF NOT EXISTS files (
+                  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, name TEXT NOT NULL,
+                  size INTEGER NOT NULL, sha256 TEXT NOT NULL, type TEXT NOT NULL,
+                  uploader TEXT NOT NULL, actor_key TEXT NOT NULL, created REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS files_session ON files(session_id);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
             if "topic_code_hash" not in columns:
@@ -198,10 +243,28 @@ class Relay:
         session, member = self._access(db, actor, sid)
         return self._session(db, session, member)
 
-    def _event(self, row):
+    def _file_json(self, db, session_id, file_id):
+        row = db.execute("SELECT * FROM files WHERE id=? AND session_id=?",
+                         (file_id, session_id)).fetchone()
+        if row is None:
+            return None
+        return {"id": row["id"], "name": row["name"], "size": row["size"],
+                "sha256": row["sha256"], "type": row["type"], "uploader": row["uploader"],
+                "created_at": _iso(row["created"]),
+                "url": f"{self.public_base_path}/v1/relay/sessions/{session_id}/files/{row['id']}"}
+
+    def _event(self, db, row):
         result = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
                   "sender": {"role": row["sender_role"], "name": row["sender_name"]}}
-        result.update(json.loads(row["payload"]))
+        payload = json.loads(row["payload"])
+        message = payload.get("message")
+        if isinstance(message, dict):
+            # Old events predate attachments: readers always get a list, never a KeyError.
+            ids = message.get("attachments") or []
+            message["attachments"] = [item for item in
+                                      (self._file_json(db, row["session_id"], file_id) for file_id in ids)
+                                      if item is not None]
+        result.update(payload)
         return result
 
     def _append(self, db, sid, member, kind, payload, *, request_id=None, content_hash=None,
@@ -221,7 +284,7 @@ class Relay:
                    (sid, seq, kind, now, member["role"], member["name"],
                     json.dumps(payload, ensure_ascii=False, sort_keys=True),
                     member["actor_key"], request_id, content_hash))
-        return self._event(db.execute("SELECT * FROM events WHERE session_id=? AND seq=?", (sid, seq)).fetchone())
+        return self._event(db, db.execute("SELECT * FROM events WHERE session_id=? AND seq=?", (sid, seq)).fetchone())
 
     def _issue(self, db, sid, role):
         code = secrets.token_urlsafe(24)
@@ -320,7 +383,7 @@ class Relay:
             rows = db.execute("SELECT * FROM events WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
                               (sid, after, self.PAGE_SIZE + 1)).fetchall()
             batch = rows[:self.PAGE_SIZE]
-            return {"session": self._session(db, session, member), "events": [self._event(row) for row in batch],
+            return {"session": self._session(db, session, member), "events": [self._event(db, row) for row in batch],
                     "next_cursor": batch[-1]["seq"] if batch else after, "has_more": len(rows) > self.PAGE_SIZE}
 
     def events(self, actor, sid, after=0, wait=0):
@@ -356,12 +419,21 @@ class Relay:
                     self._waiters.discard(token)
 
     def send(self, actor, sid, body):
-        body = _body(body, {"kind", "text", "request_id", "reply_to"})
+        body = _body(body, {"kind", "text", "request_id", "reply_to", "attachments"})
         kind = body.get("kind")
         if kind not in ("instruction", "progress", "result", "question", "note"):
             raise ValueError("未知消息类型")
         text = _text(body.get("text"), "消息", 8000)
+        attachments = body.get("attachments", [])
+        if (not isinstance(attachments, list) or len(attachments) > self.MAX_ATTACHMENTS
+                or any(not isinstance(item, str) for item in attachments)):
+            raise ValueError(f"附件最多{self.MAX_ATTACHMENTS}个，且须为附件编号")
+        attachments = list(dict.fromkeys(attachments))
         message = {"kind": kind, "text": text, "reply_to": body.get("reply_to")}
+        # Only add the field when used: hashes of attachment-free messages stay identical
+        # to the pre-attachment format, so old request_id retries still deduplicate.
+        if attachments:
+            message["attachments"] = attachments
         request_id = _text(body.get("request_id"), "request_id", 160)
         reply = message["reply_to"]
         if reply is not None and (isinstance(reply, bool) or not isinstance(reply, int) or reply < 1):
@@ -374,7 +446,13 @@ class Relay:
             if duplicate:
                 if duplicate["content_hash"] != hashed:
                     raise AuthError("相同request_id不能对应不同消息", 409)
-                return {"event": self._event(duplicate), "duplicate": True}
+                return {"event": self._event(db, duplicate), "duplicate": True}
+            if attachments:
+                placeholders = ",".join("?" for _ in attachments)
+                found = db.execute(f"SELECT COUNT(*) FROM files WHERE session_id=? AND id IN ({placeholders})",
+                                   (sid, *attachments)).fetchone()[0]
+                if found != len(attachments):
+                    raise ValueError("附件不属于本会话")
             if session["status"] == "closed":
                 raise AuthError("会话已结束，不能发送新消息", 409)
             if kind == "instruction" and member["role"] not in ("mentor", "owner"):
@@ -389,6 +467,91 @@ class Relay:
             db.execute("UPDATE members SET last_seen=? WHERE session_id=? AND actor_key=?", (time.time(), sid, member["actor_key"]))
             event = self._append(db, sid, member, "message", {"message": message}, request_id=request_id, content_hash=hashed)
             return {"event": event, "duplicate": False}
+
+    def _files_member(self, db, actor, sid):
+        """Membership for attachment routes: 404 for an unknown session, 403 for outsiders."""
+        key = _actor(actor)
+        if not isinstance(sid, str) or not sid or len(sid) > 160:
+            raise AuthError("没有这个会话", 404)
+        session = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+        if session is None:
+            raise AuthError("没有这个会话", 404)
+        member = db.execute("SELECT * FROM members WHERE session_id=? AND actor_key=?", (sid, key)).fetchone()
+        if member is None:
+            raise AuthError("不是该会话成员，不能访问附件", 403)
+        return session, member
+
+    def require_member(self, actor, sid):
+        with self._read() as db:
+            self._files_member(db, actor, sid)
+
+    def _register(self, actor, sid, name, size, digest, content_type, temporary):
+        if size <= 0:
+            raise ValueError("文件不能为空")
+        if size > self.MAX_FILE_BYTES:
+            raise ValueError("单个文件不能超过 100 MB")
+        key = _actor(actor)
+        with self._write() as db:
+            session, member = self._files_member(db, actor, sid)
+            if session["status"] == "closed":
+                raise AuthError("会话已结束，不能上传附件", 409)
+            file_id = "fl_" + secrets.token_hex(12)
+            target = self.files_dir / file_id
+            os.replace(temporary, target)
+            try:
+                db.execute("INSERT INTO files VALUES (?,?,?,?,?,?,?,?,?)",
+                           (file_id, sid, name, size, digest, content_type, member["name"], key, time.time()))
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            return self._file_json(db, sid, file_id)
+
+    def receive(self, actor, sid, name, reader, length):
+        """Stream bytes to disk (hashing) outside the write lock, then register metadata."""
+        name = _safe_name(name)
+        if length <= 0:
+            raise ValueError("文件不能为空")
+        if length > self.MAX_FILE_BYTES:
+            raise ValueError("单个文件不能超过 100 MB")
+        self.require_member(actor, sid)
+        temporary = self.files_dir / (".upload-" + secrets.token_hex(8))
+        digest = hashlib.sha256()
+        written = 0
+        head = b""
+        try:
+            with temporary.open("wb") as output:
+                while written < length:
+                    chunk = reader.read(min(65536, length - written))
+                    if not chunk:
+                        raise ValueError("上传未完成")
+                    if len(head) < 16:
+                        head = (head + chunk)[:16]
+                    output.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+            return self._register(actor, sid, name, written, digest.hexdigest(),
+                                  _content_type(name, head), temporary)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def upload(self, actor, sid, name, content):
+        """Bytes already in memory (MCP path, <=10MB); hashing and disk write happen unlocked."""
+        if not isinstance(content, (bytes, bytearray)):
+            raise ValueError("文件内容不合法")
+        return self.receive(actor, sid, name, io.BytesIO(bytes(content)), len(content))
+
+    def locate_file(self, actor, sid, file_id):
+        with self._read() as db:
+            self._files_member(db, actor, sid)
+            row = db.execute("SELECT * FROM files WHERE id=? AND session_id=?", (file_id, sid)).fetchone()
+            if row is None:
+                raise AuthError("没有这个附件", 404)
+            meta = self._file_json(db, sid, row["id"])
+        path = self.files_dir / row["id"]
+        if not path.is_file():
+            raise AuthError("附件已不存在", 404)
+        meta["inline"] = meta["type"].startswith(("image/", "video/")) or meta["type"] == "text/plain"
+        return meta, path
 
     def ack(self, actor, sid, body):
         body = _body(body, {"seq"})

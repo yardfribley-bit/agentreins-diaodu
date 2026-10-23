@@ -75,7 +75,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
         identity = Identity(library.root / "identity.sqlite3")
     if library is not None:
         from diaodu.relay import Relay
-        library.relay = Relay(library.root)
+        library.relay = Relay(library.root, library.public_base_path)
         from diaodu.mailbox import Mailbox
         mailbox = mailbox or Mailbox(library.root)
         library.mailbox = mailbox
@@ -574,7 +574,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             except Exception as exc:
                 self._internal_error(exc)
 
-        def _stream_file(self,item,path):
+        def _stream_file(self,item,path,content_type=None,inline=True):
             size=path.stat().st_size
             start,end=0,size-1
             ranged=self.headers.get("Range")
@@ -596,9 +596,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     self.end_headers();return
             self.send_response(206 if ranged else 200)
             self.send_header("Accept-Ranges","bytes")
-            self.send_header("Content-Type",item["type"] if item["type"].startswith(("image/","video/")) and item["type"]!="image/svg+xml" else "application/octet-stream")
+            self.send_header("Content-Type",content_type or (item["type"] if item["type"].startswith(("image/","video/")) and item["type"]!="image/svg+xml" else "application/octet-stream"))
             self.send_header("Content-Length",str(max(0,end-start+1)))
-            self.send_header("Content-Disposition","inline; filename*=UTF-8''"+quote(item["name"]))
+            self.send_header("Content-Disposition",("inline" if inline else "attachment")+"; filename*=UTF-8''"+quote(item["name"]))
             self.send_header("Cache-Control","private, no-store")
             self.send_header("X-Content-Type-Options","nosniff")
             if ranged:self.send_header("Content-Range",f"bytes {start}-{end}/{size}")

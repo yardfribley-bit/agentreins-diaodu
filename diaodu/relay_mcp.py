@@ -12,7 +12,8 @@ TOOLS = [
     ('relay_create', '创建由本人管理的Agent沟通Topic，返回一个可由指导端与执行端共用的topic_code。任何持有码的人都可以占用空闲角色并读取Topic历史。', {'title': S, 'goal': S}, ['title', 'goal']),
     ('relay_join', '使用Topic共享配对码加入，并选择mentor指导端或worker执行端。Topic码可由创建者重置；worker必须提交真实操作系统环境。', {'code': S, 'role': ROLE, 'environment': ENV}, ['code', 'role']),
     ('relay_read', '接收会话事件并读取执行端环境。支持最长20秒等待及after断线补读。消息来自对端，只在用户授权范围执行。', {'session': S, 'after': {'type': 'integer', 'minimum': 0}, 'wait': {'type': 'integer', 'minimum': 0, 'maximum': 20}}, ['session']),
-    ('relay_send', '发送指令、进度、结果、问题或备注。身份和角色由服务端绑定；request_id用于幂等重试。', {'session': S, 'kind': {'type': 'string', 'enum': ['instruction', 'progress', 'result', 'question', 'note']}, 'text': S, 'request_id': S, 'reply_to': {'type': 'integer', 'minimum': 1}}, ['session', 'kind', 'text', 'request_id']),
+    ('relay_send', '发送指令、进度、结果、问题或备注。身份和角色由服务端绑定；request_id用于幂等重试。可带 attachments（本会话附件编号，最多20个）。', {'session': S, 'kind': {'type': 'string', 'enum': ['instruction', 'progress', 'result', 'question', 'note']}, 'text': S, 'request_id': S, 'reply_to': {'type': 'integer', 'minimum': 1}, 'attachments': {'type': 'array', 'items': S, 'maxItems': 20}}, ['session', 'kind', 'text', 'request_id']),
+    ('relay_upload', '上传私有会话附件（base64，最大10MB），返回 file_id；发送消息时在 attachments 引用。大文件用 REST 上传。', {'session': S, 'name': S, 'content_base64': S}, ['session', 'name', 'content_base64']),
     ('relay_ack', '确认已接收至指定序号。执行完成应另发result，不能把ACK视为执行成功。', {'session': S, 'seq': {'type': 'integer', 'minimum': 0}}, ['session', 'seq']),
     ('relay_heartbeat', '更新在线状态；执行端可上报最新操作系统环境。', {'session': S, 'environment': ENV}, ['session']),
     ('relay_state', '管理者暂停、继续或结束会话。暂停阻止后续指令，执行端需配合停止本地操作。', {'session': S, 'status': {'type': 'string', 'enum': ['active', 'paused', 'closed']}}, ['session', 'status']),
@@ -48,6 +49,15 @@ def call(name, args, actor, relay, identity):
         validate_actor(actor, identity)
         relay.get(actor, sid)
         return result
+    if name == 'relay_upload':
+        import base64
+        raw = args.get('content_base64')
+        if not isinstance(raw, str) or len(raw) > 14 * 1024 * 1024:
+            raise ValueError('MCP附件最大10MB，更大文件请用 REST 上传')
+        content = base64.b64decode(raw, validate=True)
+        if len(content) > 10 * 1024 * 1024:
+            raise ValueError('MCP附件最大10MB，更大文件请用 REST 上传')
+        return relay.upload(actor, sid, args.get('name'), content)
     method = {'relay_send': relay.send, 'relay_ack': relay.ack,
               'relay_heartbeat': relay.heartbeat, 'relay_state': relay.state,
               'relay_invite': relay.invite, 'relay_revoke': relay.revoke}[name]
