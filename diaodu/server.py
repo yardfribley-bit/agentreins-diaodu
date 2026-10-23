@@ -76,6 +76,13 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
     if library is not None:
         from diaodu.relay import Relay
         library.relay = Relay(library.root, library.public_base_path, public_origin)
+        from diaodu.relay_teams import RelayTeams
+        try:
+            max_workers = int(os.environ.get("DIAODU_RELAY_MAX_WORKERS", "8"))
+        except ValueError:
+            max_workers = 8
+        library.teams = RelayTeams(library.root, max_workers,
+                                   library.public_base_path, public_origin)
         from diaodu.mailbox import Mailbox
         mailbox = mailbox or Mailbox(library.root)
         library.mailbox = mailbox
@@ -255,6 +262,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
 
         def _v1_get(self, parsed):
             try:
+                if parsed.path == '/v1/relay/teams' or parsed.path.startswith('/v1/relay/teams/'):
+                    from diaodu import relay_teams_http
+                    relay_teams_http.get(self, library, parsed)
+                    return
                 if parsed.path == '/v1/relay' or parsed.path.startswith('/v1/relay/'):
                     from diaodu import relay_http
                     relay_http.get(self, library, parsed)
@@ -370,6 +381,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
         def _v1_post(self, parts):
             try:
                 self._origin()
+                if parts[:3] == ['v1', 'relay', 'teams']:
+                    from diaodu import relay_teams_http
+                    relay_teams_http.post(self, library, parts)
+                    return
                 if parts[:2] == ['v1', 'relay']:
                     from diaodu import relay_http
                     relay_http.post(self, library, parts)

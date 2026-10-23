@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 
+from diaodu import relay_files
 from diaodu.identity import AuthError
 
 
@@ -70,36 +71,8 @@ def _environment(value):
     return result
 
 
-def _safe_name(value):
-    """Reject traversal, separators and control characters; the name is display-only."""
-    if not isinstance(value, str):
-        raise ValueError("文件名不合法")
-    name = value.strip()
-    if not name or len(name) > 240 or name in (".", ".."):
-        raise ValueError("文件名不合法")
-    if "/" in name or "\\" in name or any(ord(char) < 32 for char in name):
-        raise ValueError("文件名不能包含路径分隔符或控制字符")
-    return name
-
-
-def _content_type(name, head):
-    """Both extension and magic bytes must agree; anything else downloads as octet-stream."""
-    extension = os.path.splitext(name)[1].lower()
-    if extension == ".png" and head.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if extension in (".jpg", ".jpeg") and head.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if extension == ".gif" and head[:6] in (b"GIF87a", b"GIF89a"):
-        return "image/gif"
-    if extension == ".webp" and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "image/webp"
-    if extension in (".mp4", ".m4v") and head[4:8] == b"ftyp":
-        return "video/mp4"
-    if extension == ".webm" and head.startswith(b"\x1aE\xdf\xa3"):
-        return "video/webm"
-    if extension in (".txt", ".log", ".md", ".csv", ".json", ".yaml", ".yml") and b"\x00" not in head:
-        return "text/plain"
-    return "application/octet-stream"
+_safe_name = relay_files.safe_name
+_content_type = relay_files.content_type
 
 
 class Relay:
@@ -115,7 +88,7 @@ class Relay:
     CONTENT_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp",
                      "video/mp4", "video/webm", "text/plain", "application/octet-stream")
 
-    SIGNED_SECONDS = 15 * 60
+    SIGNED_SECONDS = relay_files.SIGNED_SECONDS
 
     def __init__(self, root: Path, public_base_path: str = "", public_origin: str = ""):
         root = Path(root)
@@ -256,41 +229,21 @@ class Relay:
         return self._session(db, session, member)
 
     def _load_signing_key(self):
-        """Persist the download-signing key under data/library so old links survive restarts."""
-        if self.key_path.is_file():
-            existing = self.key_path.read_bytes()
-            if len(existing) >= 32:
-                return existing
-        key = secrets.token_bytes(32)
-        temporary = self.key_path.with_name(self.key_path.name + ".tmp")
-        descriptor = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-        try:
-            os.write(descriptor, key)
-        finally:
-            os.close(descriptor)
-        os.replace(temporary, self.key_path)
-        os.chmod(self.key_path, 0o600)
-        return key
+        return relay_files.load_key(self.key_path)
 
     def _base_url(self):
-        return (self.public_origin + self.public_base_path) if self.public_origin else self.public_base_path
+        return relay_files.base_url(self.public_origin, self.public_base_path)
 
     def signature(self, session_id, file_id, expires_at=None):
-        expires = int(time.time() + self.SIGNED_SECONDS) if expires_at is None else int(expires_at)
-        message = f"{session_id}:{file_id}:{expires}".encode()
-        return expires, hmac.new(self._signing_key, message, hashlib.sha256).hexdigest()
+        return relay_files.sign(self._signing_key, session_id, file_id, expires_at)
 
     def verify_signature(self, session_id, file_id, expires, signature):
-        if isinstance(expires, bool) or not isinstance(expires, int):
-            return False
-        message = f"{session_id}:{file_id}:{expires}".encode()
-        expected = hmac.new(self._signing_key, message, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, signature or "")
+        return relay_files.verify(self._signing_key, session_id, file_id, expires, signature)
 
     def signed_url(self, session_id, file_id, expires_at=None):
         expires, signature = self.signature(session_id, file_id, expires_at)
-        return (f"{self._base_url()}/v1/relay/sessions/{session_id}/files/{file_id}"
-                f"?exp={expires}&sig={signature}")
+        path = f"/v1/relay/sessions/{session_id}/files/{file_id}"
+        return relay_files.download_url(self._base_url(), path, expires, signature)
 
     def _file_json(self, db, session_id, file_id):
         row = db.execute("SELECT * FROM files WHERE id=? AND session_id=?",

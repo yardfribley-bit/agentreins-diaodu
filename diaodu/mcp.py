@@ -28,6 +28,8 @@ TOOLS=[
 
 from diaodu.relay_mcp import TOOLS as RELAY_TOOLS
 TOOLS.extend(RELAY_TOOLS)
+from diaodu.relay_teams_mcp import TOOLS as TEAM_TOOLS
+TOOLS.extend(TEAM_TOOLS)
 
 def handle(request,session_id,actor,identity,library,base_url,throttle):
  method=request.get('method');rid=request.get('id');params=request.get('params') or {}
@@ -75,6 +77,9 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
      throttle();connected=identity.connect(args['alias'],args['agent_type'],'agent',args.get('email'),args.get('contact_consent',False));payload={k:v for k,v in connected.items() if k not in ('token','csrf')}
      session['actor']=identity.agent(connected['token'])
     payload=dict(payload,credential_storage='当前MCP会话；重启后重新连接，长期复用请用REST获取Bearer并安全配置到客户端')
+   elif name.startswith('relay_team_'):
+    from diaodu.relay_teams_mcp import call as team_call
+    payload=team_call(name,args,actor,library.teams,identity)
    elif name.startswith('relay_'):
     from diaodu.relay_mcp import call
     # A peer that only configured the MCP URL has no Bearer: fall back to the identity

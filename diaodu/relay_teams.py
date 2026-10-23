@@ -7,6 +7,7 @@ relay.sqlite3 or the existing `/v1/relay/sessions/...` code.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -17,6 +18,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from diaodu import relay_files
 from diaodu.identity import AuthError
 from diaodu.relay import _actor, _body, _environment, _iso, _name, _text
 
@@ -28,14 +30,25 @@ class RelayTeams:
     MAX_WAITERS = 32
     ONLINE_SECONDS = 60
     TOUCH_SECONDS = 60
+    SIGNED_SECONDS = relay_files.SIGNED_SECONDS
+    INVITE_SECONDS = 24 * 3600
+    MAX_FILE_BYTES = 100 * 1024 * 1024
+    MAX_ATTACHMENTS = 20
 
-    def __init__(self, root: Path, max_workers: int = 8):
+    def __init__(self, root: Path, max_workers: int = 8,
+                 public_base_path: str = "", public_origin: str = ""):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
         try:
             self.max_workers = max(1, min(int(max_workers), self.MAX_WORKERS_CAP))
         except (TypeError, ValueError):
             self.max_workers = self.MAX_WORKERS_CAP
+        self.public_base_path = (public_base_path or "").rstrip("/")
+        self.public_origin = (public_origin or "").rstrip("/")
+        self.files_dir = root / "relay-team-files"
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        self.key_path = root / "relay-team-files.key"
+        self._signing_key = relay_files.load_key(self.key_path)
         self.path = root / "relay_teams.sqlite3"
         descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(descriptor)
@@ -48,7 +61,7 @@ class RelayTeams:
                   id TEXT PRIMARY KEY, title TEXT NOT NULL, goal TEXT NOT NULL,
                   status TEXT NOT NULL, owner_key TEXT NOT NULL,
                   created REAL NOT NULL, updated REAL NOT NULL,
-                  last_seq INTEGER NOT NULL DEFAULT 0, topic_code_hash TEXT);
+                  last_seq INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS team_sessions_owner ON team_sessions(owner_key,status);
                 CREATE TABLE IF NOT EXISTS team_members (
                   session_id TEXT NOT NULL, role TEXT NOT NULL, seat INTEGER NOT NULL,
@@ -62,6 +75,23 @@ class RelayTeams:
                   sender_name TEXT NOT NULL, payload TEXT NOT NULL, sender_key TEXT,
                   request_id TEXT, content_hash TEXT,
                   PRIMARY KEY(session_id,seq), UNIQUE(session_id,sender_key,request_id));
+                CREATE TABLE IF NOT EXISTS team_files (
+                  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, name TEXT NOT NULL,
+                  size INTEGER NOT NULL, sha256 TEXT NOT NULL, type TEXT NOT NULL,
+                  uploader TEXT NOT NULL, actor_key TEXT NOT NULL, created REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS team_files_session ON team_files(session_id);
+                CREATE TABLE IF NOT EXISTS team_revoked (
+                  session_id TEXT NOT NULL, role TEXT NOT NULL, seat INTEGER NOT NULL,
+                  actor_key TEXT NOT NULL, revoked_at REAL NOT NULL,
+                  PRIMARY KEY(session_id,role,seat));
+                CREATE INDEX IF NOT EXISTS team_revoked_actor ON team_revoked(actor_key,session_id);
+                CREATE TABLE IF NOT EXISTS team_invites (
+                  id TEXT PRIMARY KEY, code_hash TEXT UNIQUE NOT NULL, session_id TEXT NOT NULL,
+                  role TEXT NOT NULL, seat INTEGER, note TEXT NOT NULL DEFAULT '',
+                  created REAL NOT NULL, expires REAL NOT NULL,
+                  revoked INTEGER NOT NULL DEFAULT 0, used_at REAL,
+                  used_by_key TEXT, used_by_name TEXT);
+                CREATE INDEX IF NOT EXISTS team_invites_session ON team_invites(session_id,role,seat);
             """)
 
     # -- plumbing -------------------------------------------------------
@@ -145,7 +175,14 @@ class RelayTeams:
         result = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
                   "sender": {"role": row["sender_role"], "seat": row["sender_seat"],
                              "name": row["sender_name"]}}
-        result.update(json.loads(row["payload"]))
+        payload = json.loads(row["payload"])
+        message = payload.get("message")
+        if isinstance(message, dict):
+            ids = message.get("attachments") or []
+            message["attachments"] = [item for item in
+                                      (self._file_json(db, row["session_id"], file_id) for file_id in ids)
+                                      if item is not None]
+        result.update(payload)
         return result
 
     def _append(self, db, sid, member, kind, payload, *, request_id=None, content_hash=None,
@@ -172,59 +209,76 @@ class RelayTeams:
         goal = _text(body.get("goal"), "目标", 8000)
         now = time.time()
         sid = "tm_" + secrets.token_hex(16)
-        topic_code = secrets.token_urlsafe(24)
         with self._write() as db:
-            db.execute("INSERT INTO team_sessions VALUES (?,?,?,?,?,?,?,?,?)",
-                       (sid, title, goal, "active", key, now, now, 0,
-                        hashlib.sha256(topic_code.encode()).hexdigest()))
+            db.execute("INSERT INTO team_sessions VALUES (?,?,?,?,?,?,?,?)",
+                       (sid, title, goal, "active", key, now, now, 0))
             db.execute("INSERT INTO team_members VALUES (?,?,?,?,?,?,?,?)",
                        (sid, "owner", 0, key, _name(actor), now, 0, None))
             return {"session": self._session(db, db.execute(
                 "SELECT * FROM team_sessions WHERE id=?", (sid,)).fetchone(),
                 db.execute("SELECT * FROM team_members WHERE session_id=? AND actor_key=?",
-                           (sid, key)).fetchone()),
-                "topic_code": topic_code}
+                           (sid, key)).fetchone())}
 
     def join(self, actor, body):
         key = _actor(actor)
         body = _body(body, {"code", "role", "environment"})
-        code = _text(body.get("code"), "配对码", 160)
+        code = _text(body.get("code"), "邀请码", 160)
         hashed = hashlib.sha256(code.encode()).hexdigest()
-        role = body.get("role")
-        if role not in ("mentor", "worker"):
-            raise ValueError("使用团队配对码时必须选择 mentor 或 worker 角色")
         with self._write() as db:
-            session = db.execute("SELECT * FROM team_sessions WHERE topic_code_hash=?",
-                                 (hashed,)).fetchone()
+            invite = db.execute("SELECT * FROM team_invites WHERE code_hash=?", (hashed,)).fetchone()
+            if invite is None:
+                raise AuthError("邀请码无效", 403)
+            if invite["expires"] <= time.time():
+                raise AuthError("邀请码已过期", 403)
+            if invite["revoked"]:
+                raise AuthError("邀请码已被撤销", 403)
+            if invite["used_at"] is not None:
+                raise AuthError("邀请码已被使用", 409)
+            if body.get("role") is not None and body.get("role") != invite["role"]:
+                raise ValueError("所选角色与此邀请码不一致")
+            session = db.execute("SELECT * FROM team_sessions WHERE id=?",
+                                 (invite["session_id"],)).fetchone()
             if session is None or session["status"] == "closed":
-                raise AuthError("团队配对码无效或已失效", 403)
+                raise AuthError("团队会话已结束，不能加入", 409)
+            if db.execute("SELECT 1 FROM team_revoked WHERE session_id=? AND actor_key=?",
+                          (session["id"], key)).fetchone():
+                raise AuthError("该身份已被撤销，不能重新加入团队会话", 403)
             if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND actor_key=?",
                           (session["id"], key)).fetchone():
                 raise AuthError("该身份已参与团队会话", 409)
-            if role == "mentor":
+            if invite["role"] == "mentor":
                 if "environment" in body:
                     raise AuthError("只有执行端可以上报系统环境", 403)
-                seat = 0
                 if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='mentor'",
                               (session["id"],)).fetchone():
                     raise AuthError("指导端席位已被占用", 409)
-                environment = None
+                seat, environment = 0, None
             else:
                 environment = _environment(body.get("environment"))
-                used = {row[0] for row in db.execute(
-                    "SELECT seat FROM team_members WHERE session_id=? AND role='worker'",
-                    (session["id"],))}
-                seat = next((index for index in range(1, self.max_workers + 1) if index not in used), None)
-                if seat is None:
-                    raise AuthError("执行端席位已满", 409)
+                if invite["seat"] is not None:
+                    if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='worker' "
+                                  "AND seat=?", (session["id"], invite["seat"])).fetchone():
+                        raise AuthError("该席位已被占用", 409)
+                    seat = invite["seat"]
+                else:
+                    used = {row[0] for row in db.execute(
+                        "SELECT seat FROM team_members WHERE session_id=? AND role='worker'",
+                        (session["id"],))}
+                    seat = next((index for index in range(1, self.max_workers + 1)
+                                 if index not in used), None)
+                    if seat is None:
+                        raise AuthError("执行端席位已满", 409)
             now = time.time()
             db.execute("INSERT INTO team_members VALUES (?,?,?,?,?,?,?,?)",
-                       (session["id"], role, seat, key, _name(actor), now, 0,
+                       (session["id"], invite["role"], seat, key, _name(actor), now, 0,
                         json.dumps(environment, sort_keys=True, ensure_ascii=False)
                         if environment else None))
+            db.execute("UPDATE team_invites SET used_at=?, used_by_key=?, used_by_name=? WHERE id=?",
+                       (now, key, _name(actor), invite["id"]))
             member = db.execute("SELECT * FROM team_members WHERE session_id=? AND actor_key=?",
                                 (session["id"], key)).fetchone()
-            self._append(db, session["id"], member, "joined", {"role": role, "seat": seat})
+            self._append(db, session["id"], member, "joined",
+                         {"role": invite["role"], "seat": seat})
             return {"session": self._session(db, db.execute(
                 "SELECT * FROM team_sessions WHERE id=?", (session["id"],)).fetchone(), member)}
 
@@ -262,7 +316,7 @@ class RelayTeams:
             return target == member["seat"] or row["sender_seat"] == member["seat"]
         if message.get("kind") == "instruction":
             return True
-        if row["sender_role"] == "worker" and message.get("kind") in ("result", "progress", "question"):
+        if row["sender_role"] == "worker" and message.get("kind") in ("result", "progress", "question", "note"):
             return row["sender_seat"] == member["seat"]
         return True
 
@@ -319,7 +373,7 @@ class RelayTeams:
         return self._session(db, session, member)
 
     def send(self, actor, sid, body):
-        body = _body(body, {"kind", "text", "request_id", "reply_to", "to"})
+        body = _body(body, {"kind", "text", "request_id", "reply_to", "to", "attachments"})
         kind = body.get("kind")
         if kind not in ("instruction", "progress", "result", "question", "note"):
             raise ValueError("未知消息类型")
@@ -336,9 +390,16 @@ class RelayTeams:
                 suffix = to.split(":", 1)[1]
                 if not suffix.isdigit() or not 1 <= int(suffix) <= self.max_workers:
                     raise ValueError('to 必须是 "all" 或 "worker:N"')
+        attachments = body.get("attachments", [])
+        if (not isinstance(attachments, list) or len(attachments) > self.MAX_ATTACHMENTS
+                or any(not isinstance(item, str) for item in attachments)):
+            raise ValueError(f"附件最多{self.MAX_ATTACHMENTS}个，且须为附件编号")
+        attachments = list(dict.fromkeys(attachments))
         message = {"kind": kind, "text": text, "reply_to": reply}
         if to is not None:
             message["to"] = to
+        if attachments:
+            message["attachments"] = attachments
         hashed = hashlib.sha256(json.dumps(message, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         with self._write() as db:
             session, member = self._access(db, actor, sid)
@@ -359,11 +420,22 @@ class RelayTeams:
             if reply is not None and (reply > session["last_seq"] or not db.execute(
                     "SELECT 1 FROM team_events WHERE session_id=? AND seq=?", (sid, reply)).fetchone()):
                 raise ValueError("reply_to不属于本团队会话历史")
-            if kind == "instruction" and to and to.startswith("worker:"):
+            if to and to.startswith("worker:") and member["role"] not in ("mentor", "owner"):
+                raise AuthError("执行端不能定向到具体席位；需要广播请用 to=\"all\"", 403)
+            if to and to.startswith("worker:"):
                 target = int(to.split(":", 1)[1])
                 if not db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='worker' "
                                   "AND seat=?", (sid, target)).fetchone():
+                    if db.execute("SELECT 1 FROM team_revoked WHERE session_id=? AND role='worker' "
+                                  "AND seat=?", (sid, target)).fetchone():
+                        raise AuthError("该席位已被撤销", 409)
                     raise ValueError("目标席位不存在")
+            if attachments:
+                placeholders = ",".join("?" for _ in attachments)
+                found = db.execute(f"SELECT COUNT(*) FROM team_files WHERE session_id=? AND id IN ({placeholders})",
+                                   (sid, *attachments)).fetchone()[0]
+                if found != len(attachments):
+                    raise ValueError("附件不属于本团队会话")
             if kind == "result" and reply is not None:
                 target_row = db.execute("SELECT * FROM team_events WHERE session_id=? AND seq=?",
                                         (sid, reply)).fetchone()
@@ -392,3 +464,315 @@ class RelayTeams:
             db.execute("UPDATE team_members SET ack_seq=?,last_seen=? WHERE session_id=? AND actor_key=?",
                        (seq, time.time(), sid, member["actor_key"]))
             return {"acknowledged": seq}
+    def state(self, actor, sid, body):
+        body = _body(body, {"status"})
+        status = body.get("status")
+        if status not in ("active", "paused", "closed"):
+            raise ValueError("未知团队会话状态")
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if member["role"] != "owner":
+                raise AuthError("只有团队创建者可以改变状态", 403)
+            if session["status"] == "closed" and status != "closed":
+                raise AuthError("已结束的团队会话不能重新开启", 409)
+            if status != session["status"]:
+                self._append(db, sid, member, "state", {"status": status}, critical=True)
+                db.execute("UPDATE team_sessions SET status=? WHERE id=?", (status, sid))
+            return {"session": self._view(db, actor, sid)}
+
+    def heartbeat(self, actor, sid, body=None):
+        body = _body({} if body is None else body, {"environment"})
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if "environment" in body:
+                if member["role"] != "worker":
+                    raise AuthError("只有执行端可以上报系统环境", 403)
+                environment = _environment(body["environment"])
+                current = json.loads(member["environment"]) if member["environment"] else None
+                if environment != current:
+                    self._append(db, sid, member, "environment",
+                                 {"role": "worker", "seat": member["seat"], "environment": environment})
+                    db.execute("UPDATE team_members SET environment=? WHERE session_id=? AND actor_key=?",
+                               (json.dumps(environment, sort_keys=True, ensure_ascii=False), sid,
+                                member["actor_key"]))
+            db.execute("UPDATE team_members SET last_seen=? WHERE session_id=? AND actor_key=?",
+                       (time.time(), sid, member["actor_key"]))
+            return {"session": self._view(db, actor, sid)}
+
+    def revoke(self, actor, sid, body):
+        body = _body(body, {"role", "seat"})
+        role = body.get("role")
+        if role not in ("mentor", "worker"):
+            raise ValueError("角色须为 mentor 或 worker")
+        seat = body.get("seat")
+        if seat is not None and (isinstance(seat, bool) or not isinstance(seat, int)):
+            raise ValueError("seat 必须是整数")
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if member["role"] != "owner":
+                raise AuthError("只有团队创建者可以撤销席位", 403)
+            if role == "mentor":
+                if seat not in (None, 0):
+                    raise ValueError("指导端席位固定为 0")
+                targets = [0]
+            elif seat is None:
+                targets = [row[0] for row in db.execute(
+                    "SELECT seat FROM team_members WHERE session_id=? AND role='worker'",
+                    (sid,))]
+            else:
+                if not 1 <= seat <= self.max_workers:
+                    raise ValueError("worker 席位超出范围")
+                targets = [seat]
+            revoked = []
+            for target in targets:
+                row = db.execute("SELECT * FROM team_members WHERE session_id=? AND role=? AND seat=?",
+                                 (sid, role, target)).fetchone()
+                if row is None:
+                    continue
+                if session["status"] != "closed":
+                    self._append(db, sid, member, "revoked",
+                                 {"role": role, "seat": target}, critical=True)
+                db.execute("DELETE FROM team_members WHERE session_id=? AND role=? AND seat=?",
+                           (sid, role, target))
+                db.execute("INSERT INTO team_revoked VALUES (?,?,?,?,?) "
+                           "ON CONFLICT(session_id,role,seat) DO UPDATE SET actor_key=excluded.actor_key, "
+                           "revoked_at=excluded.revoked_at",
+                           (sid, role, target, row["actor_key"], time.time()))
+                db.execute("UPDATE team_invites SET revoked=1 WHERE session_id=? AND role=? AND seat=? "
+                           "AND used_at IS NULL AND revoked=0", (sid, role, target))
+                revoked.append(target)
+            if revoked:
+                db.execute("UPDATE team_sessions SET updated=? WHERE id=?", (time.time(), sid))
+            return {"session": self._view(db, actor, sid), "revoked_seats": revoked}
+
+    def _base_url(self):
+        return relay_files.base_url(self.public_origin, self.public_base_path)
+
+    def signature(self, session_id, file_id, expires_at=None):
+        return relay_files.sign(self._signing_key, session_id, file_id, expires_at)
+
+    def verify_signature(self, session_id, file_id, expires, signature):
+        return relay_files.verify(self._signing_key, session_id, file_id, expires, signature)
+
+    def signed_url(self, session_id, file_id, expires_at=None):
+        expires, signature = self.signature(session_id, file_id, expires_at)
+        path = f"/v1/relay/teams/{session_id}/files/{file_id}"
+        return relay_files.download_url(self._base_url(), path, expires, signature)
+
+    def _file_json(self, db, session_id, file_id):
+        row = db.execute("SELECT * FROM team_files WHERE id=? AND session_id=?",
+                         (file_id, session_id)).fetchone()
+        if row is None:
+            return None
+        url = self.signed_url(session_id, row["id"])
+        return {"id": row["id"], "name": row["name"], "size": row["size"],
+                "sha256": row["sha256"], "type": row["type"], "uploader": row["uploader"],
+                "created_at": _iso(row["created"]), "url": url, "download_url": url}
+
+    def _files_member(self, db, actor, sid):
+        key = _actor(actor)
+        if not isinstance(sid, str) or not sid or len(sid) > 160:
+            raise AuthError("没有这个团队会话", 404)
+        session = db.execute("SELECT * FROM team_sessions WHERE id=?", (sid,)).fetchone()
+        if session is None:
+            raise AuthError("没有这个团队会话", 404)
+        member = db.execute("SELECT * FROM team_members WHERE session_id=? AND actor_key=?",
+                            (sid, key)).fetchone()
+        if member is None:
+            raise AuthError("不是该团队会话成员，不能访问附件", 403)
+        return session, member
+
+    def _register(self, actor, sid, name, size, digest, content_type, temporary):
+        if size <= 0:
+            raise ValueError("文件不能为空")
+        if size > self.MAX_FILE_BYTES:
+            raise ValueError("单个文件不能超过 100 MB")
+        key = _actor(actor)
+        with self._write() as db:
+            session, member = self._files_member(db, actor, sid)
+            if session["status"] == "closed":
+                raise AuthError("团队会话已结束，不能上传附件", 409)
+            file_id = "fl_" + secrets.token_hex(12)
+            target = self.files_dir / file_id
+            os.replace(temporary, target)
+            try:
+                db.execute("INSERT INTO team_files VALUES (?,?,?,?,?,?,?,?,?)",
+                           (file_id, sid, name, size, digest, content_type,
+                            member["name"], key, time.time()))
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            return self._file_json(db, sid, file_id)
+
+    def receive(self, actor, sid, name, reader, length):
+        name = relay_files.safe_name(name)
+        if length <= 0:
+            raise ValueError("文件不能为空")
+        if length > self.MAX_FILE_BYTES:
+            raise ValueError("单个文件不能超过 100 MB")
+        with self._read() as db:
+            self._files_member(db, actor, sid)
+        temporary = self.files_dir / (".upload-" + secrets.token_hex(8))
+        digest = hashlib.sha256()
+        written = 0
+        head = b""
+        try:
+            with temporary.open("wb") as output:
+                while written < length:
+                    chunk = reader.read(min(65536, length - written))
+                    if not chunk:
+                        raise ValueError("上传未完成")
+                    if len(head) < 16:
+                        head = (head + chunk)[:16]
+                    output.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+            return self._register(actor, sid, name, written, digest.hexdigest(),
+                                  relay_files.content_type(name, head), temporary)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def upload(self, actor, sid, name, content):
+        if not isinstance(content, (bytes, bytearray)):
+            raise ValueError("文件内容不合法")
+        return self.receive(actor, sid, name, io.BytesIO(bytes(content)), len(content))
+
+    def _locate(self, sid, file_id):
+        with self._read() as db:
+            row = db.execute("SELECT * FROM team_files WHERE id=? AND session_id=?",
+                             (file_id, sid)).fetchone()
+            if row is None:
+                raise AuthError("没有这个团队附件", 404)
+            meta = self._file_json(db, sid, row["id"])
+        path = self.files_dir / row["id"]
+        if not path.is_file():
+            raise AuthError("附件已不存在", 404)
+        meta["inline"] = meta["type"].startswith(("image/", "video/")) or meta["type"] == "text/plain"
+        return meta, path
+
+    def locate_file(self, actor, sid, file_id):
+        with self._read() as db:
+            self._files_member(db, actor, sid)
+        return self._locate(sid, file_id)
+
+    def locate_file_unsigned(self, sid, file_id):
+        return self._locate(sid, file_id)
+
+    # -- invitations ----------------------------------------------------
+
+    def _invite_json(self, row):
+        now = time.time()
+        if row["used_at"] is not None:
+            status = "used"
+        elif row["revoked"]:
+            status = "revoked"
+        elif row["expires"] <= now:
+            status = "expired"
+        else:
+            status = "unused"
+        return {"id": row["id"], "role": row["role"], "seat": row["seat"],
+                "note": row["note"], "status": status,
+                "created_at": _iso(row["created"]), "expires_at": _iso(row["expires"]),
+                "used_by": ({"name": row["used_by_name"], "at": _iso(row["used_at"])}
+                            if row["used_at"] is not None else None)}
+
+    def invite(self, actor, sid, body):
+        body = _body(body, {"role", "seat", "note"})
+        role = body.get("role")
+        if role not in ("mentor", "worker"):
+            raise ValueError("角色须为 mentor 或 worker")
+        seat = body.get("seat")
+        if seat is not None and (isinstance(seat, bool) or not isinstance(seat, int)):
+            raise ValueError("seat 必须是整数")
+        note = body.get("note", "")
+        if not isinstance(note, str) or len(note) > 160:
+            raise ValueError("邀请备注最多160字符")
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if member["role"] != "owner":
+                raise AuthError("只有团队创建者可以生成邀请", 403)
+            if session["status"] == "closed":
+                raise AuthError("团队会话已结束", 409)
+            if role == "mentor":
+                if seat not in (None, 0):
+                    raise ValueError("指导端席位固定为 0")
+                if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='mentor'",
+                              (sid,)).fetchone():
+                    raise AuthError("指导端席位已被占用", 409)
+                seat = 0
+            else:
+                if seat is not None:
+                    if not 1 <= seat <= self.max_workers:
+                        raise ValueError("worker 席位超出范围")
+                    if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='worker' "
+                                  "AND seat=?", (sid, seat)).fetchone():
+                        raise AuthError("该席位已被占用", 409)
+            code = secrets.token_urlsafe(24)
+            now = time.time()
+            expires = now + self.INVITE_SECONDS
+            invite_id = "ti_" + secrets.token_hex(8)
+            db.execute("INSERT INTO team_invites VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (invite_id, hashlib.sha256(code.encode()).hexdigest(), sid, role, seat,
+                        note.strip(), now, expires, 0, None, None, None))
+            row = db.execute("SELECT * FROM team_invites WHERE id=?", (invite_id,)).fetchone()
+            item = self._invite_json(row)
+            item["code"] = code
+            return {"invite": item}
+
+    def invites(self, actor, sid):
+        with self._read() as db:
+            session, member = self._access(db, actor, sid)
+            if member["role"] != "owner":
+                raise AuthError("只有团队创建者可以查看邀请", 403)
+            rows = db.execute("SELECT * FROM team_invites WHERE session_id=? ORDER BY created DESC",
+                              (sid,)).fetchall()
+            return {"invites": [self._invite_json(row) for row in rows]}
+
+    def revoke_invite(self, actor, sid, invite_id):
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if member["role"] != "owner":
+                raise AuthError("只有团队创建者可以撤销邀请", 403)
+            row = db.execute("SELECT * FROM team_invites WHERE id=? AND session_id=?",
+                             (invite_id, sid)).fetchone()
+            if row is None:
+                raise AuthError("没有这个邀请", 404)
+            if row["used_at"] is not None:
+                raise AuthError("邀请已被使用，需撤销该席位", 409)
+            db.execute("UPDATE team_invites SET revoked=1 WHERE id=?", (invite_id,))
+            return {"revoked": True, "invite": self._invite_json(
+                db.execute("SELECT * FROM team_invites WHERE id=?", (invite_id,)).fetchone())}
+
+    def reset_invites(self, actor, sid):
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if member["role"] != "owner":
+                raise AuthError("只有团队创建者可以重置邀请", 403)
+            result = db.execute("UPDATE team_invites SET revoked=1 "
+                                "WHERE session_id=? AND used_at IS NULL AND revoked=0", (sid,))
+            return {"revoked": result.rowcount}
+
+    def invite_info(self, code):
+        """Public view of an invitation code for the join link."""
+        if not isinstance(code, str):
+            raise AuthError("邀请码无效", 404)
+        code = code.strip()
+        if not code or len(code) > 160:
+            raise AuthError("邀请码无效", 404)
+        hashed = hashlib.sha256(code.encode()).hexdigest()
+        with self._read() as db:
+            invite = db.execute("SELECT * FROM team_invites WHERE code_hash=?", (hashed,)).fetchone()
+            if invite is None:
+                raise AuthError("邀请码无效", 404)
+            session = db.execute("SELECT * FROM team_sessions WHERE id=?",
+                                 (invite["session_id"],)).fetchone()
+            rows = db.execute("SELECT * FROM team_members WHERE session_id=? ORDER BY role,seat",
+                              (session["id"],)).fetchall()
+        mentor = next((row for row in rows if row["role"] == "mentor"), None)
+        workers = [row for row in rows if row["role"] == "worker"]
+        return {"title": session["title"], "goal": session["goal"],
+                "status": session["status"], "created_at": _iso(session["created"]),
+                "invite": self._invite_json(invite),
+                "mentor": self._peer(mentor) if mentor else None,
+                "workers": [self._peer(row) for row in workers],
+                "max_workers": self.max_workers}
