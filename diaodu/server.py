@@ -374,8 +374,11 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     base=(public_origin or ("http://"+self.headers.get("Host","localhost")))+library.public_base_path+"/v1"
                     result,sid=mcp.handle(body,self.headers.get("Mcp-Session-Id"),actor,identity,library,base,lambda:identity.throttle(self.headers.get("X-Real-IP",self.client_address[0])))
                     if body.get('method') == 'tools/call' and str((body.get('params') or {}).get('name', '')).startswith(('diaodu_relay_', 'relay_')):
-                        # A cookie/session or Bearer can expire during a long poll.
-                        self._actor(mutation=True)
+                        # A cookie/session or Bearer can expire during a long poll. Requests
+                        # that authenticate only through the MCP session skip this recheck;
+                        # mcp.handle revalidates that session actor against the identity DB.
+                        if self.headers.get("Authorization") or self.headers.get("Cookie"):
+                            self._actor(mutation=True)
                     if result and not result.get('error') and not result.get('result',{}).get('isError'):
                         params=body.get('params') or {};task_ref=None
                         if body.get('method')=='tools/call' and params.get('name')=='diaodu_read_task':task_ref=(params.get('arguments') or {}).get('task')

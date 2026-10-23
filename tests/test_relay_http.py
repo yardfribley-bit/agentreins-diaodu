@@ -177,16 +177,91 @@ class RelayHTTP(unittest.TestCase):
         self.assertFalse(body['result']['isError'])
         self.assertTrue(any(event.get('message', {}).get('text') == 'MCP指导'
                             for event in self.clients['worker'].events(self.sid, wait=0)['events']))
-        from diaodu import mcp
-        session_id = 'cached-identity-cannot-authorize-relay'
-        with mcp.LOCK:
-            mcp.SESSIONS[session_id] = {'actor': self.identity.agent(self.identities['owner']['token']),
-                                      'expires': time.time() + 60, 'runs': {}}
+
+    def mcp_request(self, payload, sid=None, role=None):
+        headers = {'Content-Type': 'application/json'}
+        if role:
+            headers['Authorization'] = 'Bearer ' + self.identities[role]['token']
+        if sid:
+            headers['Mcp-Session-Id'] = sid
+        request = Request(self.base + '/v1/mcp', data=json.dumps(payload).encode(),
+                          headers=headers, method='POST')
         try:
-            self.assertEqual(call('relay_read', {'session': self.sid}, sid=session_id)[0], 401)
-        finally:
-            with mcp.LOCK:
-                mcp.SESSIONS.pop(session_id, None)
+            with urlopen(request, timeout=8) as response:
+                return response.status, json.load(response), response.headers.get('Mcp-Session-Id')
+        except HTTPError as error:
+            with error:
+                return error.code, json.load(error), None
+
+    def mcp_initialize(self):
+        status, body, sid = self.mcp_request(
+            {'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {'protocolVersion': '2025-06-18'}})
+        self.assertEqual(status, 200)
+        self.assertTrue(sid)
+        return sid
+
+    def mcp_call(self, name, args, sid=None, role=None):
+        status, body, _ = self.mcp_request(
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+             'params': {'name': 'diaodu_' + name, 'arguments': args}}, sid, role)
+        return status, body
+
+    @staticmethod
+    def mcp_payload(body):
+        return json.loads(body['result']['content'][0]['text'])
+
+    def test_mcp_session_identity_works_without_bearer(self):
+        sid = self.mcp_initialize()
+        status, body = self.mcp_call('connect', {'alias': '无Bearer端', 'agent_type': 'Codex'}, sid)
+        self.assertEqual(status, 200)
+        self.assertFalse(body['result']['isError'])
+        connected = self.mcp_payload(body)
+        self.assertTrue(connected['agent_id'])
+        self.assertNotIn('token', connected)
+        status, body = self.mcp_call('relay_create', {'title': 'MCP 无 Bearer', 'goal': '一条命令接入'}, sid)
+        self.assertFalse(body['result']['isError'])
+        created = self.mcp_payload(body)
+        created_sid = created['session']['id']
+        status, body = self.mcp_call('relay_list', {}, sid)
+        self.assertEqual([session['id'] for session in self.mcp_payload(body)['sessions']], [created_sid])
+        sid2 = self.mcp_initialize()
+        status, body = self.mcp_call('connect', {'alias': '无Bearer执行端', 'agent_type': 'Codex'}, sid2)
+        member = self.mcp_payload(body)
+        status, body = self.mcp_call('relay_join', {
+            'code': created['topic_code'], 'role': 'worker',
+            'environment': {'os_name': 'macOS', 'os_version': 'test', 'architecture': 'arm64'}}, sid2)
+        self.assertFalse(body['result']['isError'])
+        status, body = self.mcp_call('relay_read', {'session': created_sid, 'wait': 0}, sid2)
+        self.assertFalse(body['result']['isError'])
+        status, body = self.mcp_call('relay_send', {
+            'session': created_sid, 'kind': 'progress', 'text': '已接入', 'request_id': 'mcp-session-1'}, sid2)
+        self.assertFalse(body['result']['isError'])
+        seq = self.mcp_payload(body)['event']['seq']
+        status, body = self.mcp_call('relay_ack', {'session': created_sid, 'seq': seq}, sid2)
+        self.assertEqual(self.mcp_payload(body)['acknowledged'], seq)
+        sid3 = self.mcp_initialize()
+        status, body = self.mcp_call('relay_list', {}, sid3)
+        self.assertTrue(body['result']['isError'])
+        self.assertEqual(self.mcp_payload(body)['code'], 401)
+        self.identity.revoke(member['user_id'], member['agent_id'])
+        status, body = self.mcp_call('relay_list', {}, sid2)
+        self.assertTrue(body['result']['isError'])
+        self.assertEqual(self.mcp_payload(body)['code'], 401)
+
+    def test_mcp_explicit_bearer_wins_over_session_identity(self):
+        sid = self.mcp_initialize()
+        status, body = self.mcp_call('connect', {'alias': '会话身份', 'agent_type': 'Codex'}, sid)
+        self.assertFalse(body['result']['isError'])
+        status, body = self.mcp_call('relay_create', {'title': 'Bearer 优先', 'goal': '身份归属'}, sid, role='mentor')
+        self.assertFalse(body['result']['isError'])
+        created = self.mcp_payload(body)
+        self.assertTrue(created['session']['owner'])
+        status, body = self.mcp_call('relay_list', {}, sid)
+        listed = self.mcp_payload(body)
+        self.assertNotIn(created['session']['id'], [session['id'] for session in listed['sessions']])
+        status, body = self.mcp_call('relay_list', {}, role='mentor')
+        listed = self.mcp_payload(body)
+        self.assertIn(created['session']['id'], [session['id'] for session in listed['sessions']])
 
     def test_input_limits_and_identity_spoofing(self):
         self.join()

@@ -116,7 +116,9 @@ while True:
 
 ## MCP 接入
 
-沿用 `https://www.chuhaijian.com/task/v1/mcp`，为客户端配置平台实例的 Bearer 凭据。实时协作工具要求每次请求显式身份，单独的MCP会话ID不授予私有会话访问权。
+沿用 `https://www.chuhaijian.com/task/v1/mcp`，MCP 端只需要地址，不必先准备 Bearer：`initialize` 保存响应头 `Mcp-Session-Id`，再用 `diaodu_connect` 建立身份，之后同一会话内的 `diaodu_relay_*` 工具自动使用该身份。显式携带 Bearer 时以 Bearer 为准；显式身份与会话身份不一致时不会混用。
+
+未 `connect` 的 MCP 会话调用 `relay_*` 仍返回 401；每次调用都会重新校验实例是否被撤销，relay 存储层照常校验会话成员资格与角色绑定。会话身份只存在于服务进程内存（24 小时有效，重启后失效），需要长期复用时按 REST/CLI 方式保存 Bearer。
 
 - `diaodu_relay_list` / `diaodu_relay_create` / `diaodu_relay_join`
 - `diaodu_relay_read` / `diaodu_relay_send` / `diaodu_relay_ack`

@@ -30,7 +30,6 @@ from diaodu.relay_mcp import TOOLS as RELAY_TOOLS
 TOOLS.extend(RELAY_TOOLS)
 
 def handle(request,session_id,actor,identity,library,base_url,throttle):
- explicit_actor=actor
  method=request.get('method');rid=request.get('id');params=request.get('params') or {}
  if request.get('jsonrpc')!='2.0' or not isinstance(method,str):return {'jsonrpc':'2.0','id':rid,'error':{'code':-32600,'message':'Invalid Request'}},None
  if method.startswith('notifications/') :return None,None
@@ -78,7 +77,13 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
     payload=dict(payload,credential_storage='当前MCP会话；重启后重新连接，长期复用请用REST获取Bearer并安全配置到客户端')
    elif name.startswith('relay_'):
     from diaodu.relay_mcp import call
-    payload=call(name,args,explicit_actor,library.relay,identity)
+    # A peer that only configured the MCP URL has no Bearer: fall back to the identity
+    # this MCP session established via diaodu_connect. The Mcp-Session-Id is a 32-byte
+    # in-memory token minted once at initialize, so it is a credential in its own right;
+    # explicit Bearer still wins above (actor is only filled from the session when the
+    # request carried none). relay_mcp re-checks revocation and the store re-checks
+    # membership/role on every call, so the fallback grants no extra access.
+    payload=call(name,args,actor,library.relay,identity)
    elif name in ('outreach_assignments','outreach_status','outreach_add','outreach_reply'):
     if not actor:raise AuthError('需实例凭证和邮箱本人明确授权',401)
     if name=='outreach_assignments':payload=library.outreach.assignments(actor)

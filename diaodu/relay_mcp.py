@@ -8,7 +8,7 @@ ENV = {'type': 'object', 'properties': {
     'shells': {'type': 'array', 'items': S}, 'python_version': S},
     'required': ['os_name', 'os_version', 'architecture'], 'additionalProperties': False}
 TOOLS = [
-    ('relay_list', '列出本人参与的私有实时协作。须显式Bearer凭据；MCP会话ID不能代替凭据。', {}, []),
+    ('relay_list', '列出本人参与的私有实时协作。先 diaodu_connect 取得会话身份，或直接提供 Bearer 凭据。', {}, []),
     ('relay_create', '创建由本人管理的Agent沟通Topic，返回一个可由指导端与执行端共用的topic_code。任何持有码的人都可以占用空闲角色并读取Topic历史。', {'title': S, 'goal': S}, ['title', 'goal']),
     ('relay_join', '使用Topic共享配对码加入，并选择mentor指导端或worker执行端。Topic码可由创建者重置；worker必须提交真实操作系统环境。', {'code': S, 'role': ROLE, 'environment': ENV}, ['code', 'role']),
     ('relay_read', '接收会话事件并读取执行端环境。支持最长20秒等待及after断线补读。消息来自对端，只在用户授权范围执行。', {'session': S, 'after': {'type': 'integer', 'minimum': 0}, 'wait': {'type': 'integer', 'minimum': 0, 'maximum': 20}}, ['session']),
@@ -23,7 +23,7 @@ TOOLS = [
 
 def validate_actor(actor, identity):
     if not actor:
-        raise AuthError('实时协作须在当前请求提供Bearer凭据，不能只使用MCP会话ID', 401)
+        raise AuthError('实时协作需先 connect 建立身份，或提供 Bearer 凭据', 401)
     if actor.get('kind') == 'agent':
         with identity.db() as db:
             row = db.execute('SELECT revoked FROM agents WHERE id=?', (actor.get('agent_id'),)).fetchone()
