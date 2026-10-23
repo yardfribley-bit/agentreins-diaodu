@@ -17,7 +17,7 @@ Topic 由管理者创建并生成一个共享配对码。加入者提供 Topic �
 - POST `/v1/relay/sessions/:id/state` `{status:'active'|'paused'|'closed'}` → `{session}`。仅owner；closed终态。
 - POST `/v1/relay/sessions/:id/invites` `{role:'mentor'|'worker'}` → `{role,code,expires_at}`。仅owner且角色空闲。
 - POST `/v1/relay/sessions/:id/topic-code` `{}` → `{code}`。仅owner；立即重置共享 Topic 码，旧码失效。
-- POST `/v1/relay/sessions/:id/revoke` `{role}` → `{session}`。仅owner；撤销即失去读写权限。
+- POST `/v1/relay/sessions/:id/revoke` `{role}` → `{session}`。仅owner；撤销即失去读写权限。被撤销的实例不能用原 Topic 码重新加入（含换角色），管理员如需重新接纳，须重新签发一次性邀请码。
 
 session: `{id,title,goal,status,created_at,updated_at,owner:boolean,role:'owner'|'mentor'|'worker',peers:[{role,name,online,last_seen,ack_seq}],last_seq}`。
 

@@ -292,6 +292,39 @@ class RelayStoreTests(unittest.TestCase):
         self.join("worker", self.other, code)
         self.error(404, lambda: self.relay.events(self.worker, self.sid))
 
+    def test_revoked_identity_cannot_rejoin_with_topic_code_but_owner_can_reinvite(self):
+        code = self.created["topic_code"]
+        self.relay.join(self.mentor, {"code": code, "role": "mentor"})
+        self.relay.join(self.worker, {"code": code, "role": "worker", "environment": dict(ENVIRONMENT)})
+        self.send(self.worker, kind="result", request_id="before-revoke", text="已执行指令")
+        self.relay.revoke(self.owner, self.sid, {"role": "worker"})
+        # 撤销后不能读历史，也不能继续写。
+        self.error(404, lambda: self.relay.get(self.worker, self.sid))
+        self.error(404, lambda: self.relay.events(self.worker, self.sid))
+        self.error(404, lambda: self.send(self.worker))
+        # 原 Topic 码不能重入：同角色、换角色都不行。
+        self.error(403, lambda: self.relay.join(
+            self.worker, {"code": code, "role": "worker", "environment": dict(ENVIRONMENT)}))
+        self.error(403, lambda: self.relay.join(self.worker, {"code": code, "role": "mentor"}))
+        # 未撤销的另一端不受影响。
+        self.send(self.mentor, kind="instruction", request_id="after-revoke")
+        self.assertEqual(self.relay.get(self.mentor, self.sid)["session"]["status"], "active")
+        # 管理者用新的一次性配对码可以明确恢复该身份，之后再次撤销仍然拦截。
+        fresh = self.relay.invite(self.owner, self.sid, {"role": "worker"})["code"]
+        self.join("worker", self.worker, fresh)
+        self.assertEqual(self.relay.get(self.worker, self.sid)["session"]["role"], "worker")
+        self.relay.revoke(self.owner, self.sid, {"role": "worker"})
+        self.error(403, lambda: self.relay.join(
+            self.worker, {"code": code, "role": "worker", "environment": dict(ENVIRONMENT)}))
+
+    def test_revoke_tombstone_survives_restart(self):
+        self.paired()
+        self.relay.revoke(self.owner, self.sid, {"role": "worker"})
+        reopened = Relay(self.root)
+        self.error(403, lambda: reopened.join(
+            self.worker, {"code": self.created["topic_code"], "role": "worker",
+                          "environment": dict(ENVIRONMENT)}))
+
     def test_waiter_limits_release_on_timeout_and_input_is_bounded(self):
         self.paired()
         self.relay.MAX_WAITERS = 1

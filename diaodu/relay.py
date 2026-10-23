@@ -108,6 +108,9 @@ class Relay:
                   created REAL NOT NULL, sender_role TEXT NOT NULL, sender_name TEXT NOT NULL,
                   payload TEXT NOT NULL, sender_key TEXT, request_id TEXT, content_hash TEXT,
                   PRIMARY KEY(session_id,seq), UNIQUE(session_id,sender_key,request_id));
+                CREATE TABLE IF NOT EXISTS revoked (
+                  session_id TEXT NOT NULL, actor_key TEXT NOT NULL, role TEXT NOT NULL,
+                  revoked_at REAL NOT NULL, PRIMARY KEY(session_id,actor_key));
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
             if "topic_code_hash" not in columns:
@@ -269,6 +272,13 @@ class Relay:
             session = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
             if session is None or session["status"] == "closed":
                 raise AuthError("配对码无效或已失效", 403)
+            # Topic codes are shared and stay valid until rotated or the session closes,
+            # so a revoked identity must not be able to reuse one to come back. A fresh
+            # one-time invite issued by the owner (revoke deletes the old ones) is the
+            # only way to readmit the same identity, and that is an explicit owner act.
+            if invite is None and db.execute(
+                    "SELECT 1 FROM revoked WHERE session_id=? AND actor_key=?", (sid, key)).fetchone():
+                raise AuthError("该身份已被管理者撤销，不能用 Topic 码重新加入", 403)
             if db.execute("SELECT 1 FROM members WHERE session_id=? AND (actor_key=? OR role=?)", (sid, key, role)).fetchone():
                 raise AuthError("该身份已参与会话或角色已配对", 409)
             if role != "worker" and "environment" in body:
@@ -280,6 +290,7 @@ class Relay:
                         json.dumps(environment, sort_keys=True, ensure_ascii=False) if environment else None))
             if invite is not None:
                 db.execute("DELETE FROM invites WHERE session_id=? AND role=?", (sid, role))
+            db.execute("DELETE FROM revoked WHERE session_id=? AND actor_key=?", (sid, key))
             member = db.execute("SELECT * FROM members WHERE session_id=? AND role=?", (sid, role)).fetchone()
             self._append(db, sid, member, "joined", {"role": role})
             return {"session": self._view(db, actor, sid)}
@@ -443,10 +454,13 @@ class Relay:
         with self._write() as db:
             session, member = self._access(db, actor, sid)
             self._owner(member)
-            person = db.execute("SELECT 1 FROM members WHERE session_id=? AND role=?", (sid, role)).fetchone()
+            person = db.execute("SELECT actor_key FROM members WHERE session_id=? AND role=?", (sid, role)).fetchone()
             db.execute("DELETE FROM invites WHERE session_id=? AND role=?", (sid, role))
             if person:
                 self._append(db, sid, member, "revoked", {"role": role}, allow_full=True)
                 db.execute("DELETE FROM members WHERE session_id=? AND role=?", (sid, role))
+                db.execute("INSERT INTO revoked VALUES (?,?,?,?) ON CONFLICT(session_id,actor_key) "
+                           "DO UPDATE SET role=excluded.role, revoked_at=excluded.revoked_at",
+                           (sid, person["actor_key"], role, time.time()))
                 db.execute("UPDATE sessions SET updated=? WHERE id=?", (time.time(), sid))
             return {"session": self._view(db, actor, sid)}
