@@ -278,8 +278,10 @@ class Relay:
                 "worker": {"role": "worker", "name": members["worker"]} if "worker" in members else None}
 
     @staticmethod
-    def _public_payload(kind, payload, db=None, session_id=None):
+    def _public_payload(kind, payload, db=None, session_id=None, files_table="files"):
         """Whitelist public fields; environment and credentials never leave the server."""
+        if files_table not in ("files", "team_files"):
+            files_table = "files"
         if kind == "message":
             message = payload.get("message") or {}
             attachments = []
@@ -288,13 +290,16 @@ class Relay:
                     attachments.append({"name": item.get("name"), "size": item.get("size"),
                                         "type": item.get("type")})
                 elif isinstance(item, str) and db is not None:
-                    row = db.execute("SELECT name,size,type FROM files WHERE id=? AND session_id=?",
+                    row = db.execute(f"SELECT name,size,type FROM {files_table} "
+                                     "WHERE id=? AND session_id=?",
                                      (item, session_id)).fetchone()
                     if row is not None:
                         attachments.append({"name": row["name"], "size": row["size"],
                                             "type": row["type"]})
             public = {"kind": message.get("kind"), "text": message.get("text"),
                       "reply_to": message.get("reply_to")}
+            if message.get("to") is not None:
+                public["to"] = message.get("to")
             if attachments:
                 public["attachments"] = attachments
             return {"message": public}

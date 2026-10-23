@@ -94,7 +94,8 @@ def post(handler, library, parts):
             handler._json(201, teams.invite(actor, parts[3], body))
             return
         action = {'messages': teams.send, 'ack': teams.ack, 'state': teams.state,
-                  'revoke': teams.revoke, 'heartbeat': teams.heartbeat}.get(parts[4])
+                  'revoke': teams.revoke, 'heartbeat': teams.heartbeat,
+                  'public': teams.set_public}.get(parts[4])
         if action is None:
             handler._json(404, {'error': '没有这个团队协作动作'})
             return

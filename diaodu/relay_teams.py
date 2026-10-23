@@ -20,7 +20,7 @@ from pathlib import Path
 
 from diaodu import relay_files
 from diaodu.identity import AuthError
-from diaodu.relay import _actor, _body, _environment, _iso, _name, _text
+from diaodu.relay import Relay, _actor, _body, _environment, _iso, _name, _text
 
 
 class RelayTeams:
@@ -61,7 +61,8 @@ class RelayTeams:
                   id TEXT PRIMARY KEY, title TEXT NOT NULL, goal TEXT NOT NULL,
                   status TEXT NOT NULL, owner_key TEXT NOT NULL,
                   created REAL NOT NULL, updated REAL NOT NULL,
-                  last_seq INTEGER NOT NULL DEFAULT 0);
+                  last_seq INTEGER NOT NULL DEFAULT 0,
+                  public_read INTEGER NOT NULL DEFAULT 0, public_token_hash TEXT);
                 CREATE INDEX IF NOT EXISTS team_sessions_owner ON team_sessions(owner_key,status);
                 CREATE TABLE IF NOT EXISTS team_members (
                   session_id TEXT NOT NULL, role TEXT NOT NULL, seat INTEGER NOT NULL,
@@ -93,6 +94,13 @@ class RelayTeams:
                   used_by_key TEXT, used_by_name TEXT);
                 CREATE INDEX IF NOT EXISTS team_invites_session ON team_invites(session_id,role,seat);
             """)
+            # Additive migration for databases created before public watch existed.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(team_sessions)")}
+            if "public_read" not in columns:
+                db.execute("ALTER TABLE team_sessions ADD COLUMN public_read "
+                           "INTEGER NOT NULL DEFAULT 0")
+            if "public_token_hash" not in columns:
+                db.execute("ALTER TABLE team_sessions ADD COLUMN public_token_hash TEXT")
 
     # -- plumbing -------------------------------------------------------
 
@@ -149,11 +157,11 @@ class RelayTeams:
                 db.execute("UPDATE team_members SET last_seen=? WHERE session_id=? AND actor_key=?",
                            (now, sid, key))
 
-    def _peer(self, row):
+    def _peer(self, row, include_environment=True):
         item = {"role": row["role"], "seat": row["seat"], "name": row["name"],
                 "online": time.time() - row["last_seen"] < self.ONLINE_SECONDS,
                 "last_seen": _iso(row["last_seen"]), "ack_seq": row["ack_seq"]}
-        if row["role"] == "worker":
+        if row["role"] == "worker" and include_environment:
             item["environment"] = json.loads(row["environment"]) if row["environment"] else None
         return item
 
@@ -176,8 +184,12 @@ class RelayTeams:
                 "updated_at": _iso(session["updated"]), "last_seq": session["last_seq"],
                 "owner": member["role"] == "owner", "owner_name": owner["name"],
                 "role": member["role"], "seat": member["seat"],
+                "public_read": bool(session["public_read"]),
+                "max_workers": self.max_workers,
                 "mentor": self._peer(mentor) if mentor else None,
-                "workers": [self._peer(row) for row in workers]}
+                "workers": [self._peer(row, member["role"] != "worker"
+                                       or row["seat"] == member["seat"])
+                            for row in workers]}
 
     def _event(self, db, row):
         result = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
@@ -218,7 +230,9 @@ class RelayTeams:
         now = time.time()
         sid = "tm_" + secrets.token_hex(16)
         with self._write() as db:
-            db.execute("INSERT INTO team_sessions VALUES (?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO team_sessions "
+                       "(id,title,goal,status,owner_key,created,updated,last_seq) "
+                       "VALUES (?,?,?,?,?,?,?,?)",
                        (sid, title, goal, "active", key, now, now, 0))
             db.execute("INSERT INTO team_members VALUES (?,?,?,?,?,?,?,?)",
                        (sid, "owner", 0, key, _name(actor), now, 0, None))
@@ -262,6 +276,9 @@ class RelayTeams:
                     raise AuthError("指导端席位已被占用", 409)
                 seat, environment = 0, None
             else:
+                if not body.get("environment"):
+                    raise ValueError("执行端加入必须上报 environment"
+                                     "（os_name、os_version、architecture）")
                 environment = _environment(body.get("environment"))
                 if invite["seat"] is not None:
                     if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='worker' "
@@ -307,6 +324,114 @@ class RelayTeams:
         with self._read() as db:
             session, member = self._access(db, actor, sid)
             return {"session": self._session(db, session, member)}
+
+    # -- public read-only view ------------------------------------------
+
+    def _public_row(self, db, hashed):
+        row = db.execute("SELECT * FROM team_sessions "
+                         "WHERE public_token_hash=? AND public_read=1", (hashed,)).fetchone()
+        if row is None:
+            raise AuthError("公开视图不可用或已关闭", 404)
+        return row
+
+    def _public_view(self, db, session):
+        """Public session summary: role/seat/name only, never environment or credentials."""
+        rows = db.execute("SELECT role,seat,name FROM team_members WHERE session_id=? "
+                          "ORDER BY role,seat", (session["id"],)).fetchall()
+        mentor = next((row for row in rows if row["role"] == "mentor"), None)
+        workers = [{"role": "worker", "seat": row["seat"], "name": row["name"]}
+                   for row in rows if row["role"] == "worker"]
+        return {"title": session["title"], "goal": session["goal"],
+                "status": session["status"], "created_at": _iso(session["created"]),
+                "updated_at": _iso(session["updated"]), "last_seq": session["last_seq"],
+                "max_workers": self.max_workers,
+                "mentor": ({"role": "mentor", "seat": 0, "name": mentor["name"]}
+                           if mentor else None),
+                "workers": workers}
+
+    def _public_event(self, db, row):
+        if row["kind"] == "environment":
+            return None
+        event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
+                 "sender": {"role": row["sender_role"], "seat": row["sender_seat"],
+                            "name": row["sender_name"]}}
+        event.update(Relay._public_payload(row["kind"], json.loads(row["payload"]),
+                                           db, row["session_id"], "team_files"))
+        return event
+
+    def _public_page(self, token, after):
+        if not isinstance(token, str) or not token or len(token) > 160:
+            raise AuthError("公开视图不可用或已关闭", 404)
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ValueError("after须为非负整数")
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        with self._read() as db:
+            session = self._public_row(db, hashed)
+            if after > session["last_seq"]:
+                raise ValueError("消息游标超过当前会话进度")
+            rows = db.execute("SELECT * FROM team_events WHERE session_id=? AND seq>? "
+                              "ORDER BY seq LIMIT ?", (session["id"], after,
+                                                       self.PAGE_SIZE + 1)).fetchall()
+            scanned = rows[:self.PAGE_SIZE]
+            events = [event for event in (self._public_event(db, row) for row in scanned)
+                      if event is not None]
+            return {"session": self._public_view(db, session), "events": events,
+                    "next_cursor": scanned[-1]["seq"] if scanned else after,
+                    "has_more": len(rows) > self.PAGE_SIZE}
+
+    def public_events(self, token, after=0, wait=0):
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or not 0 <= wait <= 20:
+            raise ValueError("wait须为0至20秒")
+        hashed = hashlib.sha256(token.encode()).hexdigest() if isinstance(token, str) else b""
+        waiter = ("team-public", hashed)
+        registered = False
+        deadline = time.monotonic() + wait
+        try:
+            with self._condition:
+                while True:
+                    result = self._public_page(token, after)
+                    if result["events"] or not wait or result["session"]["status"] == "closed" or time.monotonic() >= deadline:
+                        # Re-check after waiting: disabling or rotating must close the link.
+                        with self._read() as db:
+                            session = self._public_row(db, hashed)
+                            result["session"] = self._public_view(db, session)
+                        return result
+                    if result["next_cursor"] > after:
+                        after = result["next_cursor"]
+                        continue
+                    if not registered:
+                        if waiter in self._waiters or len(self._waiters) >= self.MAX_WAITERS:
+                            raise AuthError("实时等待连接已达上限，请稍后重试", 429)
+                        self._waiters.add(waiter)
+                        registered = True
+                    self._condition.wait(min(1.0, max(0, deadline - time.monotonic())))
+        finally:
+            if registered:
+                with self._condition:
+                    self._waiters.discard(waiter)
+
+    def set_public(self, actor, sid, body):
+        body = _body(body, {"enabled"})
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if member["role"] != "owner":
+                raise AuthError("只有团队创建者可以开关公开围观", 403)
+            now = time.time()
+            url = None
+            if enabled:
+                token = secrets.token_urlsafe(24)
+                db.execute("UPDATE team_sessions SET public_read=1, public_token_hash=?, "
+                           "updated=? WHERE id=?",
+                           (hashlib.sha256(token.encode()).hexdigest(), now, sid))
+                url = self._base_url() + "/relay/watch/" + token
+            else:
+                db.execute("UPDATE team_sessions SET public_read=0, public_token_hash=NULL, "
+                           "updated=? WHERE id=?", (now, sid))
+            view = self._view(db, actor, sid)
+            return {"session": view, "public_url": url}
 
     # -- events ---------------------------------------------------------
 
