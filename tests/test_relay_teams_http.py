@@ -220,6 +220,14 @@ class TeamsHTTP(unittest.TestCase):
         serialized = json.dumps(info)
         for leak in ('token', 'actor_key', 'ag_', 'us_', 'tm_'):
             self.assertNotIn(leak, serialized)
+        # Invite links are anonymous: no machine environment or precise presence.
+        self.assertEqual(len(info['workers']), 3)
+        for worker in info['workers']:
+            self.assertEqual(set(worker), {'role', 'seat', 'name', 'online'})
+        self.assertEqual(set(info['mentor']), {'role', 'seat', 'name', 'online'})
+        for leak in ('environment', 'os_name', 'os_version', 'macOS', 'arm64',
+                     'shells', 'bash', 'python_version', '3.11.15', 'last_seen', 'ack_seq'):
+            self.assertNotIn(leak, serialized)
         self.assertEqual(self.req('GET', '/v1/relay/teams/invites/nope')[0], 404)
 
     def test_mcp_team_flow_invite_join_send_ack_and_download(self):

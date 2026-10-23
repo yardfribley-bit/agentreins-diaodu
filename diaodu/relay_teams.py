@@ -157,6 +157,14 @@ class RelayTeams:
             item["environment"] = json.loads(row["environment"]) if row["environment"] else None
         return item
 
+    @classmethod
+    def _public_peer(cls, row):
+        """Anonymous-safe member view: no environment, timestamps or ack progress."""
+        if row is None:
+            return None
+        return {"role": row["role"], "seat": row["seat"], "name": row["name"],
+                "online": time.time() - row["last_seen"] < cls.ONLINE_SECONDS}
+
     def _session(self, db, session, member):
         rows = db.execute("SELECT * FROM team_members WHERE session_id=? ORDER BY role,seat",
                           (session["id"],)).fetchall()
@@ -773,6 +781,6 @@ class RelayTeams:
         return {"title": session["title"], "goal": session["goal"],
                 "status": session["status"], "created_at": _iso(session["created"]),
                 "invite": self._invite_json(invite),
-                "mentor": self._peer(mentor) if mentor else None,
-                "workers": [self._peer(row) for row in workers],
+                "mentor": self._public_peer(mentor),
+                "workers": [self._public_peer(row) for row in workers],
                 "max_workers": self.max_workers}
