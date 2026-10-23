@@ -104,7 +104,7 @@ while True:
 | GET | `/sessions/:id/events` | `after=序号&wait=0至20`；每页最多100事件 |
 | POST | `/sessions/:id/messages` | `kind`, `text`, `request_id`, 可选`reply_to`、`attachments`（附件编号，最多20个） |
 | POST | `/sessions/:id/files?name=<URL编码>` | 原始字节上传，成员凭证；单文件≤100MB |
-| GET | `/sessions/:id/files/:file_id` | 成员凭证下载；私有，非成员403、跨会话404 |
+| GET | `/sessions/:id/files/:file_id` | Bearer 或签名链接下载；私有，非成员403、跨会话404 |
 | POST | `/sessions/:id/ack` | `seq` |
 | POST | `/sessions/:id/heartbeat` | `{}`；worker可更新`environment` |
 | POST | `/sessions/:id/state` | 管理者：`status=active/paused/closed` |
@@ -142,7 +142,14 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
   "https://www.chuhaijian.com/task/v1/relay/sessions/$SID/messages"
 ```
 
-`relay_read` 的事件里 `message.attachments` 是元数据数组（`id,name,size,sha256,type,uploader,created_at,url`），老事件没有该字段时返回空数组 `[]`。下载走 `GET .../files/:file_id`，必须带成员凭证：非成员 403，拿另一个会话的附件编号 404，匿名不可读。文件名禁止路径分隔符和控制字符、长度≤240；类型按扩展名与文件头双判，只有图片、视频和纯文本内联预览，其余一律 `application/octet-stream` + `attachment`，并带 `X-Content-Type-Options: nosniff`。单文件上限 100MB、每条消息最多 20 个附件；Nginx 的 `client_max_body_size` 已调到 110m，升级后需 reload。文件保存在 data/library/relay-files/，随 data/library 一起备份。
+`relay_read` 的事件里 `message.attachments` 是元数据数组（`id,name,size,sha256,type,uploader,created_at,url,download_url`），老事件没有该字段时返回空数组 `[]`。`url` 是带 host 的**绝对地址**并已签名，Agent 可以直接裸 GET，不需要拼域名、也不需要带 Authorization：
+
+```sh
+curl -L -o 报表.pdf "<message.attachments[0].url>"
+sha256sum 报表.pdf   # 与 attachments[0].sha256 对比
+```
+
+签名覆盖 session_id、file_id 和过期时间，默认 15 分钟；过期返回 403，重新 `relay_read` 即可拿新链接。签名密钥保存在 `data/library/relay-files.key`，重启后有效期内旧链接仍可用。签名会出现在 URL 中，不要把带签名的链接写进公开日志或任务正文。带 Bearer 的下载方式保持不变：非成员 403，拿另一个会话的附件编号 404，匿名（无签名）401。文件名禁止路径分隔符和控制字符、长度≤240；类型按扩展名与文件头双判，只有图片、视频和纯文本内联预览，其余一律 `application/octet-stream` + `attachment`，并带 `X-Content-Type-Options: nosniff`。单文件上限 100MB、每条消息最多 20 个附件；Nginx 的 `client_max_body_size` 已调到 110m，升级后需 reload。文件保存在 data/library/relay-files/，随 data/library 一起备份。
 
 暂停会话阻止新指令，已有结果和进度仍可回传。正在执行的远端操作只有执行端自身能停止；指导端和执行端都应检查state事件与最新快照。结束会话后仅可查看历史。
 
@@ -153,7 +160,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 未 `connect` 的 MCP 会话调用 `relay_*` 仍返回 401；每次调用都会重新校验实例是否被撤销，relay 存储层照常校验会话成员资格与角色绑定。会话身份只存在于服务进程内存（24 小时有效，重启后失效），需要长期复用时按 REST/CLI 方式保存 Bearer。
 
 - `diaodu_relay_list` / `diaodu_relay_create` / `diaodu_relay_join`
-- `diaodu_relay_read` / `diaodu_relay_send` / `diaodu_relay_ack` / `diaodu_relay_upload`
+- `diaodu_relay_read` / `diaodu_relay_send` / `diaodu_relay_ack` / `diaodu_relay_upload` / `diaodu_relay_download`
 - `diaodu_relay_heartbeat` / `diaodu_relay_state`
 - `diaodu_relay_invite` / `diaodu_relay_revoke`
 

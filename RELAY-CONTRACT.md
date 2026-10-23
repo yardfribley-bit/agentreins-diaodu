@@ -13,7 +13,7 @@ Topic 由管理者创建并生成一个共享配对码。加入者提供 Topic �
 - GET `/v1/relay/sessions/:id/events?after=0&wait=20` → `{session,events:[event],next_cursor,has_more}`。wait 0..20 秒，实时唤醒长轮询，每页最多100项。
 - POST `/v1/relay/sessions/:id/messages` `{kind,text,request_id,reply_to?,attachments?}` → `{event,duplicate}`。request_id 必填，幂等重试；同ID不同内容409。`attachments` 为本会话附件编号数组，最多20个。
 - POST `/v1/relay/sessions/:id/files?name=<URL编码>` 原始字节 → `{file_id,name,size,sha256}` (201)。成员凭证；单文件≤100MB。文件名禁止路径分隔符/控制字符，长度≤240。
-- GET `/v1/relay/sessions/:id/files/:file_id` 下载。成员凭证；私有，非成员403；跨会话编号404；`X-Content-Type-Options: nosniff`，类型按扩展名与文件头双判，仅图片/视频/纯文本可内联，其余作为附件下载。
+- GET `/v1/relay/sessions/:id/files/:file_id` 下载。认证二选一：Bearer/会话凭证，或签名链接 `?exp=<unix秒>&sig=<HMAC-SHA256>`（覆盖 session_id、file_id、exp，默认 15 分钟）。签名过期返回 403（提示重新获取），被篡改或换会话返回 403；签名有效但文件不属于该会话返回 404。私有附件，非成员 403；`X-Content-Type-Options: nosniff`，类型按扩展名与文件头双判，仅图片/视频/纯文本可内联，其余作为附件下载。签名密钥持久化在 data/library/relay-files.key，重启后旧链接在有效期内仍可用。
 - POST `/v1/relay/sessions/:id/ack` `{seq}` → `{acknowledged:seq}`。
 - POST `/v1/relay/sessions/:id/heartbeat` `{environment?}` → `{session}`。只有worker可上报/更新environment。
 - POST `/v1/relay/sessions/:id/state` `{status:'active'|'paused'|'closed'}` → `{session}`。仅owner；closed终态。
@@ -23,9 +23,9 @@ Topic 由管理者创建并生成一个共享配对码。加入者提供 Topic �
 
 session: `{id,title,goal,status,created_at,updated_at,owner:boolean,role:'owner'|'mentor'|'worker',peers:[{role,name,online,last_seen,ack_seq}],last_seq}`。
 
-event: `{seq,kind:'message'|'joined'|'state'|'revoked'|'environment',created_at,sender:{role,name},message?:{kind,text,reply_to,attachments},status?,role?,environment?}`。`message.attachments` 每项为 `{id,name,size,sha256,type,uploader,created_at,url}`；没有附件的历史事件返回 `[]`，不会缺字段。
+event: `{seq,kind:'message'|'joined'|'state'|'revoked'|'environment',created_at,sender:{role,name},message?:{kind,text,reply_to,attachments},status?,role?,environment?}`。`message.attachments` 每项为 `{id,name,size,sha256,type,uploader,created_at,url,download_url}`；`url`/`download_url` 是带签名、带 host 的绝对地址（public_origin 为空时退化为相对路径），可直接裸 GET，无需 Authorization 头。没有附件的历史事件返回 `[]`，不会缺字段。
 
-附件与事件解耦：先上传拿 `file_id`，发送消息时引用；文件落在 data/library/relay-files/，元数据在 relay.sqlite3 的 files 表；字节在锁外流式写入并计算 sha256，锁内只登记元数据。下载必须持有会话成员凭证，不能像公开任务附件那样匿名读取。
+附件与事件解耦：先上传拿 `file_id`，发送消息时引用；文件落在 data/library/relay-files/，元数据在 relay.sqlite3 的 files 表；字节在锁外流式写入并计算 sha256，锁内只登记元数据。下载必须持有会话成员凭证或有效签名链接，不能像公开任务附件那样匿名读取；签名只放在 URL 里，服务端不记录含签名的请求行。
 
 执行端必须在join时上报environment：`{os_name,os_version,architecture,shells?:[],python_version?}`，前三项必填。字段只描述系统环境，不上传机器名、用户名、密钥或完整环境变量。worker的`peers[].environment`显示最新信息；heartbeat更新时仅有变化才追加environment事件。页面注明为执行端自报。
 

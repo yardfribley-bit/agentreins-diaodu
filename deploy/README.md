@@ -18,6 +18,8 @@
 
 relay 私有附件保存在 data/library/relay-files/（SQLite 记录在 data/library/relay.sqlite3），随 data/library 一起备份；不要单独公开该目录。
 
+附件签名链接（`?exp=&sig=`）会出现在 URL query 中。应用本身不记录请求行，但 Nginx 默认 access log 会记录完整 URI；若不希望签名落盘，可在该 location 配置只记录 `$uri` 的 log_format 或关闭访问日志。签名密钥在 data/library/relay-files.key，备份 data/library 时必须包含它，否则旧链接会失效。
+
 ## 验证与备份
 
 公开读任务和附件应 200；写操作缺连接凭证应 401；伪造身份字段应 400；借用其他实例或任务的 run_id 应 403。Cookie 具备 HttpOnly、Secure、SameSite=Strict、Path=/task/，浏览器写操作需要 CSRF。注册不是正常使用的前提。
