@@ -35,18 +35,34 @@
   function renderSession(session) {
     if (!session) return;
     title.textContent = '公开围观 · ' + (text(session.title) || '未命名 Topic');
+    const workers = Array.isArray(session.workers) ? session.workers : [];
     goal.textContent = text(session.goal);
+    if (workers.length) {
+      status.textContent = '团队协作 · ' + (session.mentor ? '1 位指挥' : '指挥席位空缺') +
+                           ' · ' + workers.length + ' 位执行';
+    }
+  }
+  function senderLabel(event) {
+    const sender = event.sender || {};
+    const seat = Number(sender.seat);
+    const suffix = sender.role === 'worker' && Number.isInteger(seat) && seat > 0
+      ? ' · ' + seat + ' 号席' : '';
+    return (text(sender.name) || '参与者') + suffix;
   }
   function renderEvent(event) {
     const article = node('article', null, 'watch-event');
-    const sender = event.sender || {};
     const meta = node('div', null, 'watch-meta');
-    meta.append(node('strong', sender.name || '参与者'), node('span', '#' + event.seq, 'muted'),
+    meta.append(node('strong', senderLabel(event)), node('span', '#' + event.seq, 'muted'),
                 node('time', when(event.created_at)));
     article.append(meta);
     if (event.kind === 'message' && event.message) {
       const message = event.message;
       article.append(node('p', message.text, 'watch-text'));
+      const to = text(message.to);
+      if (to === 'all') article.append(node('p', '定向：全体', 'watch-target'));
+      else if (to.startsWith('worker:')) {
+        article.append(node('p', '定向：' + to.slice(7) + ' 号席', 'watch-target'));
+      }
       const attachments = Array.isArray(message.attachments) ? message.attachments : [];
       for (const attachment of attachments) {
         article.append(node('p', '附件：' + text(attachment.name) + ' · ' + sizes(attachment.size),
@@ -54,11 +70,17 @@
       }
       if (message.reply_to) article.append(node('p', '回复 #' + message.reply_to, 'watch-reply'));
     } else if (event.kind === 'joined') {
-      article.append(node('p', (text(event.role) || '成员') + ' 已加入', 'watch-system'));
+      const seat = Number(event.seat);
+      article.append(node('p', (text(event.role) || '成员') +
+                          (Number.isInteger(seat) && seat > 0 ? ' ' + seat + ' 号席' : '') +
+                          ' 已加入', 'watch-system'));
     } else if (event.kind === 'state') {
       article.append(node('p', '会话状态：' + text(event.status), 'watch-system'));
     } else if (event.kind === 'revoked') {
-      article.append(node('p', '一个席位已被撤销', 'watch-system'));
+      const seat = Number(event.seat);
+      article.append(node('p', '一个席位已被撤销' +
+                          (Number.isInteger(seat) && seat > 0 ? '（' + seat + ' 号席）' : ''),
+                          'watch-system'));
     } else {
       return;
     }

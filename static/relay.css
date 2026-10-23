@@ -17,7 +17,47 @@
 .watch-meta strong{color:#1d2430;font-size:13px}
 .watch-text{margin:8px 0 0;white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.65}
 .watch-attachment{margin:8px 0 0;font-size:12px;color:#3b5bdb}
-.watch-reply{margin:6px 0 0;font-size:12px;color:#5a6472}
+.watch-reply,.watch-target{margin:6px 0 0;font-size:12px;color:#5a6472}
 .watch-system{margin:4px 0 0;font-size:13px;color:#5a6472}
 .watch-page .muted{color:#5a6472;font-size:13px}
 .watch-page .eyebrow{letter-spacing:.12em;text-transform:uppercase;font-size:11px;color:#8a94a3;margin:0}
+
+/* Team collaboration UI */
+.mode-choice{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:16px 0;display:flex;flex-direction:column;gap:9px}
+.mode-choice legend{font-size:11px;font-weight:650;color:var(--muted);padding:0 5px}
+.mode-choice label{display:block;margin:0;font-size:12px;font-weight:550;line-height:1.5;cursor:pointer}
+.mode-choice input{margin:0 6px 0 0;vertical-align:-2px}
+.mode-choice small{display:block;margin:2px 0 0 21px;line-height:1.55}
+.team-summary{margin:18px 1px}
+.summary-item{border:1px solid var(--line);border-radius:10px;background:#fff;padding:11px;margin-bottom:9px}
+.summary-instruction{font-size:11px;color:#526780;line-height:1.7;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.summary-seat{display:flex;align-items:baseline;gap:7px;margin-top:7px;font-size:10px;color:var(--muted);line-height:1.7}
+.summary-seat strong{font-size:10px;color:#44566f;flex:none}
+.summary-seat .done{color:var(--green)}
+.summary-seat .working{color:var(--amber)}
+.summary-seat .missing{color:var(--red)}
+.composer-target{display:flex;align-items:center;gap:4px;margin-left:2px}
+.composer-target label{white-space:nowrap}
+.composer-target select{max-width:120px;border:1px solid #e3e9f3;border-radius:6px;padding:2px 4px}
+.invite-form-row{display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:10px}
+.invite-form-row label{margin:0}
+.invite-form-row select,.invite-form-row input{display:block;width:100%;margin-top:6px;font-size:12px;padding:8px 9px}
+.new-invite{border:1px solid #cfe0ff;background:#f4f8ff;border-radius:10px;padding:14px;margin:14px 0}
+.new-invite h3{font-size:13px;margin-bottom:6px}
+.new-invite code{display:block;background:#fff;border:1px solid #dbe6fb;border-radius:7px;padding:9px;margin:8px 0;font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;user-select:all}
+.new-invite .row{display:flex;gap:8px;flex-wrap:wrap}
+.new-invite button{font-size:11px}
+.invite-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.invite-row{border:1px solid var(--line);border-radius:9px;padding:11px 12px}
+.invite-row-top{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.invite-row-top strong{font-size:12px}
+.invite-status{font-size:9px;border-radius:4px;padding:0 5px;background:#eef1f6;color:#748098}
+.invite-status.unused{background:var(--green-soft);color:var(--green)}
+.invite-status.used{background:var(--primary-soft);color:var(--primary)}
+.invite-status.expired,.invite-status.revoked{background:#f6eeee;color:var(--red)}
+.invite-row p{font-size:10px;color:var(--muted);line-height:1.7;overflow-wrap:anywhere;margin-top:4px}
+.invite-row .row{display:flex;gap:7px;margin-top:8px;flex-wrap:wrap}
+.invite-row button{font-size:10px;padding:4px 8px}
+@media(max-width:680px){.invite-form-row{grid-template-columns:1fr}.composer-target{width:100%;margin-left:0}.composer-target select{max-width:none;flex:1}}
+.event-attachment{display:flex;align-items:center;gap:8px;font-size:10px;color:#5e7190;background:#f4f7fc;border:1px solid #e7edf7;border-radius:7px;padding:6px 9px;margin-top:7px;overflow-wrap:anywhere}
+.event-attachment a{font-size:10px;white-space:nowrap}
