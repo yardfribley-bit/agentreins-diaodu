@@ -75,7 +75,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
         identity = Identity(library.root / "identity.sqlite3")
     if library is not None:
         from diaodu.relay import Relay
-        library.relay = Relay(library.root, library.public_base_path)
+        library.relay = Relay(library.root, library.public_base_path, public_origin)
         from diaodu.mailbox import Mailbox
         mailbox = mailbox or Mailbox(library.root)
         library.mailbox = mailbox

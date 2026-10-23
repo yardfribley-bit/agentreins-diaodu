@@ -183,12 +183,27 @@ def get(handler, library, parsed):
         _rate_limit(handler)
         handler._json(200, _topic_info(handler, library, parts[3]))
         return
-    actor = handler._actor()
-    relay = library.relay
     if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'sessions'] and parts[4] == 'files':
-        item, path = relay.locate_file(actor, parts[3], parts[5])
+        relay = library.relay
+        query = parse_qs(parsed.query)
+        if 'sig' in query or 'exp' in query:
+            # Signed links carry no Authorization header, so agents can just fetch them.
+            try:
+                expires = int(query.get('exp', [''])[0])
+            except ValueError:
+                raise AuthError('签名链接不合法', 403)
+            if expires < time.time():
+                raise AuthError('签名链接已过期，请重新获取', 403)
+            if not relay.verify_signature(parts[3], parts[5], expires, query.get('sig', [''])[0]):
+                raise AuthError('签名链接不合法', 403)
+            item, path = relay.locate_file_unsigned(parts[3], parts[5])
+        else:
+            actor = handler._actor()
+            item, path = relay.locate_file(actor, parts[3], parts[5])
         handler._stream_file(item, path, content_type=item.get('type'), inline=item.get('inline', False))
         return
+    actor = handler._actor()
+    relay = library.relay
     if parts == ['v1', 'relay', 'sessions']:
         result = relay.list_sessions(actor)
     elif len(parts) == 4 and parts[:3] == ['v1', 'relay', 'sessions']:

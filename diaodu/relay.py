@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -114,12 +115,17 @@ class Relay:
     CONTENT_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp",
                      "video/mp4", "video/webm", "text/plain", "application/octet-stream")
 
-    def __init__(self, root: Path, public_base_path: str = ""):
+    SIGNED_SECONDS = 15 * 60
+
+    def __init__(self, root: Path, public_base_path: str = "", public_origin: str = ""):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
         self.public_base_path = (public_base_path or "").rstrip("/")
+        self.public_origin = (public_origin or "").rstrip("/")
         self.files_dir = root / "relay-files"
         self.files_dir.mkdir(parents=True, exist_ok=True)
+        self.key_path = root / "relay-files.key"
+        self._signing_key = self._load_signing_key()
         self.path = root / "relay.sqlite3"
         # Create privately before SQLite opens it; the caller's umask is irrelevant.
         descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -243,15 +249,52 @@ class Relay:
         session, member = self._access(db, actor, sid)
         return self._session(db, session, member)
 
+    def _load_signing_key(self):
+        """Persist the download-signing key under data/library so old links survive restarts."""
+        if self.key_path.is_file():
+            existing = self.key_path.read_bytes()
+            if len(existing) >= 32:
+                return existing
+        key = secrets.token_bytes(32)
+        temporary = self.key_path.with_name(self.key_path.name + ".tmp")
+        descriptor = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        try:
+            os.write(descriptor, key)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, self.key_path)
+        os.chmod(self.key_path, 0o600)
+        return key
+
+    def _base_url(self):
+        return (self.public_origin + self.public_base_path) if self.public_origin else self.public_base_path
+
+    def signature(self, session_id, file_id, expires_at=None):
+        expires = int(time.time() + self.SIGNED_SECONDS) if expires_at is None else int(expires_at)
+        message = f"{session_id}:{file_id}:{expires}".encode()
+        return expires, hmac.new(self._signing_key, message, hashlib.sha256).hexdigest()
+
+    def verify_signature(self, session_id, file_id, expires, signature):
+        if isinstance(expires, bool) or not isinstance(expires, int):
+            return False
+        message = f"{session_id}:{file_id}:{expires}".encode()
+        expected = hmac.new(self._signing_key, message, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature or "")
+
+    def signed_url(self, session_id, file_id, expires_at=None):
+        expires, signature = self.signature(session_id, file_id, expires_at)
+        return (f"{self._base_url()}/v1/relay/sessions/{session_id}/files/{file_id}"
+                f"?exp={expires}&sig={signature}")
+
     def _file_json(self, db, session_id, file_id):
         row = db.execute("SELECT * FROM files WHERE id=? AND session_id=?",
                          (file_id, session_id)).fetchone()
         if row is None:
             return None
+        url = self.signed_url(session_id, row["id"])
         return {"id": row["id"], "name": row["name"], "size": row["size"],
                 "sha256": row["sha256"], "type": row["type"], "uploader": row["uploader"],
-                "created_at": _iso(row["created"]),
-                "url": f"{self.public_base_path}/v1/relay/sessions/{session_id}/files/{row['id']}"}
+                "created_at": _iso(row["created"]), "url": url, "download_url": url}
 
     def _event(self, db, row):
         result = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
@@ -559,9 +602,8 @@ class Relay:
             raise ValueError("文件内容不合法")
         return self.receive(actor, sid, name, io.BytesIO(bytes(content)), len(content))
 
-    def locate_file(self, actor, sid, file_id):
+    def _locate(self, sid, file_id):
         with self._read() as db:
-            self._files_member(db, actor, sid)
             row = db.execute("SELECT * FROM files WHERE id=? AND session_id=?", (file_id, sid)).fetchone()
             if row is None:
                 raise AuthError("没有这个附件", 404)
@@ -571,6 +613,15 @@ class Relay:
             raise AuthError("附件已不存在", 404)
         meta["inline"] = meta["type"].startswith(("image/", "video/")) or meta["type"] == "text/plain"
         return meta, path
+
+    def locate_file(self, actor, sid, file_id):
+        with self._read() as db:
+            self._files_member(db, actor, sid)
+        return self._locate(sid, file_id)
+
+    def locate_file_unsigned(self, sid, file_id):
+        """Only for a verified signed link; callers must check the HMAC first."""
+        return self._locate(sid, file_id)
 
     def ack(self, actor, sid, body):
         body = _body(body, {"seq"})

@@ -3,12 +3,16 @@ import hashlib
 import io
 import json
 import socket
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 import test_relay_http as fixtures
+from diaodu.relay import Relay
 
 
 class RelayFiles(unittest.TestCase):
@@ -56,7 +60,8 @@ class RelayFiles(unittest.TestCase):
         self.assertEqual(meta['name'], '报表.png')
         self.assertEqual(meta['type'], 'image/png')
         self.assertNotIn('actor_key', meta)
-        self.assertTrue(meta['url'].endswith(f'/v1/relay/sessions/{self.sid}/files/{meta["id"]}'))
+        self.assertIn(f'/v1/relay/sessions/{self.sid}/files/{meta["id"]}?exp=', meta['url'])
+        self.assertTrue(meta['url'].startswith('https://www.chuhaijian.com/task/v1/'))
         status, data, headers = self.download(self.sid, meta['id'], 'mentor')
         self.assertEqual(status, 200)
         self.assertEqual(data, content)
@@ -154,6 +159,124 @@ class RelayFiles(unittest.TestCase):
         event = self.mcp_payload(body)['event']
         self.assertEqual(event['message']['attachments'][0]['sha256'], meta['sha256'])
         self.assertEqual(event['message']['attachments'][0]['name'], '结果.txt')
+
+    def local(self, url):
+        parsed = urlparse(url)
+        path = parsed.path
+        prefix = self.library.public_base_path
+        if prefix and path.startswith(prefix + '/'):
+            path = path[len(prefix):]
+        return self.base + path + (('?' + parsed.query) if parsed.query else '')
+
+    def raw_get(self, url):
+        try:
+            with urlopen(url, timeout=30) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            with error:
+                return error.code, error.read()
+
+    def test_signed_url_downloads_without_headers(self):
+        self.join()
+        content = b'\x89PNG\r\n\x1a\n' + b'signed' * 100
+        status, meta = self.upload(self.sid, '签名.png', content, 'worker')
+        self.assertEqual(status, 201)
+        self.assertIn('?exp=', meta['url'])
+        self.assertIn('&sig=', meta['url'])
+        self.assertEqual(meta['download_url'], meta['url'])
+        status, data = self.raw_get(self.local(meta['url']))
+        self.assertEqual(status, 200)
+        self.assertEqual(data, content)
+        self.assertEqual(hashlib.sha256(data).hexdigest(), meta['sha256'])
+
+    def test_signed_url_expired_tampered_and_cross_session(self):
+        self.join()
+        status, meta = self.upload(self.sid, '签名.txt', b'payload', 'worker')
+        relay = self.library.relay
+        expires, signature = relay.signature(self.sid, meta['id'], expires_at=int(time.time()) - 5)
+        expired = (f'{self.base}/v1/relay/sessions/{self.sid}/files/{meta["id"]}'
+                   f'?exp={expires}&sig={signature}')
+        self.assertEqual(self.raw_get(expired)[0], 403)
+        local_url = self.local(meta['url'])
+        tampered = local_url[:-1] + ('0' if local_url[-1] != '0' else '1')
+        self.assertEqual(self.raw_get(tampered)[0], 403)
+        query = parse_qs(urlparse(meta['url']).query)
+        shifted = int(query['exp'][0]) + 60
+        wrong_exp = (f'{self.base}/v1/relay/sessions/{self.sid}/files/{meta["id"]}'
+                     f'?exp={shifted}&sig={query["sig"][0]}')
+        self.assertEqual(self.raw_get(wrong_exp)[0], 403)
+        other = self.clients['worker'].create('跨会话签名', '不得读取')
+        other_sid = other['session']['id']
+        other_exp, other_sig = relay.signature(other_sid, meta['id'])
+        cross = (f'{self.base}/v1/relay/sessions/{other_sid}/files/{meta["id"]}'
+                 f'?exp={other_exp}&sig={other_sig}')
+        self.assertEqual(self.raw_get(cross)[0], 404)
+        self.assertEqual(self.raw_get(self.local(meta['url']).replace(self.sid, other_sid))[0], 403)
+
+    def test_signing_key_persists_across_restart(self):
+        self.join()
+        status, meta = self.upload(self.sid, '持久.txt', b'restart-key', 'worker')
+        reopened = Relay(self.root, '/task', 'https://www.chuhaijian.com')
+        query = parse_qs(urlparse(meta['url']).query)
+        self.assertTrue(reopened.verify_signature(self.sid, meta['id'],
+                                                  int(query['exp'][0]), query['sig'][0]))
+
+    def test_relative_url_fallback_without_public_origin(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        relay = Relay(Path(temporary.name))
+        owner = {"kind": "agent", "agent_id": "ag_o", "user_id": "us_o", "agent_name": "o"}
+        worker = {"kind": "agent", "agent_id": "ag_w", "user_id": "us_w", "agent_name": "w"}
+        created = relay.create(owner, {"title": "t", "goal": "g"})
+        relay.join(worker, {"code": created["topic_code"], "role": "worker",
+                            "environment": {"os_name": "macOS", "os_version": "x",
+                                            "architecture": "arm64"}})
+        meta = relay.upload(worker, created["session"]["id"], 'x.txt', b'hello')
+        self.assertTrue(meta['url'].startswith('/v1/relay/sessions/'))
+        self.assertIn('?exp=', meta['url'])
+
+    def test_mcp_download_small_boundary_and_large_fallback(self):
+        sid = self.mcp_initialize()
+        self.mcp_call('connect', {'alias': '下载端', 'agent_type': 'Dev'}, sid)
+        status, body = self.mcp_call('relay_create', {'title': '下载', 'goal': 'MCP 下载'}, sid)
+        created = self.mcp_payload(body)
+        sid2 = self.mcp_initialize()
+        self.mcp_call('connect', {'alias': '下载执行端', 'agent_type': 'Dev'}, sid2)
+        self.mcp_call('relay_join', {'code': created['topic_code'], 'role': 'worker',
+                                     'environment': {'os_name': 'macOS', 'os_version': 'x',
+                                                     'architecture': 'arm64'}}, sid2)
+        small = b'small-file-body'
+        status, body = self.mcp_call('relay_upload', {
+            'session': created['session']['id'], 'name': 'small.txt',
+            'content_base64': base64.b64encode(small).decode()}, sid2)
+        small_meta = self.mcp_payload(body)
+        status, body = self.mcp_call('relay_download', {
+            'session': created['session']['id'], 'file_id': small_meta['id']}, sid2)
+        downloaded = self.mcp_payload(body)
+        self.assertEqual(base64.b64decode(downloaded['content_base64']), small)
+        self.assertEqual(downloaded['sha256'], hashlib.sha256(small).hexdigest())
+        boundary = b'x' * (5 * 1024 * 1024)
+        status, body = self.mcp_call('relay_upload', {
+            'session': created['session']['id'], 'name': 'boundary.bin',
+            'content_base64': base64.b64encode(boundary).decode()}, sid2)
+        boundary_meta = self.mcp_payload(body)
+        status, body = self.mcp_call('relay_download', {
+            'session': created['session']['id'], 'file_id': boundary_meta['id']}, sid2)
+        self.assertFalse(self.mcp_payload(body).get('too_large'))
+        large = boundary + b'y'
+        status, body = self.mcp_call('relay_upload', {
+            'session': created['session']['id'], 'name': 'large.bin',
+            'content_base64': base64.b64encode(large).decode()}, sid2)
+        large_meta = self.mcp_payload(body)
+        status, body = self.mcp_call('relay_download', {
+            'session': created['session']['id'], 'file_id': large_meta['id']}, sid2)
+        payload = self.mcp_payload(body)
+        self.assertTrue(payload['too_large'])
+        self.assertNotIn('content_base64', payload)
+        self.assertIn('?exp=', payload['download_url'])
+        status, data = self.raw_get(self.local(payload['download_url']))
+        self.assertEqual(status, 200)
+        self.assertEqual(data, large)
 
 
 if __name__ == '__main__':
