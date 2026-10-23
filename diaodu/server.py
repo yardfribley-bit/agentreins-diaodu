@@ -8,6 +8,8 @@ import re
 import os
 import hmac
 import secrets
+import sys
+import traceback
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -232,7 +234,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self._json(409, {"error": str(exc)})
                 return
             except Exception as exc:
-                self._json(500, {"error": str(exc)})
+                self._internal_error(exc)
                 return
             self._json(404, {"error": "没有这个地址"})
 
@@ -306,7 +308,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if len(parts) >= 3 and parts[:2] == ["v1", "tasks"]:
                     parts[2] = library.read_task(parts[2])["id"]
                     if len(parts)==3 or (len(parts)==4 and parts[3]=='context'):
-                        library.attention.record(parts[2],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
+                        library.record_attention(parts[2],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
                 if len(parts)==4 and parts[:2]==["v1","tasks"] and parts[3] in ("context","updates"):
                     actor=None
                     if self.headers.get("Authorization") or "diaodu_session=" in self.headers.get("Cookie",""):
@@ -347,6 +349,8 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self._json(404, {"error": "没有这件任务"})
             except ValueError as exc:
                 self._json(400, {"error": str(exc)})
+            except Exception as exc:
+                self._internal_error(exc)
 
         def _v1_post(self, parts):
             try:
@@ -378,7 +382,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         if body.get('method')=='resources/read' and str(params.get('uri','')).startswith('diaodu://task/'):task_ref=params['uri'][len('diaodu://task/'):]
                         if task_ref:
                             task=library.read_task(task_ref)
-                            library.attention.record(task['id'],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
+                            library.record_attention(task['id'],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
                     if result is None:
                         self.send_response(202);self.send_header("Content-Length","0");self.end_headers()
                     else:self._json(200,result,{"Mcp-Session-Id":sid} if sid else None)
@@ -407,9 +411,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     if not re.fullmatch(r'[a-f0-9]{32}',visitor):visitor=secrets.token_hex(16)
                     ua=self.headers.get('User-Agent','').lower()
                     if not any(bot in ua for bot in ('bot','spider','crawler','curl','python','headless')):
-                        library.attention.record(task['id'],'browser',visitor)
+                        library.record_attention(task['id'],'browser',visitor)
                     header=f"diaodu_visitor={visitor}; HttpOnly; SameSite=Lax; Path={library.public_base_path}/; Max-Age=31536000"+('; Secure' if secure_cookies else '')
-                    self._json(200,library.attention.stats(task['id']),{'Set-Cookie':header})
+                    self._json(200,library.attention_stats(task['id']),{'Set-Cookie':header})
                     return
                 actor = self._actor(mutation=True)
                 if parts[:2]==['v1','mail']:
@@ -564,6 +568,8 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self._json(400, {"error": "请求不是 JSON"})
             except ValueError as exc:
                 self._json(400, {"error": str(exc)})
+            except Exception as exc:
+                self._internal_error(exc)
 
         def _stream_file(self,item,path):
             size=path.stat().st_size
@@ -655,6 +661,14 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self.send_header(key,value)
             self.end_headers()
             if not getattr(self,"_head_only",False):self.wfile.write(data)
+
+        def _internal_error(self, exc):
+            """Log the detail server-side, return only a generic JSON error to the client."""
+            traceback.print_exc(file=sys.stderr)
+            try:
+                self._json(500, {"error": "服务暂时不可用，请稍后重试"})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _file(self, path: Path):
             if not path.is_file():

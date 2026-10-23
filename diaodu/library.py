@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import mimetypes
 import secrets
+import sys
 import threading
+import traceback
 from pathlib import Path
 
 from diaodu.store import now
@@ -197,11 +199,27 @@ class Library:
             self._save(data)
             return self._public(task)
 
+    def attention_stats(self, task_id):
+        """Read-path statistics are best effort: a broken stats DB must not break reads."""
+        try:
+            return self.attention.stats(task_id)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            return {"page_views": 0, "unique_browsers": 0, "api_reads": 0,
+                    "unique_api_sources": 0, "started_at": getattr(self.attention, "started", "")}
+
+    def record_attention(self, task_id, channel, visitor):
+        """Write-path statistics are best effort: failures are logged, never raised."""
+        try:
+            self.attention.record(task_id, channel, visitor)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
     def _public(self, task):
         shown = _public(task)
         from diaodu.workflow import snapshot
         shown["workflow"] = snapshot(task)
-        shown["attention"] = self.attention.stats(task["id"])
+        shown["attention"] = self.attention_stats(task["id"])
         # Rewrite persisted root URLs for the current deployment, including old attachments.
         for item in shown["files"]:
             item["url"] = f"{self.public_base_path}/v1/tasks/{task['id']}/files/{item['id']}"
