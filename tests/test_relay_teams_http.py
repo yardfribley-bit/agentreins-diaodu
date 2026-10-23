@@ -150,7 +150,7 @@ class TeamsHTTP(unittest.TestCase):
         self.assertEqual(status, 200)
         status, body = self.req('POST', '/v1/relay/teams/join',
                                 {'code': first['code'], 'environment': dict(ENVIRONMENT)}, 'w3')
-        self.assertEqual(status, 409)
+        self.assertEqual(status, 403)
         ledger = self.req('GET', f'/v1/relay/teams/{self.sid}/invites', role='owner')[1]['invites']
         record = next(item for item in ledger if item['id'] == first['id'])
         self.assertEqual(record['status'], 'used')

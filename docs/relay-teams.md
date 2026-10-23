@@ -11,7 +11,7 @@
 
 - `POST /v1/relay/teams/<sid>/invites` `{role, seat?, note?}`：owner 生成邀请。worker 指定 `seat` 时绑定该席；不指定表示任意空席（加入时分配最小空闲号）。mentor 邀请固定 seat 0。默认 24 小时过期，`note` 用来标注用途（如“Alice 的笔记本”）。
 - 返回 `{invite:{id, role, seat, note, status, created_at, expires_at, code}}`；`code` 只在创建时返回一次。
-- 校验顺序：码不存在 → 过期 → 已撤销 → 已使用 → 席位已空。错误分开：无效/过期/撤销 403，已使用/席位被占/席位已满 409。
+- 校验顺序：码不存在 → 过期 → 已撤销 → 已使用 → 席位已空。错误分开：无效/过期/撤销/已使用 403，席位被占或席位已满 409。
 - 使用后写入 `used_by`（展示名 + 时间），码立即失效；同一码第二次使用返回 409。
 - `GET /v1/relay/teams/<sid>/invites`：owner 的邀请账本，含身份、备注、状态（unused/used/revoked/expired）、使用人、生成与过期时间；不返回 code。
 - `POST .../invites/<invite_id>/revoke`：撤销单条未使用邀请（已使用返回 409）。

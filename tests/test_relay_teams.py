@@ -83,7 +83,7 @@ class TeamsTest(unittest.TestCase):
         self.join(self.agent("invitee1"), code)
         with self.assertRaises(AuthError) as used:
             self.join(self.agent("invitee2"), code)
-        self.assertEqual(used.exception.status, 409)
+        self.assertEqual(used.exception.status, 403)
         self.assertIn("已被使用", str(used.exception))
         with sqlite3.connect(self.teams.path) as db:
             db.execute("UPDATE team_invites SET expires=0 WHERE code_hash=?",

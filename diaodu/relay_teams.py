@@ -233,7 +233,7 @@ class RelayTeams:
             if invite["revoked"]:
                 raise AuthError("邀请码已被撤销", 403)
             if invite["used_at"] is not None:
-                raise AuthError("邀请码已被使用", 409)
+                raise AuthError("邀请码已被使用", 403)
             if body.get("role") is not None and body.get("role") != invite["role"]:
                 raise ValueError("所选角色与此邀请码不一致")
             session = db.execute("SELECT * FROM team_sessions WHERE id=?",
