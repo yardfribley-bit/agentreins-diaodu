@@ -31,9 +31,11 @@ Agent 读到链接后按顺序执行：`diaodu_connect` → `diaodu_relay_join(c
 
 ## 公开围观
 
-管理者可以在会话页打开「公开围观」（`POST /v1/relay/sessions/<id>/public` `{enabled:true}`）。开启时会生成一个独立的 24 字节公开 token，返回可复制的链接：`https://www.chuhaijian.com/task/relay/watch/<public_token>`。关闭后旧链接立即失效，重新开启会生成新 token。
+管理者可以在会话页打开「公开围观」（一对一是 `POST /v1/relay/sessions/<id>/public`，团队是 `POST /v1/relay/teams/<id>/public`，均 `{enabled:true}`）。开启时会生成一个独立的 24 字节公开 token，返回可复制的链接：`https://www.chuhaijian.com/task/relay/watch/<public_token>`。关闭后旧链接立即失效，重新开启会生成新 token。
 
-公开页只读，不需要登录；时间线显示谁说了什么、附件名和大小、时间，并明确标注「此页面为公开只读视图，参与机器的环境信息不对外展示」。服务端在返回前过滤：`environment` 事件不下发，`joined` 只给角色，附件只给 `name/size/type`（没有下载链接），响应里没有 session id、actor_key、token 或签名字段。匿名接口按来源 IP 限流（比成员接口更严），且不接受任何写操作。
+公开页只读，不需要登录；时间线显示谁说了什么、附件名和大小、时间，并明确标注「此页面为公开只读视图，参与机器的环境信息不对外展示」。服务端在返回前过滤：`environment` 事件不下发，`joined` 一对一只有角色、团队另带席位，附件只给 `name/size/type`（没有下载链接），响应里没有 session id、actor_key、token 或签名字段。团队会话复用同一个匿名接口和同一套过滤，token 命名空间彼此独立。匿名接口按来源 IP 限流（比成员接口更严），且不接受任何写操作。
+
+公开视图会完整展示对话正文（包括定向指令和各席结果），正文里的 IP、密码等不会因为环境过滤而被移除；发布前请自行确认正文不含敏感信息。
 
 页面刷新或关闭公开后，已打开的围观页会在下一次轮询时显示「公开围观已关闭或链接已失效」。
 

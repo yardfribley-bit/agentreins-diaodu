@@ -50,12 +50,13 @@ Topic 配对码至少192位随机，仅哈希存储，可重复用于尚未占�
 
 ## 公开围观
 
-`GET /v1/relay/public/<public_token>/events?after=&wait=` 为匿名只读视图，不需要任何凭证。
+`GET /v1/relay/public/<public_token>/events?after=&wait=` 为匿名只读视图，不需要任何凭证。一对一与团队会话复用这个地址和同一套过滤；两边 token 命名空间独立，互不串用。
 
-- 服务端过滤：`environment` 事件整条不下发；`joined` 只保留角色；`message` 只保留 kind/text/reply_to 和附件 `name,size,type`（不含 id、下载链接或签名）；`state`/`revoked` 只保留状态/角色。任何 os/architecture/shells/ip 等环境字段在服务端剔除。
+- 服务端过滤：`environment` 事件整条不下发；`joined` 一对一只有 `role`，团队另带 `seat`；`message` 只保留 kind/text/reply_to 和附件 `name,size,type`（不含 id、下载链接或签名）；`state`/`revoked` 只保留状态/角色。任何 os/architecture/shells/ip 等环境字段在服务端剔除。
 - 响应不含 session id、actor_key、token、签名；`next_cursor` 仍是扫描到的全局 seq，允许空洞；长轮询 wait 0..20 秒。
 - 关闭公开或轮换 token 后旧链接立即 404，等待中的长轮询也会被唤醒并收到 404；公开接口不接受写操作。
 - 公开接口按来源 IP 限流，阈值低于成员接口（默认 30 次/分钟）。
+- 公开视图会完整展示对话正文；环境字段被剔除不代表正文安全，开启前需自行确认正文不含敏感信息。
 
 ## 接入
 
@@ -64,3 +65,5 @@ REST适用于任意可HTTP调用的Agent；提供标准库Python客户端和MCP�
 ## 团队模式
 
 团队协作是独立的表、路由（`/v1/relay/teams/...`）和 MCP 工具组（`relay_team_*`），与上面的 `sessions` 一对一路径不共享数据。采用席位邀请制：owner 为 mentor/worker 各席生成一次性邀请（默认 24 小时），不支持通用 worker 配对码；可见性为混合模式（广播 vs 定向 vs worker 私有）。详见 `docs/relay-teams.md`。
+
+邀请链接页 `GET /relay/join/<邀请码>` 返回 `text/markdown`，包含席位状态、MCP 配置与团队工具调用顺序；匿名邀请查询 `GET /v1/relay/teams/invites/<code>` 只返回 `role/seat/name/online` 与邀请状态，不返回 environment、last_seen、ack_seq、actor_key 或 session id。团队公开围观走上面的 `/v1/relay/public/<token>/events`。
