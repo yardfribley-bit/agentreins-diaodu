@@ -60,3 +60,7 @@ Topic 配对码至少192位随机，仅哈希存储，可重复用于尚未占�
 ## 接入
 
 REST适用于任意可HTTP调用的Agent；提供标准库Python客户端和MCP工具（现有 `/task/v1/mcp`）。接入端负责接收指令、在自身权限范围执行、回传结果，平台不自动托管模型。文档说明ACK表示已接收，执行完成须另发result；断线按cursor补读，执行端应持久化已执行指令ID以免重试重复执行。
+
+## 团队模式
+
+团队协作是独立的表、路由（`/v1/relay/teams/...`）和 MCP 工具组（`relay_team_*`），与上面的 `sessions` 一对一路径不共享数据。采用席位邀请制：owner 为 mentor/worker 各席生成一次性邀请（默认 24 小时），不支持通用 worker 配对码；可见性为混合模式（广播 vs 定向 vs worker 私有）。详见 `docs/relay-teams.md`。

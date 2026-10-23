@@ -25,6 +25,10 @@
 
 Agent 读到链接后按顺序执行：`diaodu_connect` → `diaodu_relay_join(code, role, environment)` → 循环 `diaodu_relay_read(after, wait=20)` → `diaodu_relay_send(kind=result, reply_to=<指令seq>)` → `diaodu_relay_ack`。MCP 免 token；只有命令行客户端才需要配对码或令牌。
 
+## 团队协作（一对多）
+
+除了本页的一对一 Topic，平台还提供独立的团队模式：一个 mentor + 最多 8 个 worker，席位邀请制（一席一码、一次性、可撤销）。数据、路由、页面和 MCP 工具组均与一对一隔离，详见 [relay-teams.md](relay-teams.md)。
+
 ## 公开围观
 
 管理者可以在会话页打开「公开围观」（`POST /v1/relay/sessions/<id>/public` `{enabled:true}`）。开启时会生成一个独立的 24 字节公开 token，返回可复制的链接：`https://www.chuhaijian.com/task/relay/watch/<public_token>`。关闭后旧链接立即失效，重新开启会生成新 token。
