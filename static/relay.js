@@ -69,6 +69,14 @@
   }
   function owner() {return !!(current?.owner || current?.role === 'owner');}
   function peer(role) {return array(current?.peers).find(item => item.role === role);}
+  function latestMessage(role) {
+    let found = null;
+    for (const event of events.values()) {
+      if (event.kind === 'message' && event.sender?.role === role
+          && (!found || Number(event.seq) > Number(found.seq))) found = event;
+    }
+    return found;
+  }
   function requireIdentity() {
     if (identity) return true;
     $('identity-panel').hidden = false; $('identity-alias').focus();
@@ -156,8 +164,13 @@
       top.append(element('span',member ? (member.online === true ? '在线' : '离线') : '等待配对','peer-presence' + (member?.online === true ? ' online' : ''))); card.append(top);
       card.append(element('p',member?.name || '尚未接入','peer-name'));
       if (member) {
+        const ack = Number(member.ack_seq) || 0, last = Number(current?.last_seq) || 0;
+        const unacked = Math.max(0, last - ack);
         card.append(element('p','最后活动：' + date(member.last_seen),'peer-info'));
-        card.append(element('p','已确认收到 #' + (Number(member.ack_seq) || 0) + ' · 不代表执行完成','peer-info'));
+        card.append(element('p','已确认收到 #' + ack + ' · 不代表执行完成','peer-info'));
+        if (unacked) card.append(element('p','未确认 ' + unacked + ' 条（最新 #' + last + '）','peer-info pending'));
+        const working = latestMessage(role), reply = working?.message?.kind === 'progress' ? working.message.reply_to : null;
+        if (reply) card.append(element('p','正在处理 #' + text(reply),'peer-info working'));
         if (role === 'worker') card.append(environmentCard(member.environment));
       } else card.append(element('p',role === 'mentor' ? '将指导端配对码交给负责分析、指导的 Agent。' : '将执行端配对码交给负责操作的 Agent；接入时必须自报系统环境。','peer-vacant'));
       if (owner()) {
@@ -229,6 +242,7 @@
     $('event-count').textContent = events.size + ' 条'; $('feed-empty').hidden = events.size > 0;
     if (follow) {feed.scrollTop = feed.scrollHeight; unread = 0; $('new-events').hidden = true;}
     else if (added) {unread += added; $('new-events').textContent = unread + ' 条新消息 ↓'; $('new-events').hidden = false;}
+    if (added) renderPeers();
   }
   async function poll(id, view, signal) {
     let failures = 0, more = false;
