@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from diaodu import relay_teams_mcp
 from diaodu.identity import AuthError
 from diaodu.relay import Relay
 from diaodu.relay_teams import RelayTeams
@@ -266,6 +267,31 @@ class TeamsTest(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertNotIn("team_members", relay_tables)
         self.assertNotIn("team_events", relay_tables)
+
+
+class McpTeamToolSchema(unittest.TestCase):
+    """Schema/implementation drift guard for the team MCP tool table.
+
+    mcp.py rejects a tools/call whose arguments miss anything listed in required,
+    while relay_teams_mcp.call() reads args["session"] for every tool after the
+    create/join/list branches. A tool in that group that omits "session" from its
+    schema is therefore impossible to call; the allowlist below is the only
+    session-less group.
+    """
+
+    SESSIONLESS = {"relay_team_create", "relay_team_join", "relay_team_list"}
+
+    def test_tools_that_need_a_session_declare_it(self):
+        self.assertTrue(relay_teams_mcp.TOOLS)
+        for name, _description, properties, required in relay_teams_mcp.TOOLS:
+            with self.subTest(tool=name):
+                self.assertTrue(name.startswith("relay_team_"))
+                self.assertTrue(set(required) <= set(properties))
+                if name in self.SESSIONLESS:
+                    self.assertNotIn("session", required)
+                else:
+                    self.assertIn("session", properties)
+                    self.assertIn("session", required)
 
 
 if __name__ == "__main__":
