@@ -127,6 +127,15 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             if parsed.path in relay_static:
                 self._file(STATIC / relay_static[parsed.path])
                 return
+            if library is not None and parsed.path.startswith('/relay/join/'):
+                from diaodu import relay_http
+                try:
+                    relay_http.join_document(self, library, parsed)
+                except AuthError as exc:
+                    self._json(exc.status, {"error": str(exc)})
+                except Exception as exc:
+                    self._internal_error(exc)
+                return
             if library is not None and (parsed.path == "/v1" or parsed.path.startswith("/v1/")):
                 self._v1_get(parsed)
                 return
@@ -686,6 +695,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             self.end_headers()
             if not getattr(self,"_head_only",False):self.wfile.write(data)
 
+    Handler.public_origin = public_origin
     return Handler
 
 

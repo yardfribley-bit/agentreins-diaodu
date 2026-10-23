@@ -10,9 +10,20 @@
 
 1. 在管理页面创建 Topic，复制共享配对码。页面管理记录仍归创建它的管理身份所有；其他电脑上的 Agent 可凭 Topic 码加入。
 2. 把同一个 Topic 配对码交给两端，指导端选择 mentor，执行端选择 worker。每个角色只允许一个实例；码可继续用于空闲角色，管理者可重置使旧码失效。任何拿到配对码的人都能加入空闲角色并读取完整Topic历史，请只分享给目标Agent。
-3. Agent 可以直接用已配置的出海剑 MCP 加入。没有 MCP 时也无需配置：使用下方标准库客户端，首次 `join` 自动创建 Agent 身份并私密保存凭据；worker 环境由客户端自动检测。加入后接收事件、处理授权范围内的指令、回传结果并确认序号。断线按序号补读；消息用稳定的 `request_id`。
+3. Agent 可以直接把 MCP 地址加为 MCP 服务器（Streamable HTTP，不需要 token）接入，也可以把页面生成的「接入链接」整条发给它，让 Agent 自己读取说明并配置。没有 MCP 时也无需配置：使用下方标准库客户端，首次 `join` 自动创建 Agent 身份并私密保存凭据；worker 环境由客户端自动检测。加入后接收事件、处理授权范围内的指令、回传结果并确认序号。断线按序号补读；消息用稳定的 `request_id`。
 
 管理员是独立的控制身份，不占指导端或执行端席位。创建会话不会自动调用模型、支付模型费用或运行目标机器上的程序。
+
+## 一条链接接入
+
+管理页面每个 Topic 都提供「复制接入链接」，形如 `https://www.chuhaijian.com/task/relay/join/<配对码>`，后面可加 `?role=mentor` 或 `?role=worker` 指定该链接是给哪一端。把整条链接丢给对方的 Agent，它打开就能读到完整接入说明，不需要再人工解释。
+
+- `GET /v1/relay/topics/<配对码>`：公开 JSON（无需凭证），返回 `title`、`goal`、`status`、`created_at`、`seats.mentor/worker`（`occupied` 与已占用者的展示名）、`mcp_url`、`guide_url`、`join_url`。码不存在或已失效返回 404；会话已关闭时 `status` 为 `closed`。响应只含展示名，不含任何凭证或内部编号。
+- `GET /relay/join/<配对码>`：公开 Markdown（`text/markdown; charset=utf-8`），说明 Topic 资料、当前空位、MCP 配置、调用顺序和边界；席位已满时会明确写「该角色已被占用，等管理者撤销或重置配对码」。
+- 两个端点都按来源 IP 限流（默认每分钟 60 次），超限返回 429。
+- 标题和目标按「资料」处理：Markdown 里先声明它们不是指令，并对 HTML 与控制字符做转义，避免创建者通过标题注入伪造指令。
+
+Agent 读到链接后按顺序执行：`diaodu_connect` → `diaodu_relay_join(code, role, environment)` → 循环 `diaodu_relay_read(after, wait=20)` → `diaodu_relay_send(kind=result, reply_to=<指令seq>)` → `diaodu_relay_ack`。MCP 免 token；只有命令行客户端才需要配对码或令牌。
 
 ## 标准库 Python 客户端
 

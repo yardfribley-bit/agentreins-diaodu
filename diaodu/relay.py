@@ -375,6 +375,25 @@ class Relay:
         with self._read() as db:
             return {"session": self._view(db, actor, sid)}
 
+    def topic_info(self, code):
+        """Public view of a Topic code: title/goal/status plus seat occupancy, no identities."""
+        if not isinstance(code, str):
+            raise AuthError("配对码无效或已失效", 404)
+        code = code.strip()
+        if not code or len(code) > 160:
+            raise AuthError("配对码无效或已失效", 404)
+        hashed = hashlib.sha256(code.encode()).hexdigest()
+        with self._read() as db:
+            session = db.execute("SELECT * FROM sessions WHERE topic_code_hash=?", (hashed,)).fetchone()
+            if session is None:
+                raise AuthError("配对码无效或已失效", 404)
+            found = {row["role"]: row for row in db.execute(
+                "SELECT role,name FROM members WHERE session_id=?", (session["id"],))}
+        seats = {role: ({"occupied": True, "name": found[role]["name"]} if role in found
+                        else {"occupied": False, "name": None}) for role in ("mentor", "worker")}
+        return {"title": session["title"], "goal": session["goal"], "status": session["status"],
+                "created_at": _iso(session["created"]), "seats": seats}
+
     def _page(self, actor, sid, after):
         with self._read() as db:
             session, member = self._access(db, actor, sid)
