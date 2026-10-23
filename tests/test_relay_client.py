@@ -1,8 +1,14 @@
 import argparse
 import io
 import json
+import os
+import sys
+from contextlib import redirect_stderr
+from pathlib import Path
+import tempfile
 import unittest
 from email.message import Message
+from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 from diaodu import relay_client as rc
@@ -158,6 +164,75 @@ class WatchTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 rc._wait_seconds(str(value))
         self.assertEqual(rc._wait_seconds("20"), 20)
+
+
+class CLITests(unittest.TestCase):
+    URL = "http://127.0.0.1:8765/v1"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.state = Path(self.temporary.name) / "client.json"
+        rc.save_state(self.state, {self.URL: {"token": "t", "last_session": "rl_last",
+                                             "cursors": {"rl_last": 2}}})
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def argv(self, *rest):
+        return ["--url", self.URL, "--state-file", str(self.state), *rest]
+
+    def run_cli(self, *rest):
+        with patch.object(sys, "argv", ["relay_client.py", *self.argv(*rest)]):
+            rc.main()
+
+    def fake_client(self):
+        patcher = patch.object(rc, "RelayClient")
+        self.addCleanup(patcher.stop)
+        client = patcher.start().return_value
+        client.token = "t"
+        client.events.return_value = {"events": [], "next_cursor": 2, "has_more": False}
+        client.get.return_value = {"session": {"id": "rl_last"}}
+        client.ack.return_value = {"acknowledged": 3}
+        return client
+
+    def test_events_and_ack_default_to_last_session(self):
+        client = self.fake_client()
+        with redirect_stderr(io.StringIO()):
+            self.run_cli("events", "--wait", "0")
+            self.run_cli("ack", "3")
+        client.events.assert_called_once_with("rl_last", 2, 0)
+        client.ack.assert_called_once_with("rl_last", 3)
+        self.assertEqual(rc.load_state(self.state)[self.URL]["cursors"]["rl_last"], 3)
+
+    def test_get_without_session_uses_last_session(self):
+        client = self.fake_client()
+        self.run_cli("get")
+        client.get.assert_called_once_with("rl_last")
+
+    def test_ack_keeps_explicit_session_form(self):
+        client = self.fake_client()
+        self.run_cli("ack", "rl_other", "4")
+        client.ack.assert_called_once_with("rl_other", 4)
+
+    def test_join_watch_starts_at_join_point_and_remembers_session(self):
+        client = self.fake_client()
+        client.join.return_value = {"session": {"id": "rl_new", "last_seq": 9}}
+        with patch.dict(os.environ, {"DIAODU_PAIR_CODE": "pair"}), \
+                patch.object(rc, "watch_loop", return_value=10) as loop, redirect_stderr(io.StringIO()):
+            self.run_cli("join", "--role", "worker", "--watch")
+        args = loop.call_args
+        self.assertEqual(args.args[0], client)
+        self.assertEqual(args.args[1], "rl_new")
+        self.assertEqual(args.args[2], 9)
+        self.assertIsNotNone(args.kwargs.get("on_cursor"))
+        self.assertEqual(rc.load_state(self.state)[self.URL]["last_session"], "rl_new")
+
+    def test_missing_session_is_a_usage_error(self):
+        rc.save_state(self.state, {self.URL: {"token": "t"}})
+        self.fake_client()
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            self.run_cli("get")
+        self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":

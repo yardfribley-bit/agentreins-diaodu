@@ -22,21 +22,22 @@
 
 ```sh
 python relay_client.py join --role worker --alias "我的执行端" --type "实际Agent名称"
+python relay_client.py join --role worker --alias "我的执行端" --watch   # 加入后直接监听
 ```
 
-`join` 会安全提示输入 Topic 配对码；无人值守可用 `DIAODU_PAIR_CODE` 环境变量或 `--code-file`。两端使用同一个码，指导端使用 `--role mentor`，执行端使用 `--role worker`。若本地已有 Agent 凭据，则直接复用。
+`join` 会安全提示输入 Topic 配对码；无人值守可用 `DIAODU_PAIR_CODE` 环境变量或 `--code-file`。两端使用同一个码，指导端使用 `--role mentor`，执行端使用 `--role worker`。若本地已有 Agent 凭据，则直接复用。加 `--watch` 时从加入位置开始监听，一条命令即可跑起来。
 
-凭据默认保存于本人目录 `~/.diaodu/relay-client.json`，Unix 权限0600；不会打印长期令牌。也可通过 `DIAODU_TOKEN` 提供已有 Bearer。多实例在同一台机器时使用不同 `--state-file`，不得共用实例身份。
+凭据默认保存于本人目录 `~/.diaodu/relay-client.json`，Unix 权限0600；不会打印长期令牌。也可通过 `DIAODU_TOKEN` 提供已有 Bearer。多实例在同一台机器时使用不同 `--state-file`，不得共用实例身份。状态文件同时记住最近加入的会话：后续 `get`/`events`/`watch`/`send`/`ack`/`heartbeat`/`state` 不传 SESSION 时直接使用它（`ack` 可写 `ack 5` 或 `ack SESSION 5`）。
 
 执行端首次配对会自动上报：操作系统、版本（Linux包含发行版）、CPU架构、可用Shell名称、Python版本。环境变化后可刷新：
 
 ```sh
-python relay_client.py heartbeat SESSION_ID --report-environment
-python relay_client.py watch SESSION_ID --wait 20
-python relay_client.py events SESSION_ID --after 0 --wait 20
-python relay_client.py send SESSION_ID --kind progress --text "已检查环境，正在处理第一步" --request-id step-1-progress
-python relay_client.py send SESSION_ID --kind result --text "第一步完成，结果如下……" --request-id step-1-result --reply-to 3
-python relay_client.py ack SESSION_ID 5
+python relay_client.py heartbeat --report-environment
+python relay_client.py watch --wait 20
+python relay_client.py events --after 0 --wait 20
+python relay_client.py send --kind progress --text "已检查环境，正在处理第一步" --request-id step-1-progress
+python relay_client.py send --kind result --text "第一步完成，结果如下……" --request-id step-1-result --reply-to 3
+python relay_client.py ack 5
 ```
 
 `watch` 常驻拉取并逐行打印事件，Ctrl-C 退出；它记录的是“已展示到哪”的 `read_cursor`，重启后从该位置继续，不会重复刷屏。`ack` 记录的是“已处理到哪”的 `acked_cursor`，`events` 未传 `--after` 时从它继续，因此未确认的事件会重放。两者分开保存在状态文件中（旧版本文件只有 `acked_cursor`，缺省按 0 处理）。

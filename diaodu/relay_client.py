@@ -264,13 +264,15 @@ def main():
     join.add_argument('--alias', default='通用Agent', help='首次接入时用于标识此Agent')
     join.add_argument('--type', default='通用Agent', help='首次接入时的Agent类型')
     join.add_argument('--code-file', type=Path, help='或设置DIAODU_PAIR_CODE；交互终端可安全输入')
+    join.add_argument('--watch', action='store_true', help='加入后直接进入监听循环，Ctrl-C 退出')
+    join.add_argument('--wait', type=_wait_seconds, default=20, help='配合 --watch：每次等待秒数，1 到 20')
     watch = commands.add_parser('watch', help='常驻拉取并逐行打印事件，Ctrl-C 退出')
-    watch.add_argument('session')
+    watch.add_argument('session', nargs='?', help='省略时使用最近加入的会话')
     watch.add_argument('--after', type=int, default=None, help='默认续读上次 watch 的展示位置')
     watch.add_argument('--wait', type=_wait_seconds, default=20, help='每次长轮询等待秒数，1 到 20')
-    for name in ('get', 'events', 'send', 'ack', 'heartbeat', 'state'):
+    for name in ('get', 'events', 'send', 'heartbeat', 'state'):
         sub = commands.add_parser(name)
-        sub.add_argument('session')
+        sub.add_argument('session', nargs='?', help='省略时使用最近加入的会话')
         if name == 'events':
             sub.add_argument('--after', type=int, default=None)
             sub.add_argument('--wait', type=int, default=20)
@@ -281,12 +283,12 @@ def main():
             texts.add_argument('--text-file', type=Path)
             sub.add_argument('--request-id', required=True)
             sub.add_argument('--reply-to', type=int)
-        elif name == 'ack':
-            sub.add_argument('seq', type=int)
         elif name == 'heartbeat':
             sub.add_argument('--report-environment', action='store_true', help='仅执行端使用')
         elif name == 'state':
             sub.add_argument('status', choices=('active', 'paused', 'closed'))
+    ack = commands.add_parser('ack', help='确认已接收至指定序号；可写成 ack SEQ 或 ack SESSION SEQ')
+    ack.add_argument('values', nargs='*', help='[SESSION] SEQ；只写 SEQ 时使用最近加入的会话')
     args = parser.parse_args()
     try:
         if args.command == 'environment':
@@ -303,6 +305,16 @@ def main():
             except OSError as error:
                 print('游标未能写入状态文件：' + str(error), file=sys.stderr)
 
+        def session_arg(value=None):
+            chosen = value or config.get('last_session')
+            if not chosen:
+                parser.error('没有会话编号：先 join 一次，或显式传 SESSION')
+            return chosen
+
+        def remember_session(sid):
+            config['last_session'] = sid
+            persist()
+
         if args.command not in ('connect', 'join') and not client.token:
             parser.error('先connect或通过DIAODU_TOKEN提供凭据')
         if args.command == 'connect':
@@ -314,6 +326,7 @@ def main():
             result = client.list()
         elif args.command == 'create':
             result = client.create(args.title, args.goal)
+            remember_session(result['session']['id'])
         elif args.command == 'join':
             code = args.code_file.read_text().strip() if args.code_file else os.environ.get('DIAODU_PAIR_CODE') or getpass.getpass('单次配对码：')
             if not client.token:
@@ -323,39 +336,67 @@ def main():
                 config['token'] = client.token
                 save_state(args.state_file, saved)
             result = client.join(code, args.role)
+            session = result['session']
+            remember_session(session['id'])
+            if args.watch:
+                sid = session['id']
+                cursor = int(session.get('last_seq', 0))
+                print('已加入并开始监听 ' + sid + '，从 #' + str(cursor) + ' 开始，Ctrl-C 退出',
+                      file=sys.stderr)
+
+                def remember(cursor, sid=sid):
+                    remember_read_cursor(config, sid, cursor)
+                    persist()
+
+                stopped = watch_loop(client, sid, cursor, args.wait, on_cursor=remember)
+                print('watch 已停止，展示到 #' + str(stopped), file=sys.stderr)
+                return
         elif args.command == 'get':
-            result = client.get(args.session)
+            result = client.get(session_arg(args.session))
         elif args.command == 'events':
+            sid = session_arg(args.session)
             # Unacked events replay on purpose; --after wins when the caller keeps its own cursor.
-            after = args.after if args.after is not None else acked_cursor(config, args.session)
-            result = client.events(args.session, after, args.wait)
-            remember_read_cursor(config, args.session, result.get('next_cursor', after))
+            after = args.after if args.after is not None else acked_cursor(config, sid)
+            result = client.events(sid, after, args.wait)
+            remember_read_cursor(config, sid, result.get('next_cursor', after))
             persist()
         elif args.command == 'watch':
-            resume = read_cursor(config, args.session)
+            sid = session_arg(args.session)
+            resume = read_cursor(config, sid)
             after = args.after if args.after is not None else (
-                resume if resume is not None else acked_cursor(config, args.session))
-            print('watch 已启动：' + args.session + '，从 #' + str(after) + ' 开始，Ctrl-C 退出',
+                resume if resume is not None else acked_cursor(config, sid))
+            print('watch 已启动：' + sid + '，从 #' + str(after) + ' 开始，Ctrl-C 退出',
                   file=sys.stderr)
 
-            def remember(cursor):
-                remember_read_cursor(config, args.session, cursor)
+            def remember(cursor, sid=sid):
+                remember_read_cursor(config, sid, cursor)
                 persist()
 
-            stopped = watch_loop(client, args.session, after, args.wait, on_cursor=remember)
+            stopped = watch_loop(client, sid, after, args.wait, on_cursor=remember)
             print('watch 已停止，展示到 #' + str(stopped), file=sys.stderr)
             return
         elif args.command == 'send':
+            sid = session_arg(args.session)
             text = args.text_file.read_text() if args.text_file else args.text
-            result = client.send(args.session, args.kind, text, args.request_id, args.reply_to)
+            result = client.send(sid, args.kind, text, args.request_id, args.reply_to)
         elif args.command == 'ack':
-            result = client.ack(args.session, args.seq)
-            config.setdefault('cursors', {})[args.session] = result['acknowledged']
+            if len(args.values) == 1:
+                sid, seq = session_arg(), args.values[0]
+            elif len(args.values) == 2:
+                sid, seq = args.values
+            else:
+                parser.error('用法：ack [SESSION] SEQ')
+            try:
+                seq = int(seq)
+            except ValueError:
+                parser.error('SEQ 必须是整数')
+            result = client.ack(sid, seq)
+            config.setdefault('cursors', {})[sid] = result['acknowledged']
             persist()
         elif args.command == 'heartbeat':
-            result = client.heartbeat(args.session, args.report_environment)
+            result = client.heartbeat(session_arg(args.session), args.report_environment)
         else:
-            result = client.state(args.session, args.status)
+            result = client.state(session_arg(args.session), args.status)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     except (RelayError, ValueError, OSError) as error:
         parser.exit(1, '请求失败：' + str(error) + '\n')
