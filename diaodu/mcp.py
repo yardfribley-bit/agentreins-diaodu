@@ -69,7 +69,13 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
    name=params.get('name','').removeprefix('diaodu_');args=params.get('arguments') or {}
    definition=next((t for t in TOOLS if t[0]==name),None)
    if not definition:raise ValueError('未知工具')
-   if not isinstance(args,dict) or any(k not in definition[2] for k in args) or any(k not in args for k in definition[3]):raise ValueError('工具参数不合法')
+   if not isinstance(args,dict):raise ValueError('工具参数不合法：arguments 必须是对象')
+   missing=[k for k in definition[3] if k not in args]
+   extra=sorted(k for k in args if k not in definition[2])
+   if missing or extra:
+    # Names only: values may be invite codes or base64 payloads and must never echo back.
+    detail='；'.join((['缺少 '+'、'.join(missing)] if missing else [])+(['不允许 '+'、'.join(extra)] if extra else []))
+    raise ValueError('工具参数不合法：'+detail)
    if name=='connect':
     if session is None:raise AuthError('请先initialize，并携带Mcp-Session-Id；或使用已有Bearer凭证',401)
     if actor:payload={k:v for k,v in actor.items() if k not in ('csrf','token')}

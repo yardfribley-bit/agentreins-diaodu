@@ -382,6 +382,20 @@ class TeamsHTTP(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(hashlib.sha256(data).hexdigest(), uploaded['sha256'])
 
+    def test_mcp_argument_error_names_keys_without_echoing_values(self):
+        _init, sid = self.mcp({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}})
+        result, _connected = self.mcp_call('connect', {'alias': '参数校验', 'agent_type': 'Dev'}, sid)
+        self.assertFalse(result.get('isError'))
+        response, _ = self.mcp({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                                'params': {'name': 'diaodu_relay_team_invite',
+                                           'arguments': {'role': 'mentor',
+                                                         'secret_value': 'must-not-leak'}}}, sid)
+        result = response['result']
+        self.assertTrue(result['isError'])
+        self.assertEqual(json.loads(result['content'][0]['text']),
+                         {'code': 400,
+                          'message': '工具参数不合法：缺少 session；不允许 secret_value'})
+
 
 if __name__ == '__main__':
     unittest.main()
