@@ -12,8 +12,10 @@ from diaodu.identity import AuthError
 # Public share links are rate limited per source IP. 24-byte codes are not enumerable,
 # but this keeps a cheap ceiling on scanning and accidental loops.
 RATE_LIMIT = 60
+PUBLIC_RATE_LIMIT = 30
 RATE_WINDOW = 60.0
 _HITS = {}
+_PUBLIC_HITS = {}
 _HITS_LOCK = threading.Lock()
 
 
@@ -22,20 +24,28 @@ def _client_ip(handler):
     return handler.headers.get('X-Real-IP') or handler.client_address[0]
 
 
-def _rate_limit(handler):
+def _limit(handler, bucket, limit):
     ip = _client_ip(handler)
     now = time.monotonic()
     with _HITS_LOCK:
-        hits = [moment for moment in _HITS.get(ip, ()) if now - moment < RATE_WINDOW]
-        if len(hits) >= RATE_LIMIT:
-            _HITS[ip] = hits
+        hits = [moment for moment in bucket.get(ip, ()) if now - moment < RATE_WINDOW]
+        if len(hits) >= limit:
+            bucket[ip] = hits
             raise AuthError('请求过于频繁，请稍后重试', 429)
         hits.append(now)
-        _HITS[ip] = hits
-        if len(_HITS) > 1000:
-            for key, values in list(_HITS.items()):
+        bucket[ip] = hits
+        if len(bucket) > 1000:
+            for key, values in list(bucket.items()):
                 if not values or now - values[-1] >= RATE_WINDOW:
-                    _HITS.pop(key, None)
+                    bucket.pop(key, None)
+
+
+def _rate_limit(handler):
+    _limit(handler, _HITS, RATE_LIMIT)
+
+
+def _public_rate_limit(handler):
+    _limit(handler, _PUBLIC_HITS, PUBLIC_RATE_LIMIT)
 
 
 def _base_url(handler, library):
@@ -183,6 +193,15 @@ def get(handler, library, parsed):
         _rate_limit(handler)
         handler._json(200, _topic_info(handler, library, parts[3]))
         return
+    if len(parts) == 5 and parts[:3] == ['v1', 'relay', 'public'] and parts[4] == 'events':
+        _public_rate_limit(handler)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if set(query) - {'after', 'wait'} or any(len(values) != 1 for values in query.values()):
+            raise ValueError('仅支持 after 与 wait 查询参数')
+        after = int(query.get('after', ['0'])[0])
+        wait = 0 if getattr(handler, '_head_only', False) else int(query.get('wait', ['0'])[0])
+        handler._json(200, library.relay.public_events(parts[3], after=after, wait=wait))
+        return
     if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'sessions'] and parts[4] == 'files':
         relay = library.relay
         query = parse_qs(parsed.query)
@@ -258,6 +277,7 @@ def post(handler, library, parts):
     elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'sessions']:
         action = {'messages': relay.send, 'ack': relay.ack, 'heartbeat': relay.heartbeat,
                   'state': relay.state, 'invites': relay.invite, 'revoke': relay.revoke,
+                  'public': relay.set_public,
                   'topic-code': relay.rotate_topic_code}.get(parts[4])
         if action is None:
             handler._json(404, {'error': '没有这个实时协作动作'})

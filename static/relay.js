@@ -205,6 +205,10 @@
     $('session-status').textContent = states[current.status] || '状态待确认'; $('session-status').className = 'status-badge ' + current.status;
     $('session-role').textContent = '当前身份：' + (roles[current.role] || '成员');
     $('owner-actions').hidden = !owner(); $('management').hidden = !owner();
+    $('toggle-public').textContent = current.public_read ? '关闭公开围观' : '开启公开围观';
+    $('toggle-public').disabled = mutationBusy;
+    $('public-panel').hidden = !current.public_read;
+    if (current.public_read) $('public-link').value = localStorage.getItem('relay-public-' + current.id) || '';
     $('toggle-state').textContent = current.status === 'paused' ? '继续协作' : '暂停指令';
     $('toggle-state').disabled = mutationBusy || current.status === 'closed'; $('close-session').disabled = mutationBusy || current.status === 'closed'; $('rotate-topic-code').disabled = mutationBusy || current.status === 'closed';
     $('revoke-all').disabled = mutationBusy || !array(current.peers).length;
@@ -438,6 +442,27 @@
   $('message-text').addEventListener('keydown',event => {if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && !event.isComposing) {event.preventDefault(); $('message-form').requestSubmit();}});
   $('cancel-reply').addEventListener('click',() => {replyTo = null; renderComposer();});
   $('toggle-state').addEventListener('click',() => changeState(current?.status === 'paused' ? 'active' : 'paused'));
+  $('toggle-public').addEventListener('click', async () => {
+    if (!owner() || !current || mutationBusy) return;
+    const id = current.id, enable = !current.public_read;
+    mutationBusy = true; renderCurrent();
+    try {
+      const value = await api('relay/sessions/' + encodeURIComponent(id) + '/public',{enabled: enable});
+      if (value.session) upsertSession(value.session);
+      if (value.public_url) localStorage.setItem('relay-public-' + id, value.public_url);
+      else localStorage.removeItem('relay-public-' + id);
+      $('public-link').value = value.public_url || '';
+      notify(value.public_url ? '公开围观已开启，公开链接已生成。' : '公开围观已关闭，旧链接立即失效。');
+    } catch (error) { notify(error.message,true); }
+    finally { mutationBusy = false; renderCurrent(); }
+  });
+  $('close-public').addEventListener('click', () => $('toggle-public').click());
+  $('copy-public').addEventListener('click', async () => {
+    const link = $('public-link').value;
+    if (!link) return;
+    try {await navigator.clipboard.writeText(link); $('copy-public').textContent = '已复制';}
+    catch (_) {$('public-link').select(); notify('剪贴板不可用，请手动复制。',true);}
+  });
   $('rotate-topic-code').addEventListener('click',() => {
     if (!owner() || current?.status === 'closed') return;
     openConfirm('重置 Topic 配对码？','旧配对码将立即失效。已加入的 Agent 不受影响，尚未加入的 Agent 需要使用新码。','重置并显示新码',resetTopicCode);

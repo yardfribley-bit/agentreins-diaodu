@@ -123,6 +123,12 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self.send_header('Content-Length', '0')
                 self.end_headers()
                 return
+            if parsed.path.startswith('/relay/watch/'):
+                self._file(STATIC / 'relay-watch.html')
+                return
+            if parsed.path == '/relay-watch.js':
+                self._file(STATIC / 'relay-watch.js')
+                return
             relay_static = {'/relay/': 'relay.html', '/relay/relay.js': 'relay.js', '/relay/relay.css': 'relay.css'}
             if parsed.path in relay_static:
                 self._file(STATIC / relay_static[parsed.path])

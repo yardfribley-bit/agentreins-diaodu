@@ -139,7 +139,8 @@ class Relay:
                   id TEXT PRIMARY KEY, title TEXT NOT NULL, goal TEXT NOT NULL,
                   status TEXT NOT NULL, owner_key TEXT NOT NULL,
                   created REAL NOT NULL, updated REAL NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0,
-                  topic_code_hash TEXT);
+                  topic_code_hash TEXT, public_read INTEGER NOT NULL DEFAULT 0,
+                  public_token_hash TEXT);
                 CREATE INDEX IF NOT EXISTS sessions_owner ON sessions(owner_key,status);
                 CREATE TABLE IF NOT EXISTS members (
                   session_id TEXT NOT NULL, role TEXT NOT NULL, actor_key TEXT NOT NULL,
@@ -167,6 +168,10 @@ class Relay:
             columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
             if "topic_code_hash" not in columns:
                 db.execute("ALTER TABLE sessions ADD COLUMN topic_code_hash TEXT")
+            if "public_read" not in columns:
+                db.execute("ALTER TABLE sessions ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0")
+            if "public_token_hash" not in columns:
+                db.execute("ALTER TABLE sessions ADD COLUMN public_token_hash TEXT")
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -243,7 +248,8 @@ class Relay:
         return {"id": session["id"], "title": session["title"], "goal": session["goal"],
                 "status": session["status"], "created_at": _iso(session["created"]),
                 "updated_at": _iso(session["updated"]), "owner": member["role"] == "owner",
-                "role": member["role"], "peers": peers, "last_seq": session["last_seq"]}
+                "role": member["role"], "peers": peers, "last_seq": session["last_seq"],
+                "public_read": bool(session["public_read"])}
 
     def _view(self, db, actor, sid):
         session, member = self._access(db, actor, sid)
@@ -295,6 +301,137 @@ class Relay:
         return {"id": row["id"], "name": row["name"], "size": row["size"],
                 "sha256": row["sha256"], "type": row["type"], "uploader": row["uploader"],
                 "created_at": _iso(row["created"]), "url": url, "download_url": url}
+
+    # -- public read-only view ------------------------------------------
+
+    def _public_base(self):
+        base = self.public_origin + self.public_base_path
+        return base.rstrip("/")
+
+    def _public_row(self, db, hashed):
+        row = db.execute("SELECT * FROM sessions WHERE public_token_hash=? AND public_read=1",
+                         (hashed,)).fetchone()
+        if row is None:
+            raise AuthError("公开视图不可用或已关闭", 404)
+        return row
+
+    def _public_view(self, db, session):
+        members = {row["role"]: row["name"] for row in db.execute(
+            "SELECT role,name FROM members WHERE session_id=?", (session["id"],))}
+        return {"title": session["title"], "goal": session["goal"], "status": session["status"],
+                "created_at": _iso(session["created"]), "updated_at": _iso(session["updated"]),
+                "last_seq": session["last_seq"],
+                "mentor": {"role": "mentor", "name": members["mentor"]} if "mentor" in members else None,
+                "worker": {"role": "worker", "name": members["worker"]} if "worker" in members else None}
+
+    @staticmethod
+    def _public_payload(kind, payload, db=None, session_id=None):
+        """Whitelist public fields; environment and credentials never leave the server."""
+        if kind == "message":
+            message = payload.get("message") or {}
+            attachments = []
+            for item in message.get("attachments") or []:
+                if isinstance(item, dict):
+                    attachments.append({"name": item.get("name"), "size": item.get("size"),
+                                        "type": item.get("type")})
+                elif isinstance(item, str) and db is not None:
+                    row = db.execute("SELECT name,size,type FROM files WHERE id=? AND session_id=?",
+                                     (item, session_id)).fetchone()
+                    if row is not None:
+                        attachments.append({"name": row["name"], "size": row["size"],
+                                            "type": row["type"]})
+            public = {"kind": message.get("kind"), "text": message.get("text"),
+                      "reply_to": message.get("reply_to")}
+            if attachments:
+                public["attachments"] = attachments
+            return {"message": public}
+        if kind == "joined":
+            return {"role": payload.get("role")}
+        if kind == "state":
+            return {"status": payload.get("status")}
+        if kind == "revoked":
+            return {"role": payload.get("role")}
+        return {}
+
+    def _public_event(self, db, row):
+        if row["kind"] == "environment":
+            return None
+        event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
+                 "sender": {"role": row["sender_role"], "name": row["sender_name"]}}
+        event.update(self._public_payload(row["kind"], json.loads(row["payload"]),
+                                         db, row["session_id"]))
+        return event
+
+    def _public_page(self, token, after):
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        with self._read() as db:
+            session = self._public_row(db, hashed)
+            if after > session["last_seq"]:
+                raise ValueError("消息游标超过当前会话进度")
+            rows = db.execute("SELECT * FROM events WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
+                              (session["id"], after, self.PAGE_SIZE + 1)).fetchall()
+            scanned = rows[:self.PAGE_SIZE]
+            events = [event for event in (self._public_event(db, row) for row in scanned)
+                      if event is not None]
+            return {"session": self._public_view(db, session), "events": events,
+                    "next_cursor": scanned[-1]["seq"] if scanned else after,
+                    "has_more": len(rows) > self.PAGE_SIZE}
+
+    def public_events(self, token, after=0, wait=0):
+        if not isinstance(token, str) or not token or len(token) > 160:
+            raise AuthError("公开视图不可用或已关闭", 404)
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ValueError("after须为非负整数")
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or not 0 <= wait <= 20:
+            raise ValueError("wait须为0至20秒")
+        waiter = ("public", hashlib.sha256(token.encode()).hexdigest())
+        registered = False
+        deadline = time.monotonic() + wait
+        try:
+            with self._condition:
+                while True:
+                    result = self._public_page(token, after)
+                    if result["events"] or not wait or result["session"]["status"] == "closed" or time.monotonic() >= deadline:
+                        # Re-check the token after waiting: disabling or rotating must close it.
+                        with self._read() as db:
+                            session = self._public_row(db, waiter[1])
+                            result["session"] = self._public_view(db, session)
+                        return result
+                    if result["next_cursor"] > after:
+                        after = result["next_cursor"]
+                        continue
+                    if not registered:
+                        if waiter in self._waiters or len(self._waiters) >= self.MAX_WAITERS:
+                            raise AuthError("实时等待连接已达上限，请稍后重试", 429)
+                        self._waiters.add(waiter)
+                        registered = True
+                    self._condition.wait(min(1.0, max(0, deadline - time.monotonic())))
+        finally:
+            if registered:
+                with self._condition:
+                    self._waiters.discard(waiter)
+
+    def set_public(self, actor, sid, body):
+        body = _body(body, {"enabled"})
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if member["role"] != "owner":
+                raise AuthError("只有管理者可以开关公开围观", 403)
+            now = time.time()
+            url = None
+            if enabled:
+                token = secrets.token_urlsafe(24)
+                db.execute("UPDATE sessions SET public_read=1, public_token_hash=?, updated=? WHERE id=?",
+                           (hashlib.sha256(token.encode()).hexdigest(), now, sid))
+                url = self._public_base() + "/relay/watch/" + token
+            else:
+                db.execute("UPDATE sessions SET public_read=0, public_token_hash=NULL, updated=? WHERE id=?",
+                           (now, sid))
+            view = self._session(db, db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone(), member)
+            return {"session": view, "public_url": url}
 
     def _event(self, db, row):
         result = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),

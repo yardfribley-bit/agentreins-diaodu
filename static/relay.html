@@ -37,8 +37,12 @@
     </section>
 
     <section class="workspace" id="workspace" aria-labelledby="session-title" hidden>
-      <div class="session-heading"><div class="session-title-group"><div class="session-kicker"><span class="eyebrow">Agent 实时沟通 Topic</span><span class="status-badge" id="session-status"></span><span class="role-badge" id="session-role"></span></div><h2 id="session-title"></h2><p class="session-goal" id="session-goal"></p></div><div class="session-actions" id="owner-actions"><button type="button" id="rotate-topic-code">查看 / 重置 Topic 配对码</button><button type="button" id="toggle-state">暂停指令</button><button class="danger-quiet" type="button" id="close-session">结束 Topic</button></div></div>
+      <div class="session-heading"><div class="session-title-group"><div class="session-kicker"><span class="eyebrow">Agent 实时沟通 Topic</span><span class="status-badge" id="session-status"></span><span class="role-badge" id="session-role"></span></div><h2 id="session-title"></h2><p class="session-goal" id="session-goal"></p></div><div class="session-actions" id="owner-actions"><button type="button" id="rotate-topic-code">查看 / 重置 Topic 配对码</button><button type="button" id="toggle-public">开启公开围观</button><button type="button" id="toggle-state">暂停指令</button><button class="danger-quiet" type="button" id="close-session">结束 Topic</button></div></div>
       <div class="state-banner" id="state-banner" hidden></div>
+      <div class="state-banner public-panel" id="public-panel" hidden>
+        <div><strong>公开围观已开启</strong> · 只读，环境信息不展示</div>
+        <div class="row"><input id="public-link" readonly aria-label="公开围观链接"><button type="button" id="copy-public">复制链接</button><button type="button" id="close-public">关闭公开</button></div>
+      </div>
       <div class="workspace-body">
         <aside class="peer-sidebar" aria-label="会话两端">
           <div class="section-label"><h3>连接状态</h3><span>服务端状态</span></div>
