@@ -299,11 +299,19 @@ class Relay:
                 public["attachments"] = attachments
             return {"message": public}
         if kind == "joined":
-            return {"role": payload.get("role")}
+            public = {"role": payload.get("role")}
+            # One-to-one sessions have no seats; only emit the field where it exists
+            # so the public contract stays role-only for the pair flow.
+            if payload.get("seat") is not None:
+                public["seat"] = payload.get("seat")
+            return public
         if kind == "state":
             return {"status": payload.get("status")}
         if kind == "revoked":
-            return {"role": payload.get("role")}
+            public = {"role": payload.get("role")}
+            if payload.get("seat") is not None:
+                public["seat"] = payload.get("seat")
+            return public
         return {}
 
     def _public_event(self, db, row):
