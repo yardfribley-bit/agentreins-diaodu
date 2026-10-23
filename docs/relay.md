@@ -32,13 +32,16 @@ python relay_client.py join --role worker --alias "我的执行端" --type "实�
 
 ```sh
 python relay_client.py heartbeat SESSION_ID --report-environment
+python relay_client.py watch SESSION_ID --wait 20
 python relay_client.py events SESSION_ID --after 0 --wait 20
 python relay_client.py send SESSION_ID --kind progress --text "已检查环境，正在处理第一步" --request-id step-1-progress
 python relay_client.py send SESSION_ID --kind result --text "第一步完成，结果如下……" --request-id step-1-result --reply-to 3
 python relay_client.py ack SESSION_ID 5
 ```
 
-`ack` 将最后确认序号保存到本地，之后 `events` 未传 `--after` 时从该位置继续。只读消息不会自动确认完成。平台显示的是执行端自报环境，不将其视为远程硬件认证。
+`watch` 常驻拉取并逐行打印事件，Ctrl-C 退出；它记录的是“已展示到哪”的 `read_cursor`，重启后从该位置继续，不会重复刷屏。`ack` 记录的是“已处理到哪”的 `acked_cursor`，`events` 未传 `--after` 时从它继续，因此未确认的事件会重放。两者分开保存在状态文件中（旧版本文件只有 `acked_cursor`，缺省按 0 处理）。
+
+**执行成功后再 `ack`**：`ack` 只表示已接收，不代表执行完成；完成结果仍要另发 `result`。如果执行端需要“至少一次”处理，应在本地持久化已执行的事件序号（或显式 `--after` 传入自己的游标），不要只依赖 `watch` 的展示游标。平台显示的是执行端自报环境，不将其视为远程硬件认证；对方在线状态按最近 60 秒内是否有任何已认证请求（含长轮询）计算。
 
 ## 用 Python 接入已有 Agent
 
@@ -74,7 +77,7 @@ while True:
         client.ack(sid, cursor)
 ```
 
-上例展示协议循环，注释中的执行器需由已有 Agent 实现。生产接入还应处理HTTP超时/429/断线，退避重试并保持同一请求ID；退出后重新运行不会由平台自动启动本地Agent。
+上例展示协议循环，注释中的执行器需由已有 Agent 实现。标准库客户端已对 HTTP 超时、429 和 5xx 做指数退避重试，重试时保留同一请求ID；自建客户端需要自行实现同样的退避与幂等，退出后重新运行不会由平台自动启动本地 Agent。
 
 ## HTTP 协议
 
@@ -105,7 +108,9 @@ while True:
 
 加入Topic码时须选择mentor或worker；每个角色只有一个席位。同一Agent不能同时占两端。只有指导端及管理者能发`instruction`；执行端发`progress`和`result`；所有参与者可以发`question`和`note`。成员资格和身份凭据撤销后不能继续读取历史消息，也不能再用原 Topic 码重新加入；需要恢复时由管理者重新签发一次性邀请码。私有消息不进入公开任务板。
 
-每次响应包含会话快照；事件有严格递增`seq`。`next_cursor`用于下一页，`has_more=true`时继续补读。发送重试必须保留相同`request_id`和内容，不同内容复用ID会返回409。ACK只表示接收确认，执行完成必须发送result；执行器需要自己的幂等记录，平台不保证外部系统操作“恰好一次”。
+每次响应包含会话快照；事件有严格递增`seq`。`next_cursor`用于下一页，`has_more=true`时继续补读。发送重试必须保留相同`request_id`和内容（文本入库前会去掉首尾空白，空白差异视为同一条），不同内容复用ID会返回409。ACK只表示接收确认，执行完成必须发送result；执行器需要自己的幂等记录，平台不保证外部系统操作“恰好一次”。
+
+`online` 表示该成员最近 60 秒内有过已认证请求，长轮询本身也算，因此只旁听不发消息的一端仍显示在线。会话普通事件达到 5000 条后拒绝新的消息与进度；结束会话、撤销成员等控制事件仍会写入，执行端环境刷新只更新成员信息、不再追加事件，也不会因此报错。
 
 暂停会话阻止新指令，已有结果和进度仍可回传。正在执行的远端操作只有执行端自身能停止；指导端和执行端都应检查state事件与最新快照。结束会话后仅可查看历史。
 

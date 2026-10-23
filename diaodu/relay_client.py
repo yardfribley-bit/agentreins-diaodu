@@ -9,9 +9,11 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import sys
 import tempfile
+import time
 import uuid
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -62,37 +64,68 @@ class RelayClient:
         self.url = url.rstrip('/')
         self.token = token if token is not None else os.environ.get('DIAODU_TOKEN', '')
         self.opener = build_opener(NoRedirect())
+        self.max_retries = 3
+        self.retry_base = 0.5
+        self._sleep = time.sleep
 
-    def request(self, path, body=None, timeout=35):
+    def _retry_delay(self, attempt, headers=None):
+        if headers is not None:
+            value = headers.get('Retry-After')
+            if value:
+                try:
+                    return min(max(float(value), 0.0), 10.0)
+                except (TypeError, ValueError):
+                    pass
+        return min(self.retry_base * (2 ** attempt), 10.0)
+
+    def request(self, path, body=None, timeout=35, idempotent=True):
+        """Retry 429 and transient failures; ambiguous writes opt out via idempotent=False."""
         if not path.startswith('/') or path.startswith('//'):
             raise ValueError('需要API相对路径')
-        headers = {'Accept': 'application/json', 'Content-Type': 'application/json',
-                   'User-Agent': 'diaodu-relay-client/1'}
-        if self.token:
-            headers['Authorization'] = 'Bearer ' + self.token
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode()
-        request = Request(self.url + path, data=data, headers=headers)
-        try:
-            with self.opener.open(request, timeout=timeout) as response:
-                return json.load(response)
-        except HTTPError as error:
-            with error:
-                try:
-                    message = json.load(error).get('error', '请求失败')
-                except (ValueError, AttributeError):
-                    message = 'HTTP ' + str(error.code)
-            raise RelayError(error.code, str(message)) from None
+        attempt = 0
+        while True:
+            headers = {'Accept': 'application/json', 'Content-Type': 'application/json',
+                       'User-Agent': 'diaodu-relay-client/1'}
+            if self.token:
+                headers['Authorization'] = 'Bearer ' + self.token
+            request = Request(self.url + path, data=data, headers=headers)
+            try:
+                with self.opener.open(request, timeout=timeout) as response:
+                    return json.load(response)
+            except HTTPError as error:
+                with error:
+                    try:
+                        message = json.load(error).get('error', '请求失败')
+                    except (ValueError, AttributeError):
+                        message = 'HTTP ' + str(error.code)
+                    retryable = error.code == 429 or (
+                        idempotent and error.code in (500, 502, 503, 504))
+                    retry_headers = error.headers
+                if retryable and attempt < self.max_retries:
+                    self._sleep(self._retry_delay(attempt, retry_headers))
+                    attempt += 1
+                    continue
+                raise RelayError(error.code, str(message)) from None
+            except (URLError, TimeoutError, ConnectionError) as error:
+                if idempotent and attempt < self.max_retries:
+                    self._sleep(self._retry_delay(attempt))
+                    attempt += 1
+                    continue
+                reason = getattr(error, 'reason', error)
+                raise RelayError(0, '网络连接失败：' + str(reason)) from None
 
     def connect(self, alias, agent_type='通用Agent'):
         if self.token:
             return dict(self.request('/me'), reused=True)
-        result = self.request('/connect', {'alias': alias, 'agent_type': agent_type, 'member_kind': 'agent'})
+        result = self.request('/connect', {'alias': alias, 'agent_type': agent_type, 'member_kind': 'agent'},
+                              idempotent=False)
         self.token = result.pop('token')
         result.pop('csrf', None)
         return result
 
     def create(self, title, goal):
-        return self.request('/relay/sessions', {'title': title, 'goal': goal})
+        return self.request('/relay/sessions', {'title': title, 'goal': goal}, idempotent=False)
 
     def join(self, code, role, reported_environment=None):
         if role not in ('mentor', 'worker'):
@@ -100,7 +133,7 @@ class RelayClient:
         body = {'code': code, 'role': role}
         if role == 'worker':
             body['environment'] = reported_environment if reported_environment is not None else environment()
-        return self.request('/relay/join', body)
+        return self.request('/relay/join', body, idempotent=False)
 
     def list(self):
         return self.request('/relay/sessions')
@@ -116,6 +149,7 @@ class RelayClient:
         return self.request(self.path(sid) + '/events?' + urlencode({'after': after, 'wait': wait}), timeout=35)
 
     def send(self, sid, kind, text, request_id=None, reply_to=None):
+        """Keep one request_id for a logical message so transport retries stay idempotent."""
         body = {'kind': kind, 'text': text, 'request_id': request_id or str(uuid.uuid4())}
         if reply_to is not None:
             body['reply_to'] = reply_to
@@ -144,6 +178,49 @@ def load_state(path):
     return value
 
 
+def _cursor_value(config, field, sid, default=None):
+    cursors = config.get(field)
+    if not isinstance(cursors, dict):
+        return default
+    value = cursors.get(sid)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return default
+    return value
+
+
+def acked_cursor(config, sid):
+    """Last seq the user acknowledged; unacked events replay, so this is the safe resume point."""
+    return _cursor_value(config, 'cursors', sid, 0)
+
+
+def read_cursor(config, sid):
+    """Last seq watch already printed; None for state files written by older versions."""
+    return _cursor_value(config, 'read_cursors', sid, None)
+
+
+def remember_read_cursor(config, sid, cursor):
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        return
+    config.setdefault('read_cursors', {})[sid] = cursor
+
+
+def watch_loop(client, sid, cursor, wait, emit=print, on_cursor=None):
+    """Print each batch as one JSON line per event until Ctrl-C; returns the last cursor."""
+    try:
+        while True:
+            batch = client.events(sid, cursor, wait)
+            for event in batch.get('events') or []:
+                emit(json.dumps(event, ensure_ascii=False))
+            next_cursor = batch.get('next_cursor', cursor)
+            if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or next_cursor < cursor:
+                raise RelayError(0, '实时接口没有推进游标，已停止 watch')
+            cursor = next_cursor
+            if on_cursor is not None:
+                on_cursor(cursor)
+    except KeyboardInterrupt:
+        return cursor
+
+
 def save_state(path, state):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.is_symlink():
@@ -157,6 +234,16 @@ def save_state(path, state):
     finally:
         if os.path.exists(name):
             os.unlink(name)
+
+
+def _wait_seconds(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError('wait 须为 1 到 20 的整数')
+    if not 1 <= number <= 20:
+        raise argparse.ArgumentTypeError('wait 须为 1 到 20 的整数')
+    return number
 
 
 def main():
@@ -177,6 +264,10 @@ def main():
     join.add_argument('--alias', default='通用Agent', help='首次接入时用于标识此Agent')
     join.add_argument('--type', default='通用Agent', help='首次接入时的Agent类型')
     join.add_argument('--code-file', type=Path, help='或设置DIAODU_PAIR_CODE；交互终端可安全输入')
+    watch = commands.add_parser('watch', help='常驻拉取并逐行打印事件，Ctrl-C 退出')
+    watch.add_argument('session')
+    watch.add_argument('--after', type=int, default=None, help='默认续读上次 watch 的展示位置')
+    watch.add_argument('--wait', type=_wait_seconds, default=20, help='每次长轮询等待秒数，1 到 20')
     for name in ('get', 'events', 'send', 'ack', 'heartbeat', 'state'):
         sub = commands.add_parser(name)
         sub.add_argument('session')
@@ -205,6 +296,13 @@ def main():
         key = args.url.rstrip('/')
         config = saved.setdefault(key, {})
         client = RelayClient(key, os.environ.get('DIAODU_TOKEN') or config.get('token', ''))
+
+        def persist():
+            try:
+                save_state(args.state_file, saved)
+            except OSError as error:
+                print('游标未能写入状态文件：' + str(error), file=sys.stderr)
+
         if args.command not in ('connect', 'join') and not client.token:
             parser.error('先connect或通过DIAODU_TOKEN提供凭据')
         if args.command == 'connect':
@@ -228,15 +326,32 @@ def main():
         elif args.command == 'get':
             result = client.get(args.session)
         elif args.command == 'events':
-            after = args.after if args.after is not None else config.get('cursors', {}).get(args.session, 0)
+            # Unacked events replay on purpose; --after wins when the caller keeps its own cursor.
+            after = args.after if args.after is not None else acked_cursor(config, args.session)
             result = client.events(args.session, after, args.wait)
+            remember_read_cursor(config, args.session, result.get('next_cursor', after))
+            persist()
+        elif args.command == 'watch':
+            resume = read_cursor(config, args.session)
+            after = args.after if args.after is not None else (
+                resume if resume is not None else acked_cursor(config, args.session))
+            print('watch 已启动：' + args.session + '，从 #' + str(after) + ' 开始，Ctrl-C 退出',
+                  file=sys.stderr)
+
+            def remember(cursor):
+                remember_read_cursor(config, args.session, cursor)
+                persist()
+
+            stopped = watch_loop(client, args.session, after, args.wait, on_cursor=remember)
+            print('watch 已停止，展示到 #' + str(stopped), file=sys.stderr)
+            return
         elif args.command == 'send':
             text = args.text_file.read_text() if args.text_file else args.text
             result = client.send(args.session, args.kind, text, args.request_id, args.reply_to)
         elif args.command == 'ack':
             result = client.ack(args.session, args.seq)
             config.setdefault('cursors', {})[args.session] = result['acknowledged']
-            save_state(args.state_file, saved)
+            persist()
         elif args.command == 'heartbeat':
             result = client.heartbeat(args.session, args.report_environment)
         else:
