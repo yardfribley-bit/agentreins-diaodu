@@ -91,7 +91,9 @@ while True:
 | POST | `/join` | `code`, `role=mentor/worker`；worker另含`environment` |
 | GET | `/sessions/:id` | 会话状态、角色、双方在线状态、执行端环境 |
 | GET | `/sessions/:id/events` | `after=序号&wait=0至20`；每页最多100事件 |
-| POST | `/sessions/:id/messages` | `kind`, `text`, `request_id`, 可选`reply_to` |
+| POST | `/sessions/:id/messages` | `kind`, `text`, `request_id`, 可选`reply_to`、`attachments`（附件编号，最多20个） |
+| POST | `/sessions/:id/files?name=<URL编码>` | 原始字节上传，成员凭证；单文件≤100MB |
+| GET | `/sessions/:id/files/:file_id` | 成员凭证下载；私有，非成员403、跨会话404 |
 | POST | `/sessions/:id/ack` | `seq` |
 | POST | `/sessions/:id/heartbeat` | `{}`；worker可更新`environment` |
 | POST | `/sessions/:id/state` | 管理者：`status=active/paused/closed` |
@@ -113,6 +115,24 @@ while True:
 
 `online` 表示该成员最近 60 秒内有过已认证请求，长轮询本身也算，因此只旁听不发消息的一端仍显示在线。会话普通事件达到 5000 条后拒绝新的消息与进度；结束会话、撤销成员等控制事件仍会写入，执行端环境刷新只更新成员信息、不再追加事件，也不会因此报错。
 
+## 附件传输
+
+执行端的报表、截图、日志、代码可以先上传再随消息引用，附件与事件解耦，重试不会重复落盘：
+
+```sh
+# 上传原始字节，返回 file_id / name / size / sha256
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  --data-binary @报告.pdf \
+  "https://www.chuhaijian.com/task/v1/relay/sessions/$SID/files?name=%E6%8A%A5%E5%91%8A.pdf"
+
+# 回报结果并引用附件，reply_to 挂回原指令
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"kind":"result","text":"报表已生成","request_id":"result-7","reply_to":7,"attachments":["fl_..."]}' \
+  "https://www.chuhaijian.com/task/v1/relay/sessions/$SID/messages"
+```
+
+`relay_read` 的事件里 `message.attachments` 是元数据数组（`id,name,size,sha256,type,uploader,created_at,url`），老事件没有该字段时返回空数组 `[]`。下载走 `GET .../files/:file_id`，必须带成员凭证：非成员 403，拿另一个会话的附件编号 404，匿名不可读。文件名禁止路径分隔符和控制字符、长度≤240；类型按扩展名与文件头双判，只有图片、视频和纯文本内联预览，其余一律 `application/octet-stream` + `attachment`，并带 `X-Content-Type-Options: nosniff`。单文件上限 100MB、每条消息最多 20 个附件；Nginx 的 `client_max_body_size` 已调到 110m，升级后需 reload。文件保存在 data/library/relay-files/，随 data/library 一起备份。
+
 暂停会话阻止新指令，已有结果和进度仍可回传。正在执行的远端操作只有执行端自身能停止；指导端和执行端都应检查state事件与最新快照。结束会话后仅可查看历史。
 
 ## MCP 接入
@@ -122,7 +142,7 @@ while True:
 未 `connect` 的 MCP 会话调用 `relay_*` 仍返回 401；每次调用都会重新校验实例是否被撤销，relay 存储层照常校验会话成员资格与角色绑定。会话身份只存在于服务进程内存（24 小时有效，重启后失效），需要长期复用时按 REST/CLI 方式保存 Bearer。
 
 - `diaodu_relay_list` / `diaodu_relay_create` / `diaodu_relay_join`
-- `diaodu_relay_read` / `diaodu_relay_send` / `diaodu_relay_ack`
+- `diaodu_relay_read` / `diaodu_relay_send` / `diaodu_relay_ack` / `diaodu_relay_upload`
 - `diaodu_relay_heartbeat` / `diaodu_relay_state`
 - `diaodu_relay_invite` / `diaodu_relay_revoke`
 
