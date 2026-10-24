@@ -1,4 +1,5 @@
-/* Private relay management. Agent execution remains at the connected endpoints. */
+/* Relay workbench: a person talks 1:1 or 1:many with agents from this page.
+   Public directory links use session.public_id only. Never put invite or topic codes in the URL or in public copy. */
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
@@ -18,8 +19,10 @@
   let identity = null, csrf = '', sessions = [], current = null, cursor = 0;
   let generation = 0, pollController = null, listGeneration = 0, listController = null;
   let retryTimer = null, heartbeatAt = 0, replyTo = null, outgoing = null, mutationBusy = false;
-  let sending = false, createBusy = false, stopped = false, confirmTask = null, unread = 0;
+  let sending = false, createBusy = false, joinBusy = false, uploading = false, stopped = false, confirmTask = null, unread = 0;
+  let pendingFiles = [], joinLookup = null, joinTimer = null;
   const events = new Map();
+  const PUBLIC_ID = /^C-[pt][0-9a-f]{8}$/;
 
   for (const id of ['protocol-link','pair-guide-link']) $(id).href = guideURL;
 
@@ -88,7 +91,34 @@
   function requireIdentity() {
     if (identity) return true;
     $('identity-panel').hidden = false; $('identity-alias').focus();
-    notify('请先建立或恢复管理身份，再创建会话。'); return false;
+    notify('请先建立或恢复浏览器身份，再创建或加入对话。'); return false;
+  }
+  function publicConversationHref(session) {
+    // Phase 3 public directory owns /conversations/<public_id>/. This workbench
+    // only links out when the member payload already carries a public id.
+    const id = text(session && session.public_id);
+    if (!PUBLIC_ID.test(id) || session.visibility === 'private') return '';
+    return new URL('../conversations/' + id + '/', location.href).href;
+  }
+  function writeLocation(id, mode) {
+    const url = new URL(location.href);
+    url.searchParams.delete('code');
+    url.searchParams.delete('topic_code');
+    url.searchParams.delete('invite');
+    if (id) {
+      url.searchParams.set('session', id);
+      url.searchParams.set('mode', mode === 'team' ? 'team' : 'pair');
+    } else {
+      url.searchParams.delete('session');
+      url.searchParams.delete('mode');
+    }
+    history.replaceState(null, '', url.pathname + url.search + url.hash);
+  }
+  function isMine(event) {
+    const sender = event.sender || {};
+    if (!current || sender.role !== current.role) return false;
+    if (isTeam()) return Number(sender.seat) === Number(current.seat);
+    return true;
   }
   function updateIdentity() {
     $('identity-panel').hidden = !!identity;
@@ -96,19 +126,20 @@
     $('refresh-sessions').disabled = !identity;
   }
   function clearPairing() {$('pair-codes').replaceChildren(); formError('pair-error');}
-  function closeDialog(id) {$(id).close(); if (id === 'pair-dialog') clearPairing();}
+  function closeDialog(id) {$(id).close(); if (id === 'pair-dialog') clearPairing(); if (id === 'join-dialog') clearJoinForm();}
   function stopPolling() {
     ++generation; pollController?.abort(); pollController = null;
     if (retryTimer) clearTimeout(retryTimer); retryTimer = null;
   }
   function forgetPrivateView() {
     stopPolling(); events.clear(); current = null; cursor = 0; replyTo = null; outgoing = null;
+    clearPending();
     $('events').replaceChildren(); $('workspace').hidden = true; $('workspace-empty').hidden = false;
-    $('pair-dialog').close(); clearPairing(); $('team-dialog').close(); renderSessions();
+    $('pair-dialog').close(); clearPairing(); $('team-dialog').close(); writeLocation('', ''); renderSessions();
   }
   function lostIdentity() {
     identity = null; csrf = ''; sessions = []; forgetPrivateView(); updateIdentity();
-    $('session-list-empty').textContent = '连接身份后，可查看属于你的私有会话。';
+    $('session-list-empty').textContent = '连接身份后，可查看属于你的对话。';
     notify('当前身份已失效。请使用原平台身份重新登录；新身份不会自动取得旧会话权限。',true);
   }
   function upsertSession(session, mode) {
@@ -129,13 +160,13 @@
       const button = element('button',null,'session-item' + (current?.id === session.id ? ' active' : ''));
       button.type = 'button'; button.setAttribute('aria-current',String(current?.id === session.id));
       const top = element('div',null,'session-item-top'); top.append(element('span',null,'session-dot ' + session.status),element('strong',session.title || '未命名会话'));
-      const modeLabel = session.mode === 'team' ? '团队 · ' : '';
+      const modeLabel = session.mode === 'team' ? '团队 · ' : '一对一 · ';
       const bottom = element('div',null,'session-item-bottom'); bottom.append(element('span',modeLabel + (states[session.status] || '状态待确认') + ' · ' + (roles[session.role] || '成员')),element('time',date(session.updated_at)));
       button.append(top,element('p',session.goal || '尚未填写目标'),bottom);
       button.addEventListener('click',() => selectSession(session.id)); return button;
     }));
     $('session-list-empty').hidden = shown.length > 0;
-    if (!shown.length) $('session-list-empty').textContent = !identity ? '连接身份后，可查看属于你的私有会话。' : sessions.length ? '此状态下没有会话。' : '还没有协作会话。创建后，分别邀请指导端与执行端。';
+    if (!shown.length) $('session-list-empty').textContent = !identity ? '连接身份后，可查看属于你的对话。' : sessions.length ? '此状态下没有对话。' : '还没有对话。可以创建一对一 Topic 或团队会话，也可以用配对码加入。';
   }
   async function loadSessions() {
     if (!identity) return;
@@ -153,7 +184,10 @@
         ...array(teamValue.sessions).map(item => ({...item, mode:'team'}))
       ].sort((left,right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
       renderSessions();
-      if (!current && sessions.length) await selectSession(sessions[0].id);
+      if (!current) {
+        const opened = await openFromLocation();
+        if (!opened && sessions.length) await selectSession(sessions[0].id);
+      }
       if (current && !sessions.some(session => session.id === current.id)) forgetPrivateView();
     } catch (error) {
       if (error.name === 'AbortError' || thisGeneration !== listGeneration) return;
@@ -263,10 +297,16 @@
     const closed = current.status === 'closed';
     $('message-text').disabled = closed || sending;
     $('message-kind').disabled = closed || sending;
-    $('send-message').disabled = closed || blockedInstruction || sending || mutationBusy;
+    $('send-message').disabled = closed || blockedInstruction || sending || uploading || mutationBusy;
+    $('message-file').disabled = closed || sending || uploading;
     $('send-message').textContent = sending ? '正在确认发送…' : '发送消息 ↑';
     $('composer-state').textContent = closed ? '已结束，仅可阅读历史' : blockedInstruction ? '已暂停；可切换为备注或提问' : current.status === 'paused' ? '暂停期间仍可交流' : '';
     $('message-length').textContent = $('message-text').value.length + ' / 8000';
+    $('message-text').placeholder = current.role === 'worker' && !owner()
+      ? '回报进度或结果，或向指挥端提问…'
+      : isTeam()
+        ? '写下指令。可在上方选择全体执行端或某一个席位。'
+        : '写下给 Agent 的指令、问题或备注…';
     const target = $('composer-target'), choose = $('message-to'), previousTarget = choose.value;
     if (!isTeam()) {target.hidden = true; choose.replaceChildren();}
     else {
@@ -333,9 +373,10 @@
     $('manage-invites').hidden = !owner() || !isTeam(); $('manage-invites').disabled = mutationBusy || current.status === 'closed';
     $('rotate-topic-code').hidden = !!isTeam();
     const directory = $('directory-link');
-    const listed = current.public_id && current.visibility !== 'private' && /^C-[pt][0-9a-f]{8}$/.test(current.public_id);
-    directory.hidden = !listed;
-    if (listed) directory.href = '../conversations/' + current.public_id + '/';
+    const directoryHref = publicConversationHref(current);
+    directory.hidden = !directoryHref;
+    if (directoryHref) {directory.href = directoryHref; directory.title = '在公开目录中查看此对话。公开页不含配对码、邀请码或环境信息。';}
+    else {directory.removeAttribute('href');}
     $('toggle-public').textContent = current.public_read ? '关闭公开围观' : '开启公开围观';
     $('toggle-public').disabled = mutationBusy;
     $('public-panel').hidden = !current.public_read;
@@ -358,27 +399,50 @@
       if (event.kind === 'state') label = '会话' + (states[event.status] || '状态已更新');
       const row = element('div',null,'system-event'); row.append(element('span',label),element('time',date(event.created_at))); return row;
     }
-    const message = event.message || {}, row = element('article',null,'event ' + (Object.hasOwn(kinds,message.kind) ? message.kind : 'note'));
-    const meta = element('div',null,'event-meta');
-    meta.append(element('span',(sender.name || roles[sender.role] || '成员') + seatLabel,'event-author'),
-                element('span',kinds[message.kind] || '消息','event-kind'),element('span','#' + event.seq),element('time',date(event.created_at))); row.append(meta);
-    if (message.reply_to) row.append(element('div','回复 #' + text(message.reply_to),'event-reply'));
+    const message = event.message || {};
+    const kind = Object.hasOwn(kinds, message.kind) ? message.kind : 'note';
+    const mine = isMine(event);
+    const row = element('article', null, 'event turn ' + (mine ? 'mine ' : 'theirs ') + kind);
+    const who = text(sender.name) || roles[sender.role] || '成员';
+    row.dataset.who = [text(sender.role), String(sender.seat ?? ''), who, kind].join('|');
+    const avatar = element('span', who.trim().slice(0, 1) || '·', 'avatar avatar-' + (sender.role || 'member'));
+    avatar.setAttribute('aria-hidden', 'true');
+    const stack = element('div', null, 'turn-body');
+    const meta = element('div', null, 'event-meta turn-head');
+    meta.append(element('span', who + seatLabel, 'event-author'));
+    if (roles[sender.role]) meta.append(element('span', roles[sender.role], 'role-chip'));
+    meta.append(element('span', kinds[kind] || '消息', 'event-kind'));
+    const stamp = element('time', date(event.created_at));
+    stamp.dateTime = text(event.created_at);
+    stamp.title = '第 ' + event.seq + ' 条';
+    meta.append(stamp);
+    stack.append(meta);
+    const bubble = element('div', null, 'event-body bubble');
+    const context = [];
+    if (message.reply_to) context.push('回复 #' + text(message.reply_to));
     const to = text(message.to);
-    if (to === 'all') row.append(element('div','定向：全体','event-reply'));
-    else if (to.startsWith('worker:')) row.append(element('div','定向：' + to.slice(7) + ' 号席','event-reply'));
-    row.append(element('div',text(message.text),'event-body'));
+    if (to === 'all') context.push('发给全体');
+    else if (to.startsWith('worker:')) context.push('发给 ' + to.slice(7) + ' 号席');
+    if (context.length) bubble.append(element('div', context.join(' · '), 'event-reply'));
+    bubble.append(element('div', text(message.text), 'bubble-text'));
     const attachments = array(message.attachments).filter(item => item && typeof item === 'object');
     for (const attachment of attachments) {
-      const line = element('div',null,'event-attachment');
-      line.append(element('span','附件：' + text(attachment.name) + ' · ' + sizeLabel(attachment.size)));
+      const line = element('div', null, 'event-attachment');
+      line.append(element('span', text(attachment.name) + (attachment.size ? ' · ' + sizeLabel(attachment.size) : '')));
       if (text(attachment.url)) {
-        const link = element('a','下载'); link.href = attachment.url; link.target = '_blank'; link.rel = 'noopener';
+        const link = element('a', '下载'); link.href = attachment.url; link.target = '_blank'; link.rel = 'noopener';
         line.append(link);
       }
-      row.append(line);
+      bubble.append(line);
     }
-    const foot = element('div',null,'event-foot'), reply = element('button','回复'); reply.type = 'button';
-    reply.addEventListener('click',() => {if (!current || current.status === 'closed') return; replyTo = {seq:Number(event.seq),preview:text(message.text).slice(0,60)}; renderComposer(); $('message-text').focus();}); foot.append(reply); row.append(foot); return row;
+    stack.append(bubble);
+    const foot = element('div', null, 'event-foot');
+    const reply = element('button', '回复'); reply.type = 'button';
+    reply.addEventListener('click', () => {if (!current || current.status === 'closed') return; replyTo = {seq:Number(event.seq), preview:text(message.text).slice(0, 60)}; renderComposer(); $('message-text').focus();});
+    foot.append(reply);
+    stack.append(foot);
+    row.append(avatar, stack);
+    return row;
   }
   function sizeLabel(size) {
     const bytes = Number(size);
@@ -386,6 +450,15 @@
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  }
+  function markContinued(node) {
+    if (!node.classList.contains('event')) return;
+    const prev = node.previousElementSibling;
+    node.classList.toggle('continued', !!(prev && prev.classList.contains('event') && prev.dataset.who === node.dataset.who));
+    const next = node.nextElementSibling;
+    if (next && next.classList.contains('event')) {
+      next.classList.toggle('continued', next.dataset.who === node.dataset.who);
+    }
   }
   function appendEvents(items) {
     const feed = $('feed'), follow = !events.size || feed.scrollHeight - feed.scrollTop - feed.clientHeight < 100;
@@ -397,6 +470,7 @@
       const node = eventNode(event); node.dataset.seq = String(seq);
       const next = [...$('events').children].find(item => Number(item.dataset.seq) > seq);
       $('events').insertBefore(node,next || null);
+      markContinued(node);
     }
     $('event-count').textContent = events.size + ' 条'; $('feed-empty').hidden = events.size > 0;
     if (follow) {feed.scrollTop = feed.scrollHeight; unread = 0; $('new-events').hidden = true;}
@@ -444,21 +518,28 @@
   async function selectSession(id) {
     if (!id || !identity) return;
     stopPolling(); const view = generation; pollController = new AbortController(); const signal = pollController.signal;
-    $('pair-dialog').close(); clearPairing(); $('team-dialog').close(); replyTo = null; outgoing = null; cursor = 0; heartbeatAt = 0; unread = 0;
+    $('pair-dialog').close(); clearPairing(); $('team-dialog').close(); replyTo = null; outgoing = null; clearPending(); cursor = 0; heartbeatAt = 0; unread = 0;
     events.clear(); $('events').replaceChildren(); $('message-text').value = ''; $('new-events').hidden = true; $('feed-empty').hidden = false; $('event-count').textContent = '0 条';
     const known = sessions.find(session => session.id === id);
-    const mode = known?.mode || 'pair';
+    const mode = known?.mode === 'team' || known?.mode === 'pair' ? known.mode : (String(id).startsWith('tm_') ? 'team' : 'pair');
+    writeLocation(id, mode);
     current = known || {id,peers:[],workers:[],status:'active',role:'owner',mode};
     renderCurrent(); renderSessions(); setConnection('','正在读取会话…');
     try {
       const data = await api(sessionPath(id,'',mode),undefined,signal);
       if (signal.aborted || view !== generation) return;
       if (!data.session || data.session.id !== id) throw new Error('会话响应与请求不一致，请重试。');
-      upsertSession(data.session,mode); setConnection('connected','正在等待新事件');
+      upsertSession(data.session,mode); writeLocation(id, mode); setConnection('connected','正在等待新事件');
       poll(id,mode,view,signal);
     } catch (error) {
       if (signal.aborted || error.name === 'AbortError' || view !== generation) return;
       if (error.status === 401) {lostIdentity(); return;}
+      if (error.status === 403 || error.status === 404) {
+        sessions = sessions.filter(session => session.id !== id);
+        forgetPrivateView();
+        notify('当前身份无法访问此对话。', true);
+        return;
+      }
       setConnection('error','会话尚未连接'); notify(error.message,true);
     }
   }
@@ -654,6 +735,10 @@
     const id = current.id; mutationBusy = true; renderCurrent();
     try {
       const value = await api('relay/sessions/' + encodeURIComponent(id) + '/topic-code',{});
+      if (!text(value.code)) throw new Error('服务未返回可显示的配对码。');
+      // Close the confirm dialog before opening another modal. Chrome rejects
+      // showModal while a dialog is already modal, which hid the new code.
+      closeDialog('confirm-dialog');
       showPairing({topic_code:value.code},'Topic 配对码已重置');
       notify('Topic 配对码已重置，旧码立即失效。');
     } catch (error) {notify(error.message,true);}
@@ -689,6 +774,227 @@
     return 'browser-' + [...crypto.getRandomValues(new Uint8Array(20))].map(v => v.toString(16).padStart(2,'0')).join('');
   }
 
+  function clearPending() {
+    pendingFiles = [];
+    const input = $('message-file');
+    if (input) input.value = '';
+    const box = $('pending-files');
+    if (box) {box.replaceChildren(); box.hidden = true;}
+  }
+  function renderPending() {
+    const box = $('pending-files');
+    if (!box) return;
+    box.replaceChildren(...pendingFiles.map(file => {
+      const chip = element('span', null, 'pending-file');
+      chip.append(element('span', text(file.name) + (file.size ? ' · ' + sizeLabel(file.size) : '')));
+      const remove = element('button', '移除');
+      remove.type = 'button';
+      remove.addEventListener('click', () => {
+        pendingFiles = pendingFiles.filter(item => item.id !== file.id);
+        renderPending();
+      });
+      chip.append(remove);
+      return chip;
+    }));
+    box.hidden = pendingFiles.length === 0;
+  }
+  async function uploadAttachment(file) {
+    if (!current || !file || uploading) return;
+    if (pendingFiles.length >= 20) {notify('每条消息最多 20 个附件。', true); return;}
+    if (file.size > 100 * 1024 * 1024) {notify('单个文件不能超过 100 MB。', true); return;}
+    if (!file.size) {notify('文件不能为空。', true); return;}
+    const id = current.id, mode = current.mode;
+    uploading = true; renderComposer();
+    try {
+      const response = await fetch(new URL(sessionPath(id, 'files', mode) + '?name=' + encodeURIComponent(file.name || '附件'), apiBase), {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Accept': 'application/json', 'X-CSRF-Token': csrf},
+        body: file
+      });
+      let value;
+      try {value = await response.json();} catch (_) {throw new APIError('附件上传结果无法读取，请重试。', response.status);}
+      if (!response.ok) throw new APIError(text(value.error || value.message).slice(0, 500) || '附件上传未完成。', response.status);
+      if (current?.id !== id) return;
+      if (!text(value.id)) throw new Error('服务未返回附件编号。');
+      pendingFiles = pendingFiles.concat([{id: value.id, name: text(value.name) || file.name || '附件', size: Number(value.size) || file.size}]);
+      renderPending();
+    } catch (error) {
+      notify(error.message, true);
+    } finally {
+      uploading = false;
+      const input = $('message-file');
+      if (input) input.value = '';
+      renderComposer();
+    }
+  }
+  function browserEnvironment() {
+    const ua = navigator.userAgent || '';
+    let osName = '浏览器';
+    if (/Windows NT/i.test(ua)) osName = 'Windows';
+    else if (/Mac OS X/i.test(ua)) osName = 'macOS';
+    else if (/Android/i.test(ua)) osName = 'Android';
+    else if (/iPhone|iPad/i.test(ua)) osName = 'iOS';
+    else if (/Linux/i.test(ua)) osName = 'Linux';
+    const versionMatch = ua.match(/Windows NT ([0-9.]+)/) || ua.match(/Mac OS X ([0-9_]+)/) || ua.match(/Android ([0-9.]+)/);
+    const osVersion = (versionMatch ? versionMatch[1].replace(/_/g, '.') : '浏览器').slice(0, 160);
+    let architecture = 'unknown';
+    if (/aarch64|arm64/i.test(ua)) architecture = 'arm64';
+    else if (/x86_64|Win64|x64|amd64/i.test(ua)) architecture = 'x86_64';
+    return {os_name: osName, os_version: osVersion, architecture: architecture};
+  }
+  function prefillEnvironment() {
+    const hints = browserEnvironment();
+    if (!$('join-os').value.trim()) $('join-os').value = hints.os_name;
+    if (!$('join-os-version').value.trim()) $('join-os-version').value = hints.os_version;
+    if (!$('join-arch').value.trim()) $('join-arch').value = hints.architecture;
+  }
+  function readEnvironment() {
+    const value = {
+      os_name: $('join-os').value.trim(),
+      os_version: $('join-os-version').value.trim(),
+      architecture: $('join-arch').value.trim()
+    };
+    if (!value.os_name || !value.os_version || !value.architecture) throw new Error('执行端需要填写操作系统、版本和架构。');
+    return value;
+  }
+  function joinMode() {return document.querySelector('input[name="join-mode"]:checked')?.value === 'team' ? 'team' : 'pair';}
+  function joinRole() {return document.querySelector('input[name="join-role"]:checked')?.value === 'worker' ? 'worker' : 'mentor';}
+  function clearJoinForm() {
+    if (joinTimer) {clearTimeout(joinTimer); joinTimer = null;}
+    joinLookup = null;
+    const code = $('join-code');
+    if (code) code.value = '';
+    formError('join-error');
+    const preview = $('join-preview');
+    if (preview) {preview.hidden = true; preview.replaceChildren();}
+  }
+  function syncJoinForm() {
+    const team = joinMode() === 'team';
+    $('join-role-field').hidden = team;
+    const worker = team ? joinLookup?.info?.invite?.role === 'worker' : joinRole() === 'worker';
+    $('join-env').hidden = !worker;
+    if (worker) prefillEnvironment();
+  }
+  function renderJoinPreview(mode, info) {
+    const box = $('join-preview');
+    box.replaceChildren();
+    if (!info || typeof info !== 'object') {box.hidden = true; return;}
+    if (mode === 'pair') {
+      const seats = info.seats || {};
+      const line = role => (role === 'mentor' ? '指导端' : '执行端') + '：' + (seats[role]?.occupied ? '已占用' : '空闲');
+      box.append(element('strong', '一对一 · ' + (text(info.title) || '未命名 Topic')));
+      box.append(element('p', line('mentor') + ' · ' + line('worker')));
+      if (text(info.goal)) box.append(element('p', text(info.goal).slice(0, 160)));
+    } else {
+      const invite = info.invite || {};
+      const role = invite.role === 'mentor' ? '指导端' : invite.role === 'worker' ? '执行端' : '席位';
+      const seat = Number(invite.seat);
+      const seatText = invite.role === 'worker' ? (Number.isInteger(seat) && seat > 0 ? ' · ' + seat + ' 号席' : ' · 任意空席') : '';
+      const status = ({unused:'未使用', used:'已使用', revoked:'已撤销', expired:'已过期'})[invite.status] || '状态待确认';
+      box.append(element('strong', '团队 · ' + (text(info.title) || '未命名团队')));
+      box.append(element('p', role + seatText + ' · ' + status));
+    }
+    box.hidden = false;
+  }
+  async function lookupJoin() {
+    const code = $('join-code').value.trim();
+    const mode = joinMode();
+    if (!code) {joinLookup = null; $('join-preview').hidden = true; $('join-preview').replaceChildren(); syncJoinForm(); return null;}
+    if (joinLookup && joinLookup.code === code && joinLookup.mode === mode) {renderJoinPreview(mode, joinLookup.info); syncJoinForm(); return joinLookup.info;}
+    const info = await api(mode === 'team' ? 'relay/teams/invites/' + encodeURIComponent(code) : 'relay/topics/' + encodeURIComponent(code));
+    if ($('join-code').value.trim() !== code || joinMode() !== mode) return info;
+    joinLookup = {code, mode, info};
+    renderJoinPreview(mode, info);
+    syncJoinForm();
+    formError('join-error');
+    if (mode === 'team' && info.invite && info.invite.status && info.invite.status !== 'unused') formError('join-error', '这条邀请当前不可用。请向创建者索取新的邀请。');
+    return info;
+  }
+  function scheduleJoinLookup() {
+    if (joinTimer) clearTimeout(joinTimer);
+    joinTimer = setTimeout(async () => {
+      joinTimer = null;
+      try {await lookupJoin();}
+      catch (error) {
+        if (!$('join-code').value.trim()) return;
+        joinLookup = null;
+        $('join-preview').hidden = true;
+        $('join-preview').replaceChildren();
+        formError('join-error', error.message);
+        syncJoinForm();
+      }
+    }, 350);
+  }
+  function openJoin() {
+    if (!requireIdentity() || joinBusy) return;
+    formError('join-error');
+    $('join-preview').hidden = true;
+    $('join-preview').replaceChildren();
+    joinLookup = null;
+    prefillEnvironment();
+    syncJoinForm();
+    $('join-dialog').showModal();
+    $('join-code').focus();
+  }
+  async function submitJoin(event) {
+    event.preventDefault();
+    if (joinBusy || !requireIdentity()) return;
+    const code = $('join-code').value.trim();
+    const mode = joinMode();
+    if (!code) return;
+    joinBusy = true; $('join-submit').disabled = true; formError('join-error');
+    try {
+      let info = joinLookup && joinLookup.code === code && joinLookup.mode === mode ? joinLookup.info : null;
+      if (!info) info = await lookupJoin();
+      if (mode === 'team' && info?.invite?.status && info.invite.status !== 'unused') {
+        formError('join-error', '这条邀请当前不可用。请向创建者索取新的邀请。');
+        return;
+      }
+      const body = {code};
+      let value;
+      if (mode === 'pair') {
+        body.role = joinRole();
+        if (body.role === 'worker') body.environment = readEnvironment();
+        value = await api('relay/join', body);
+      } else {
+        const role = info?.invite?.role;
+        if (role === 'worker') body.environment = readEnvironment();
+        if (role === 'mentor' || role === 'worker') body.role = role;
+        value = await api('relay/teams/join', body);
+      }
+      if (!value.session?.id) throw new Error('未收到加入确认，请刷新列表核实后再试。');
+      $('join-code').value = '';
+      closeDialog('join-dialog');
+      upsertSession(value.session, mode);
+      await selectSession(value.session.id);
+      notify(mode === 'team' ? '已加入团队会话。可以在下方发送消息。' : '已加入一对一对话。可以在下方发送消息。');
+      $('message-text').focus();
+    } catch (error) {
+      formError('join-error', error.message);
+    } finally {
+      joinBusy = false; $('join-submit').disabled = false;
+    }
+  }
+  function stripSecretQuery() {
+    const url = new URL(location.href);
+    const leaked = url.searchParams.has('code') || url.searchParams.has('topic_code') || url.searchParams.has('invite');
+    if (!leaked) return false;
+    url.searchParams.delete('code');
+    url.searchParams.delete('topic_code');
+    url.searchParams.delete('invite');
+    history.replaceState(null, '', url.pathname + url.search + url.hash);
+    return true;
+  }
+  async function openFromLocation() {
+    const params = new URLSearchParams(location.search);
+    const id = params.get('session') || '';
+    if (!/^[A-Za-z0-9_-]{1,160}$/.test(id)) return false;
+    if (current?.id === id) return true;
+    const requested = String(id).startsWith('tm_') || params.get('mode') === 'team' ? 'team' : 'pair';
+    if (!sessions.some(item => item.id === id)) sessions.unshift({id, mode: requested, title: '正在打开…', status: 'active', role: '', peers: [], workers: []});
+    await selectSession(id);
+    return current?.id === id;
+  }
   $('identity-form').addEventListener('submit',async event => {
     event.preventDefault(); const alias = $('identity-alias').value.trim(); if (!alias) return;
     $('identity-submit').disabled = true; formError('identity-error');
@@ -701,6 +1007,12 @@
   });
   function openCreate() {if (!requireIdentity() || createBusy) return; formError('create-error'); $('create-dialog').showModal(); $('create-name').focus();}
   $('new-session').addEventListener('click',openCreate); $('empty-create').addEventListener('click',openCreate);
+  $('join-session').addEventListener('click', openJoin); $('empty-join').addEventListener('click', openJoin);
+  $('join-form').addEventListener('submit', submitJoin);
+  document.querySelectorAll('input[name="join-mode"], input[name="join-role"]').forEach(input => input.addEventListener('change', () => {joinLookup = null; syncJoinForm(); scheduleJoinLookup();}));
+  $('join-code').addEventListener('input', () => {joinLookup = null; scheduleJoinLookup();});
+  $('join-dialog').addEventListener('close', clearJoinForm);
+  $('message-file').addEventListener('change', () => {const file = $('message-file').files && $('message-file').files[0]; if (file) uploadAttachment(file);});
   $('create-form').addEventListener('submit',async event => {
     event.preventDefault(); if (createBusy || !requireIdentity()) return;
     const title = $('create-name').value.trim(), goal = $('create-goal').value.trim(); if (!title || !goal) return;
@@ -721,6 +1033,7 @@
     const id = current.id, content = $('message-text').value.trim(), kind = $('message-kind').value;
     if (!content || content.length > 8000) {notify('请填写 1–8000 字的消息。',true); return;}
     const payload = {kind,text:content}; if (replyTo) payload.reply_to = replyTo.seq;
+    if (pendingFiles.length) payload.attachments = pendingFiles.map(file => file.id);
     if (isTeam()) {const target = $('message-to').value; if (target) payload.to = target;}
     const signature = JSON.stringify([id,payload]);
     if (!outgoing || outgoing.signature !== signature) outgoing = {signature,payload:{...payload,request_id:requestID()}};
@@ -728,7 +1041,7 @@
     try {
       const value = await api(sessionPath(id,'messages'),pending.payload);
       if (!value.event || !Number.isInteger(Number(value.event.seq))) throw new Error('发送结果尚未确认；请使用同一条消息重试。');
-      if (current?.id === id) {appendEvents([value.event]); $('message-text').value = ''; replyTo = null; outgoing = null; renderComposer();}
+      if (current?.id === id) {appendEvents([value.event]); $('message-text').value = ''; replyTo = null; outgoing = null; clearPending(); renderComposer();}
       notify(value.duplicate ? '已确认之前的同一条消息，没有重复提交。' : '消息已由平台接收；执行结果请等待执行端回报。');
     } catch (error) {notify(error.message,true);}
     finally {sending = false; renderComposer();}
@@ -808,10 +1121,12 @@
   $('new-events').addEventListener('click',() => {$('feed').scrollTop = $('feed').scrollHeight; unread = 0; $('new-events').hidden = true;});
   $('feed').addEventListener('scroll',() => {const feed = $('feed'); if (feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80) {unread = 0; $('new-events').hidden = true;}});
   window.addEventListener('online',() => {if (current && !stopped) selectSession(current.id);});
-  window.addEventListener('pagehide',() => {stopped = true; stopPolling(); listController?.abort(); clearPairing();});
+  window.addEventListener('pagehide',() => {stopped = true; stopPolling(); listController?.abort(); clearPairing(); clearJoinForm();});
   (async () => {
+    const leaked = stripSecretQuery();
     try {identity = await api('me'); csrf = text(identity.csrf);}
     catch (error) {if (error.status !== 401) notify('身份暂未确认：' + error.message,true);}
     updateIdentity(); renderSessions(); if (identity) await loadSessions();
+    if (leaked) notify('地址栏中的配对信息已移除。请使用「加入已有对话」粘贴配对码，不要把配对码放进链接。', true);
   })();
 })();

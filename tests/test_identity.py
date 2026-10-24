@@ -138,6 +138,24 @@ class IdentityAPI(unittest.TestCase):
         status,_=self.req('POST','/v1/me/alias',{'alias':'伪造'},headers={'Cookie':'diaodu_session='+first['token']})
         self.assertEqual(status,403)
 
+    def test_browser_identity_cookie_slides_without_rewriting_user_login(self):
+        status, body = self.req('POST', '/v1/connect', {'alias': '页面用户', 'agent_type': '浏览器', 'member_kind': 'human'})
+        self.assertEqual(status, 201)
+        token = body['token']
+        self.assertTrue(token.startswith('da_'))
+        with urlopen(Request(self.base + '/v1/me', headers={'Cookie': 'diaodu_session=' + token})) as response:
+            cookie = response.headers['Set-Cookie']
+            me = json.load(response)
+        self.assertIn('Max-Age=2592000', cookie)
+        self.assertIn('HttpOnly', cookie)
+        self.assertIn('SameSite=Strict', cookie)
+        self.assertNotIn(token, json.dumps(me))
+        with urlopen(Request(self.base + '/v1/me', headers={'Cookie': self.cookies[0]})) as response:
+            self.assertIsNone(response.headers['Set-Cookie'])
+            self.assertEqual(json.load(response)['kind'], 'user')
+        with urlopen(Request(self.base + '/v1/me', headers={'Authorization': 'Bearer ' + token})) as response:
+            self.assertIsNone(response.headers['Set-Cookie'])
+
     def test_short_number_routes_normalize_execution_identity(self):
         number=self.task['number']
         status,task=self.req('GET','/v1/tasks/'+number)

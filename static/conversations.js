@@ -52,6 +52,10 @@
     const suffix = person.role === 'worker' && Number.isInteger(seat) && seat > 0 ? ' · ' + seat + ' 号席' : '';
     return role + ' ' + (text(person.name) || '未命名') + suffix;
   }
+  function initial(value) {
+    const label = text(value).trim();
+    return label ? label.slice(0, 1) : '对';
+  }
 
   if (!isThread) renderDirectory();
   else renderThread();
@@ -108,19 +112,26 @@
     function card(item) {
       const id = text(item.public_id);
       if (!/^C-[pt][0-9a-f]{8}$/.test(id)) return null;
-      const link = node('a', null, 'conversation-card');
+      const link = node('a', null, 'conversation-card inbox-row');
       link.href = './' + id + '/';
-      const top = node('div', null, 'card-top');
-      top.append(node('span', modes[item.mode] || '对话', 'badge mode'));
-      top.append(node('span', states[item.status] || '状态待确认', 'badge ' + text(item.status)));
-      top.append(node('span', when(item.updated_at), 'muted'));
-      link.append(top, node('h2', text(item.title) || '未命名对话'), node('p', text(item.goal), 'muted'));
-      const people = Array.isArray(item.participants) ? item.participants.map(personLabel).join(' · ') : '';
-      if (people) link.append(node('p', people, 'muted'));
+      const avatar = node('span', initial(item.title), 'avatar');
+      avatar.setAttribute('aria-hidden', 'true');
+      const body = node('div', null, 'inbox-body');
+      const head = node('div', null, 'inbox-head');
+      head.append(node('h2', text(item.title) || '未命名对话'));
+      const stamp = node('time', when(item.updated_at));
+      stamp.dateTime = text(item.updated_at);
+      head.append(stamp);
+      const chips = node('div', null, 'inbox-chips');
+      chips.append(node('span', modes[item.mode] || '对话', 'chip mode'));
+      const status = text(item.status);
+      chips.append(node('span', states[item.status] || '状态待确认', 'chip status' + (states[status] ? ' ' + status : '')));
+      const participants = Array.isArray(item.participants) ? item.participants : [];
+      for (const person of participants.slice(0, 3)) chips.append(node('span', personLabel(person), 'chip who'));
       const last = item.last_message;
-      if (last && text(last.preview)) {
-        link.append(node('p', (kinds[last.kind] || '消息') + ' · ' + text(last.preview), 'preview'));
-      }
+      const preview = last && text(last.preview) ? text(last.preview) : text(item.goal);
+      body.append(head, chips, node('p', preview, 'inbox-preview'));
+      link.append(avatar, body);
       return link;
     }
     async function load(append) {
@@ -159,6 +170,7 @@
   }
 
   function renderThread() {
+    const header = node('header', null, 'thread-header');
     const back = node('p', null, 'page-kicker');
     const backLink = node('a', '返回目录');
     backLink.href = '../';
@@ -166,16 +178,16 @@
     const title = node('h1', '对话');
     const meta = node('div', null, 'thread-meta');
     const goal = node('p', '', 'goal');
-    const people = node('p', '', 'people');
-    const banner = node('div', null, 'banner');
-    banner.append(node('p', null));
-    banner.firstChild.append(node('strong', '只读。'));
-    banner.firstChild.append(document.createTextNode(' 不能从这里加入或发送。加入仍需要配对码或邀请。定向消息会完整显示。'));
-    const feed = node('div', null, 'feed');
+    const people = node('div', null, 'participant-row');
+    header.append(back, title, meta, goal, people);
+    const banner = node('p', '此页只读，不能在这里发送或加入。', 'read-only');
+    const feed = node('div', null, 'thread');
+    feed.setAttribute('role', 'log');
     feed.setAttribute('aria-live', 'polite');
+    feed.setAttribute('aria-label', '对话记录');
     const statusLine = node('p', '正在读取…', 'muted');
     statusLine.setAttribute('role', 'status');
-    app.append(back, title, meta, goal, people, banner, feed, statusLine);
+    app.append(header, banner, feed, statusLine);
     let cursor = 0, stopped = false;
 
     function paintConversation(conversation) {
@@ -187,52 +199,83 @@
         node('span', states[conversation.status] || '状态待确认', 'badge ' + text(conversation.status))
       );
       goal.textContent = text(conversation.goal);
-      const names = Array.isArray(conversation.participants) ? conversation.participants.map(personLabel) : [];
-      people.textContent = names.join(' · ');
+      people.replaceChildren();
+      const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
+      for (const person of participants) {
+        const chip = node('span', null, 'participant');
+        const mark = node('span', initial(person.name || roles[person.role]), 'avatar avatar-' + (person.role || 'member'));
+        mark.setAttribute('aria-hidden', 'true');
+        chip.append(mark, node('span', personLabel(person)));
+        people.append(chip);
+      }
+    }
+    function senderKey(event) {
+      const sender = event.sender || {};
+      return [text(sender.role || event.role), String(sender.seat ?? event.seat ?? ''), text(sender.name)].join('|');
     }
     function renderEvent(event) {
-      const article = node('article', null, 'event');
       const message = event.kind === 'message' ? event.message || null : null;
-      const kind = message && Object.prototype.hasOwnProperty.call(kinds, message.kind) ? message.kind : '';
-      if (kind) article.classList.add('kind-' + kind);
-      const row = node('div', null, 'event-meta');
-      const sender = event.sender || {};
-      const seat = Number(sender.seat);
-      const seatLabel = sender.role === 'worker' && Number.isInteger(seat) && seat > 0 ? ' · ' + seat + ' 号席' : '';
-      row.append(node('strong', (text(sender.name) || roles[sender.role] || '参与者') + seatLabel));
-      if (kind) row.append(node('span', kinds[kind], 'kind'));
-      row.append(node('span', '#' + text(event.seq)), node('time', when(event.created_at)));
-      article.append(row);
-      if (message) {
-        article.append(node('p', text(message.text), 'event-text'));
-        const to = text(message.to);
-        if (to === 'all') article.append(node('p', '定向：全体', 'event-note'));
-        else if (to.startsWith('worker:')) article.append(node('p', '定向：' + to.slice(7) + ' 号席', 'event-note'));
-        if (message.reply_to) article.append(node('p', '回复 #' + text(message.reply_to), 'event-note'));
-        const attachments = Array.isArray(message.attachments) ? message.attachments : [];
-        for (const attachment of attachments) {
-          const line = node('div', null, 'attachment');
-          line.append(node('span', '附件：' + text(attachment.name) + ' · ' + sizes(attachment.size)));
-          const href = safeFileUrl(attachment.url);
-          if (href) {
-            const link = node('a', '下载');
-            link.href = href;
-            link.rel = 'noopener';
-            line.append(link);
-          }
-          article.append(line);
-        }
-      } else if (event.kind === 'joined') {
+      if (!message && event.kind !== 'joined' && event.kind !== 'state' && event.kind !== 'revoked') return;
+      if (!message) {
         const seat = Number(event.seat);
-        article.append(node('p', (roles[event.role] || '成员') +
-                            (Number.isInteger(seat) && seat > 0 ? ' ' + seat + ' 号席' : '') + ' 已加入', 'system'));
-      } else if (event.kind === 'state') {
-        article.append(node('p', '会话状态：' + (states[event.status] || text(event.status)), 'system'));
-      } else if (event.kind === 'revoked') {
-        article.append(node('p', '一个席位已被撤销', 'system'));
-      } else {
+        let label = '会话有更新';
+        if (event.kind === 'joined') {
+          label = (roles[event.role] || '成员') + (Number.isInteger(seat) && seat > 0 ? ' ' + seat + ' 号席' : '') + ' 已加入';
+        } else if (event.kind === 'state') {
+          label = '会话' + (states[event.status] || text(event.status));
+        } else if (event.kind === 'revoked') {
+          label = '一个席位已被撤销';
+        }
+        const line = node('div', null, 'system-turn');
+        line.append(node('span', label), node('time', when(event.created_at)));
+        feed.append(line);
         return;
       }
+      const sender = event.sender || {};
+      const kind = Object.prototype.hasOwnProperty.call(kinds, message.kind) ? message.kind : '';
+      const role = sender.role || '';
+      const side = role === 'worker' ? 'incoming' : 'outgoing';
+      const article = node('article', null, 'turn ' + side + (kind ? ' kind-' + kind : ''));
+      const who = senderKey(event) + '|' + kind;
+      const previous = feed.lastElementChild;
+      if (previous && previous.dataset.who === who) article.classList.add('continued');
+      article.dataset.who = who;
+      const seat = Number(sender.seat);
+      const seatLabel = role === 'worker' && Number.isInteger(seat) && seat > 0 ? ' ' + seat + ' 号席' : '';
+      const name = text(sender.name) || roles[role] || '参与者';
+      const avatar = node('span', initial(name), 'avatar avatar-' + (role || 'member'));
+      avatar.setAttribute('aria-hidden', 'true');
+      const body = node('div', null, 'turn-body');
+      const head = node('div', null, 'turn-head');
+      head.append(node('span', name, 'speaker'));
+      if (roles[role] || seatLabel) head.append(node('span', (roles[role] || '参与者') + seatLabel, 'role-chip'));
+      if (kind) head.append(node('span', kinds[kind], 'kind-chip'));
+      const stamp = node('time', when(event.created_at));
+      stamp.dateTime = text(event.created_at);
+      head.append(stamp);
+      const bubble = node('div', null, 'bubble');
+      const notes = [];
+      if (message.reply_to) notes.push('回复 #' + text(message.reply_to));
+      const to = text(message.to);
+      if (to === 'all') notes.push('发给全体');
+      else if (to.startsWith('worker:')) notes.push('发给 ' + to.slice(7) + ' 号席');
+      if (notes.length) bubble.append(node('p', notes.join(' · '), 'bubble-note'));
+      bubble.append(node('p', text(message.text), 'bubble-text'));
+      const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+      for (const attachment of attachments) {
+        const line = node('div', null, 'attachment');
+        line.append(node('span', text(attachment.name) + (attachment.size ? ' · ' + sizes(attachment.size) : '')));
+        const href = safeFileUrl(attachment.url);
+        if (href) {
+          const link = node('a', '下载');
+          link.href = href;
+          link.rel = 'noopener';
+          line.append(link);
+        }
+        bubble.append(line);
+      }
+      body.append(head, bubble);
+      article.append(avatar, body);
       feed.append(article);
     }
     async function poll() {
