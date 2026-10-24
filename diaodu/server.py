@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse, quote
 from diaodu.control import PHASE_LABELS, ControlError, actions
 from diaodu.library import LibraryError
 from diaodu import chat, agent_api
+from diaodu.http_util import discard_body
 from diaodu.identity import AuthError, Identity, text, digest
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
@@ -391,13 +392,13 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     return
                 if parts==['v1','mail','unsubscribe']:
                     length=int(self.headers.get('Content-Length','0'))
-                    if not 0<=length<=1024:raise ValueError('退订请求过大')
+                    if not 0<=length<=1024:self._reject_oversized(length,'退订请求过大')
                     self.rfile.read(length)
                     self._json(200,library.outreach.unsubscribe(parse_qs(urlparse(self.path).query).get('token',[''])[0]));return
                 if parts==["v1","mcp"]:
                     from diaodu import mcp
                     length=int(self.headers.get("Content-Length","0"))
-                    if length<0 or length>15*1024*1024:raise ValueError("MCP请求最大15MB")
+                    if length<0 or length>15*1024*1024:self._reject_oversized(length,"MCP请求最大15MB")
                     body=json.loads(self.rfile.read(length))
                     if not isinstance(body,dict):raise ValueError("JSON-RPC请求须为对象")
                     actor=self._actor(mutation=True) if self.headers.get("Authorization") or self.headers.get("Cookie") else None
@@ -493,7 +494,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         chat.read(library,parts[2],actor)
                         length = int(self.headers.get("Content-Length","0"))
                         if length < 0 or length > 100*1024*1024:
-                            raise ValueError("文件不能超过100MB")
+                            self._reject_oversized(length, "文件不能超过100MB")
                         filename = parse_qs(urlparse(self.path).query).get("name",[""])[0]
                         content = self.rfile.read(length)
                         if len(content) != length:raise ValueError("上传未完成")
@@ -550,7 +551,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         raise AuthError("只有任务发布者可以添加任务资料",403)
                     length = int(self.headers.get("Content-Length", "0"))
                     if length < 0 or length > 100 * 1024 * 1024:
-                        raise ValueError("单个文件不能超过 100 MB")
+                        self._reject_oversized(length, "单个文件不能超过 100 MB")
                     filename = parse_qs(urlparse(self.path).query).get("name",[""])[0]
                     content = self.rfile.read(length)
                     if len(content) != length:
@@ -560,7 +561,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if len(parts) == 4 and parts[:2] == ["v1", "tasks"] and parts[3] == "files":
                     length = int(self.headers.get("Content-Length", "0"))
                     if length < 0 or length > 100 * 1024 * 1024:
-                        raise ValueError("单个文件不能超过 100 MB")
+                        self._reject_oversized(length, "单个文件不能超过 100 MB")
                     if actor["kind"] != "agent":
                         raise AuthError("上传需要智能体实例凭证",403)
                     query = parse_qs(urlparse(self.path).query)
@@ -670,10 +671,16 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             except (KeyError, FileNotFoundError, ValueError) as exc:
                 self._json(404, {"error": str(exc)})
 
+        def _reject_oversized(self, length, message):
+            """Consume what we can of a rejected body, then close this connection."""
+            discard_body(self.rfile, length)
+            self.close_connection = True
+            raise ValueError(message)
+
         def _body(self, limit=1_200_000) -> dict:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > limit:
-                raise ValueError("请求过大")
+                self._reject_oversized(length, "请求过大")
             if length == 0:
                 return {}
             raw = self.rfile.read(length)
@@ -690,7 +697,12 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
-            for key, value in (headers or {}).items():
+            headers = dict(headers or {})
+            if status >= 400:
+                # An error response may leave an unread request body behind; do not
+                # invite the peer to reuse this connection.
+                headers.setdefault("Connection", "close")
+            for key, value in headers.items():
                 self.send_header(key,value)
             self.end_headers()
             if not getattr(self,"_head_only",False):self.wfile.write(data)

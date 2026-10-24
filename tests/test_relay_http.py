@@ -9,6 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer
+import socket
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -271,6 +272,51 @@ class RelayHTTP(unittest.TestCase):
         self.assertEqual(self.req('POST', prefix + '/messages', {'kind': 'instruction', 'text': 'x', 'request_id': 'x', 'role': 'mentor'}, 'worker')[0], 400)
         self.assertEqual(self.req('POST', prefix + '/messages', {'kind': 'note', 'text': 'x' * 70000, 'request_id': 'large'}, 'mentor')[0], 400)
         self.assertEqual(self.req('POST', prefix + '/heartbeat', {'environment': environment()}, 'mentor')[0], 403)
+
+    def raw_post(self, path, declared, payload, shutdown=True, timeout=5):
+        """Send a request whose Content-Length lies, without urllib's help."""
+        host, port = self.server.server_address[:2]
+        request = ('POST ' + path + ' HTTP/1.1\r\n'
+                   'Host: 127.0.0.1\r\n'
+                   'Authorization: Bearer ' + self.identities['mentor']['token'] + '\r\n'
+                   'Content-Type: application/json\r\n'
+                   'Content-Length: ' + str(declared) + '\r\n'
+                   'Connection: keep-alive\r\n\r\n').encode()
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            sock.sendall(request + payload)
+            if shutdown:
+                sock.shutdown(socket.SHUT_WR)
+            data = b''
+            try:
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            except ConnectionResetError:
+                pass
+            return data
+        finally:
+            sock.close()
+
+    def test_oversized_body_reject_returns_parseable_json(self):
+        path = '/v1/relay/sessions/' + self.sid + '/messages'
+        raw = self.raw_post(path, 70000, b'{"kind":"note","text":"x')
+        head, _, body = raw.partition(b'\r\n\r\n')
+        self.assertIn(b' 400 ', head.split(b'\r\n')[0])
+        self.assertIn(b'Connection: close', head)
+        self.assertEqual(json.loads(body)['error'], '请求过大')
+
+    def test_body_beyond_drain_cap_closes_without_reading(self):
+        path = '/v1/relay/sessions/' + self.sid + '/messages'
+        started = time.monotonic()
+        raw = self.raw_post(path, 32 * 1024 * 1024, b'{"kind":"note"', shutdown=False)
+        elapsed = time.monotonic() - started
+        # 32MB > 16MB cap: the server must not wait for the rest of the body.
+        self.assertLess(elapsed, 2)
+        self.assertTrue(raw == b'' or b' 400 ' in raw.split(b'\r\n')[0],
+                        raw[:80])
 
 
 if __name__ == '__main__':

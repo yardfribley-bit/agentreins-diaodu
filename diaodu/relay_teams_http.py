@@ -71,7 +71,7 @@ def _upload(handler, library, parts):
     if length <= 0:
         raise ValueError('上传内容不能为空')
     if length > teams.MAX_FILE_BYTES:
-        raise ValueError('单个文件不能超过 100 MB')
+        handler._reject_oversized(length, '单个文件不能超过 100 MB')
     name = parse_qs(urlparse(handler.path).query).get('name', [''])[0]
     handler._json(201, teams.receive(actor, sid, name, handler.rfile, length))
 
