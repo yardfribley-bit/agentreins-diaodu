@@ -795,7 +795,7 @@ dialog label input, dialog label textarea { display: block; width: 100%; margin-
 .mode-choice input { margin: 0 8px 0 0; }
 .mode-choice small { display: block; margin: 4px 0 0 20px; }
 
-.team-summary { margin: 16px 0; }
+.team-summary, .task-board { margin: 16px 0; }
 .summary-item { border: 1px solid var(--line); border-radius: var(--radius-button); background: var(--panel); padding: 12px; margin-bottom: 8px; }
 
 .summary-instruction {

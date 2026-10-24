@@ -16,6 +16,7 @@
   const roles = {owner:'管理者', mentor:'指导端', worker:'执行端'};
   const states = {active:'进行中', paused:'已暂停', closed:'已结束'};
   const kinds = {instruction:'指令', progress:'进度', result:'结果', question:'提问', note:'备注'};
+  const taskStatuses = {open:'待认领', in_progress:'进行中', done:'已完成'};
   let identity = null, csrf = '', sessions = [], current = null, cursor = 0;
   let generation = 0, pollController = null, listGeneration = 0, listController = null;
   let retryTimer = null, heartbeatAt = 0, replyTo = null, outgoing = null, mutationBusy = false;
@@ -323,11 +324,28 @@
     $('reply-preview').hidden = !replyTo;
     $('reply-text').textContent = replyTo ? '回复 #' + replyTo.seq + ' · ' + replyTo.preview : '';
   }
+  function renderTaskBoard() {
+    const box = $('task-board'), list = $('task-board-list');
+    if (!box || !list) return;
+    if (!isTeam()) { box.hidden = true; list.replaceChildren(); return; }
+    const tasks = Array.isArray(current.tasks) ? current.tasks : [];
+    box.hidden = false;
+    if (!tasks.length) {
+      list.replaceChildren(element('p','还没有任务。任务板和下面的消息是同一份记录。','peer-vacant'));
+      return;
+    }
+    list.replaceChildren(...tasks.slice(0, 12).map(task => {
+      const item = element('article', null, 'summary-item');
+      const assignee = task.assignee;
+      const who = assignee ? (text(assignee.name) || '成员') + ' · ' + (assignee.seat ?? '') + '号席' : '未认领';
+      item.append(element('p', (text(task.title) || '未命名任务') + ' · ' + (taskStatuses[task.status] || ''), 'summary-instruction'));
+      item.append(element('p', who + ' · ' + (Number(task.progress) || 0) + '%', 'summary-seat'));
+      return item;
+    }));
+  }
   function renderTeamSummary() {
     const box = $('team-summary'), list = $('team-summary-list');
-    // Only the commander and the creator see everyone's replies; a worker cannot
-    // read other seats' results, so the summary would mark them "未回报" wrongly.
-    if (!isTeam() || !(current?.owner || current?.role === 'mentor')) {
+    if (!isTeam()) {
       box.hidden = true; list.replaceChildren(); return;
     }
     box.hidden = false;
@@ -368,7 +386,14 @@
     $('workspace-empty').hidden = true; $('workspace').hidden = false;
     $('session-title').textContent = current.title || '未命名会话'; $('session-goal').textContent = current.goal || '尚未填写目标';
     $('session-status').textContent = states[current.status] || '状态待确认'; $('session-status').className = 'status-badge ' + current.status;
-    $('session-role').textContent = '当前身份：' + (roles[current.role] || '成员');
+    let roleLabel = '当前身份：' + (roles[current.role] || '成员');
+    if (isTeam()) {
+      const leader = current.leader;
+      roleLabel += leader && leader.name
+        ? ' · 领导者 ' + text(leader.name) + (Number.isInteger(Number(leader.seat)) ? ' · ' + leader.seat + '号席' : '')
+        : ' · 尚无领导者';
+    }
+    $('session-role').textContent = roleLabel;
     $('owner-actions').hidden = !owner(); $('management').hidden = !owner() || isTeam();
     $('manage-invites').hidden = !owner() || !isTeam(); $('manage-invites').disabled = mutationBusy || current.status === 'closed';
     $('rotate-topic-code').hidden = !!isTeam();
@@ -386,7 +411,7 @@
     $('revoke-all').disabled = mutationBusy || !array(current.peers).length;
     $('state-banner').hidden = current.status === 'active'; $('state-banner').className = 'state-banner ' + current.status;
     $('state-banner').textContent = current.status === 'closed' ? '会话已结束。历史记录仍可阅读，不再接受新消息或新成员。' : '新的指令已暂停，仍可发送进度、结果与备注。暂停不会强制停止远端已经启动的操作。';
-    renderPeers(); renderComposer(); renderTeamSummary();
+    renderPeers(); renderComposer(); renderTeamSummary(); renderTaskBoard();
   }
   function eventNode(event) {
     const sender = event.sender || {};
@@ -397,6 +422,10 @@
       if (event.kind === 'joined') label = (roles[event.role || sender.role] || '成员') + seatLabel + '已接入会话';
       if (event.kind === 'revoked') label = (roles[event.role] || '成员') + seatLabel + '的访问权限已撤销';
       if (event.kind === 'state') label = '会话' + (states[event.status] || '状态已更新');
+      if (event.kind === 'task') {
+        const task = event.task || {};
+        label = '任务「' + (text(task.title) || '未命名') + '」' + (taskStatuses[task.status] || '');
+      }
       const row = element('div',null,'system-event'); row.append(element('span',label),element('time',date(event.created_at))); return row;
     }
     const message = event.message || {};

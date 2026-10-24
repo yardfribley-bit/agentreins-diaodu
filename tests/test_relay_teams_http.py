@@ -178,13 +178,13 @@ class TeamsHTTP(unittest.TestCase):
         w1_seqs = [event['seq'] for event in self.events('w1')]
         w2_seqs = [event['seq'] for event in self.events('w2')]
         self.assertIn(broadcast['seq'], w1_seqs)
-        self.assertNotIn(targeted['seq'], w1_seqs)
+        self.assertIn(targeted['seq'], w1_seqs)
         self.assertIn(targeted['seq'], w2_seqs)
         result = self.send('w2', 'result', '二号结果', 'r2', reply_to=targeted['seq'])[1]['event']
-        self.assertNotIn(result['seq'], [event['seq'] for event in self.events('w1')])
+        self.assertIn(result['seq'], [event['seq'] for event in self.events('w1')])
         self.assertIn(result['seq'], [event['seq'] for event in self.events('mentor')])
-        note = self.send('w1', 'note', '私有备注', 'n1')[1]['event']
-        self.assertNotIn(note['seq'], [event['seq'] for event in self.events('w3')])
+        note = self.send('w1', 'note', '工作备注', 'n1')[1]['event']
+        self.assertIn(note['seq'], [event['seq'] for event in self.events('w3')])
         public = self.send('w1', 'note', '公开备注', 'n1-all', to='all')[1]['event']
         self.assertIn(public['seq'], [event['seq'] for event in self.events('w3')])
         status, body = self.send('w1', 'result', '跨席', 'r-cross',

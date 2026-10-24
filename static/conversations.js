@@ -198,6 +198,9 @@
         node('span', modes[conversation.mode] || '对话', 'badge mode'),
         node('span', states[conversation.status] || '状态待确认', 'badge ' + text(conversation.status))
       );
+      if (conversation.leader && conversation.leader.name) {
+        meta.append(node('span', '领导者 ' + text(conversation.leader.name), 'badge'));
+      }
       goal.textContent = text(conversation.goal);
       people.replaceChildren();
       const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
@@ -215,6 +218,15 @@
     }
     function renderEvent(event) {
       const message = event.kind === 'message' ? event.message || null : null;
+      if (event.kind === 'task') {
+        const task = event.task || {};
+        const taskState = {open:'待认领', in_progress:'进行中', done:'已完成'}[task.status] || text(task.status);
+        const taskLabel = '任务「' + text(task.title) + '」' + taskState;
+        const line = node('div', null, 'system-turn');
+        line.append(node('span', taskLabel), node('time', when(event.created_at)));
+        feed.append(line);
+        return;
+      }
       if (!message && event.kind !== 'joined' && event.kind !== 'state' && event.kind !== 'revoked') return;
       if (!message) {
         const seat = Number(event.seat);

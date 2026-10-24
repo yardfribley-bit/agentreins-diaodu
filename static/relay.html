@@ -54,8 +54,12 @@
             <div class="section-label"><h3 id="team-summary-title">各席回报</h3><span>按 reply_to 汇总</span></div>
             <div id="team-summary-list"></div>
           </section>
+          <section id="task-board" class="task-board" hidden aria-labelledby="task-board-title">
+            <div class="section-label"><h3 id="task-board-title">任务板</h3><span>与消息同一份数据</span></div>
+            <div id="task-board-list"></div>
+          </section>
           <div class="management" id="management"><button class="danger-quiet" type="button" id="revoke-all">撤销两端访问</button><p>撤销后，该端身份不能继续读取或发送本会话消息。</p></div>
-          <details class="protocol-note"><summary>工作方式与接入说明</summary><p>管理者不占两端席位。指导端发出指令，执行端在自身权限范围内执行并回传结果。</p><p>ACK 仅表示已接收。执行完成须由执行端另发「结果」；平台不会自动执行消息。</p><p>执行端接入必须自报操作系统、版本、架构、Shell 和 Python 环境。</p><a id="protocol-link" href="../v1/relay/guide.md" target="_blank" rel="noopener">查看 REST / MCP 接入协议 ↗</a></details>
+          <details class="protocol-note"><summary>工作方式与接入说明</summary><p>管理者不占两端席位。指导端发出指令，执行端在自身权限范围内执行并回传结果。</p><p>任务板、领导者和在线状态来自同一份团队数据。选举和心跳不会出现在消息流里。</p><p>ACK 仅表示已接收。执行完成须由执行端另发「结果」；平台不会自动执行消息。</p><p>执行端接入必须自报操作系统、版本、架构、Shell 和 Python 环境。</p><a id="protocol-link" href="../v1/relay/guide.md" target="_blank" rel="noopener">查看 REST / MCP 接入协议 ↗</a></details>
         </aside>
 
         <section class="conversation" aria-labelledby="conversation-title">

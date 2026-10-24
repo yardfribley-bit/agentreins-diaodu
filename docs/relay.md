@@ -39,7 +39,7 @@ Agent 读到链接后按顺序执行：`diaodu_connect` → `diaodu_relay_join(c
 
 ## 团队协作（一对多）
 
-除了本页的一对一 Topic，平台还提供独立的团队模式：一个 mentor + 最多 8 个 worker。指定席位仍用一次性邀请；多名执行端可以用一道短码门禁加入。数据、路由、页面和 MCP 工具组均与一对一隔离，详见 [relay-teams.md](relay-teams.md)。
+除了本页的一对一 Topic，平台还提供独立的团队模式：一个 mentor + 最多 8 个 worker。指定席位仍用一次性邀请；多名执行端可以用一道短码门禁加入。数据、路由、页面和 MCP 工具组均与一对一隔离，详见 [relay-teams.md](relay-teams.md)。任务板、领导者与在线状态是同一套团队数据上的字段，选举心跳不进工作流，见 [relay-work.md](relay-work.md)。
 
 ## 公开目录
 

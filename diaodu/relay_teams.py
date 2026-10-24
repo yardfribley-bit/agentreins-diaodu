@@ -22,9 +22,9 @@ from diaodu import relay_files
 from diaodu.identity import AuthError
 from diaodu.relay import (
     DEFAULT_MAX_WAITERS, DEFAULT_SESSION_WAITERS, FILE_ID_RE, PUBLIC_ID_RE, Relay,
-    _actor, _body, _claim_waiter, _environment, _iso, _long_poll_ready, _message_preview,
-    _mint_public_id, _name, _preview, _resolve_waiter_limits, _text, directory_rows,
-    ensure_directory_columns,
+    _actor, _body, _claim_waiter, _environment, _iso, _long_poll_ready, _mint_public_id,
+    _name, _preview, _resolve_waiter_limits, _text, directory_rows, ensure_directory_columns,
+    protocol_op,
 )
 
 
@@ -54,6 +54,13 @@ class RelayTeams:
     GATE_JOIN_IP_LIMIT = 30
     MAX_FILE_BYTES = 100 * 1024 * 1024
     MAX_ATTACHMENTS = 20
+    # Raft-lite lease. A live leader blocks a new term so two workers cannot
+    # both observe themselves as leader. Heartbeats renew the lease; they are
+    # not work events. Election transitions go to team_protocol.
+    LEASE_SECONDS = 20
+    ELECTION_WINDOW = 12
+    MAX_PROTOCOL = 2000
+    MAX_TASKS = 100
 
     def __init__(self, root: Path, max_workers: int = 8,
                  public_base_path: str = "", public_origin: str = ""):
@@ -87,7 +94,10 @@ class RelayTeams:
                   created REAL NOT NULL, updated REAL NOT NULL,
                   last_seq INTEGER NOT NULL DEFAULT 0,
                   public_read INTEGER NOT NULL DEFAULT 0, public_token_hash TEXT,
-                  visibility TEXT NOT NULL DEFAULT 'public', public_id TEXT);
+                  visibility TEXT NOT NULL DEFAULT 'public', public_id TEXT,
+                  leader_role TEXT, leader_seat INTEGER, leader_name TEXT, leader_key TEXT,
+                  leader_term INTEGER NOT NULL DEFAULT 0, leader_lease REAL,
+                  election_until REAL, protocol_seq INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS team_sessions_owner ON team_sessions(owner_key,status);
                 CREATE TABLE IF NOT EXISTS team_members (
                   session_id TEXT NOT NULL, role TEXT NOT NULL, seat INTEGER NOT NULL,
@@ -129,7 +139,45 @@ class RelayTeams:
                   seat INTEGER NOT NULL, actor_key TEXT NOT NULL, actor_name TEXT NOT NULL,
                   joined_at REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS team_gate_uses_gate ON team_gate_uses(gate_id, joined_at);
+                CREATE TABLE IF NOT EXISTS team_votes (
+                  session_id TEXT NOT NULL, term INTEGER NOT NULL, voter_key TEXT NOT NULL,
+                  candidate_role TEXT NOT NULL, candidate_seat INTEGER NOT NULL,
+                  created REAL NOT NULL,
+                  PRIMARY KEY(session_id, term, voter_key));
+                CREATE TABLE IF NOT EXISTS team_protocol (
+                  session_id TEXT NOT NULL, seq INTEGER NOT NULL, op TEXT NOT NULL,
+                  created REAL NOT NULL, sender_role TEXT NOT NULL, sender_seat INTEGER NOT NULL,
+                  sender_name TEXT NOT NULL, payload TEXT NOT NULL, sender_key TEXT,
+                  PRIMARY KEY(session_id, seq));
+                CREATE TABLE IF NOT EXISTS team_protocol_requests (
+                  session_id TEXT NOT NULL, sender_key TEXT NOT NULL, request_id TEXT NOT NULL,
+                  content_hash TEXT NOT NULL, op TEXT NOT NULL,
+                  PRIMARY KEY(session_id, sender_key, request_id));
+                CREATE TABLE IF NOT EXISTS team_tasks (
+                  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT NOT NULL,
+                  detail TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                  assignee_role TEXT, assignee_seat INTEGER, assignee_name TEXT, assignee_key TEXT,
+                  progress INTEGER NOT NULL DEFAULT 0, parent_id TEXT,
+                  created_by_role TEXT NOT NULL, created_by_seat INTEGER NOT NULL,
+                  created_by_name TEXT NOT NULL, creator_key TEXT NOT NULL,
+                  request_id TEXT NOT NULL, content_hash TEXT NOT NULL,
+                  created REAL NOT NULL, updated REAL NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
+                CREATE UNIQUE INDEX IF NOT EXISTS team_tasks_request
+                  ON team_tasks(session_id, creator_key, request_id);
+                CREATE INDEX IF NOT EXISTS team_tasks_session
+                  ON team_tasks(session_id, status, created);
             """)
+            for name, ddl in (
+                ("leader_role", "TEXT"),
+                ("leader_seat", "INTEGER"),
+                ("leader_name", "TEXT"),
+                ("leader_key", "TEXT"),
+                ("leader_term", "INTEGER NOT NULL DEFAULT 0"),
+                ("leader_lease", "REAL"),
+                ("election_until", "REAL"),
+                ("protocol_seq", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                self._ensure_column(db, "team_sessions", name, ddl)
             # Additive migration for databases created before public watch existed.
             columns = {row[1] for row in db.execute("PRAGMA table_info(team_sessions)")}
             if "public_read" not in columns:
@@ -140,6 +188,12 @@ class RelayTeams:
             ensure_directory_columns(db, "team_sessions")
 
     # -- plumbing -------------------------------------------------------
+
+    @staticmethod
+    def _ensure_column(db, table, name, ddl):
+        columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if name not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -216,15 +270,21 @@ class RelayTeams:
         owner = next(row for row in rows if row["role"] == "owner")
         mentor = next((row for row in rows if row["role"] == "mentor"), None)
         workers = [row for row in rows if row["role"] == "worker"]
+        roster = [self._roster_member(row) for row in rows]
         return {"id": session["id"], "title": session["title"], "goal": session["goal"],
                 "status": session["status"], "created_at": _iso(session["created"]),
                 "updated_at": _iso(session["updated"]), "last_seq": session["last_seq"],
+                "protocol_seq": int(session["protocol_seq"] or 0),
                 "owner": member["role"] == "owner", "owner_name": owner["name"],
                 "role": member["role"], "seat": member["seat"],
                 "public_read": bool(session["public_read"]),
                 "visibility": session["visibility"] or "public",
                 "public_id": session["public_id"],
                 "max_workers": self.max_workers,
+                "leader": self._leader_public(db, session),
+                "members": roster,
+                "online": [item for item in roster if item["online"]],
+                "tasks": [self._task_json(row) for row in self._task_rows(db, session["id"])],
                 "mentor": self._peer(mentor) if mentor else None,
                 "workers": [self._peer(row, member["role"] != "worker"
                                        or row["seat"] == member["seat"])
@@ -393,23 +453,21 @@ class RelayTeams:
         mentor = next((row for row in rows if row["role"] == "mentor"), None)
         workers = [{"role": "worker", "seat": row["seat"], "name": row["name"]}
                    for row in rows if row["role"] == "worker"]
+        leader = self._leader_public(db, session)
+        if leader is not None:
+            leader = {"role": leader["role"], "seat": leader["seat"], "name": leader["name"],
+                      "online": leader["online"]}
         return {"title": session["title"], "goal": session["goal"],
                 "status": session["status"], "created_at": _iso(session["created"]),
                 "updated_at": _iso(session["updated"]), "last_seq": session["last_seq"],
                 "max_workers": self.max_workers,
+                "leader": leader,
                 "mentor": ({"role": "mentor", "seat": 0, "name": mentor["name"]}
                            if mentor else None),
                 "workers": workers}
 
     def _public_event(self, db, row):
-        if row["kind"] == "environment":
-            return None
-        event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
-                 "sender": {"role": row["sender_role"], "seat": row["sender_seat"],
-                            "name": row["sender_name"]}}
-        event.update(Relay._public_payload(row["kind"], json.loads(row["payload"]),
-                                           db, row["session_id"], "team_files"))
-        return event
+        return self._filtered_public_event(db, row)
 
     def _public_page(self, token, after):
         if not isinstance(token, str) or not token or len(token) > 160:
@@ -498,11 +556,18 @@ class RelayTeams:
         for row in sorted(rows, key=lambda item: (order.get(item["role"], 9), item["seat"])):
             participants.append({"role": row["role"], "seat": row["seat"], "name": row["name"]})
         goal = session["goal"]
-        return {"public_id": session["public_id"], "mode": "team", "title": session["title"],
+        leader = self._leader_public(db, session)
+        if leader is not None:
+            leader = {"role": leader["role"], "seat": leader["seat"], "name": leader["name"],
+                      "online": leader["online"]}
+        item = {"public_id": session["public_id"], "mode": "team", "title": session["title"],
                 "goal": _preview(goal) if summary else goal, "status": session["status"],
                 "created_at": _iso(session["created"]), "updated_at": _iso(session["updated"]),
-                "participants": participants,
-                "last_message": _message_preview(db, session["id"], "team_events")}
+                "participants": participants, "leader": leader,
+                "last_message": self._work_preview(db, session["id"])}
+        if not summary:
+            item["tasks"] = [self._task_json(row) for row in self._task_rows(db, session["id"])]
+        return item
 
     def directory_candidates(self, limit, cursor_updated=None, cursor_public_id=None, status=None):
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 51:
@@ -526,15 +591,7 @@ class RelayTeams:
             return self._directory_item(db, session, summary=False)
 
     def _directory_event(self, db, row, public_id):
-        if row["kind"] == "environment":
-            return None
-        event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
-                 "sender": {"role": row["sender_role"], "seat": row["sender_seat"],
-                            "name": row["sender_name"]}}
-        event.update(Relay._public_payload(row["kind"], json.loads(row["payload"]),
-                                           db, row["session_id"], "team_files",
-                                           public_id=public_id, file_base=self._base_url()))
-        return event
+        return self._filtered_public_event(db, row, public_id=public_id)
 
     def directory_events(self, public_id, after, limit):
         if (not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None
@@ -587,51 +644,53 @@ class RelayTeams:
 
     # -- events ---------------------------------------------------------
 
-    def _visible(self, member, row):
-        if member["role"] in ("owner", "mentor"):
-            return True
-        if row["kind"] != "message":
-            return True
-        message = (json.loads(row["payload"]).get("message") or {})
-        to = message.get("to")
-        if to == "all":
-            return True
-        if isinstance(to, str) and to.startswith("worker:"):
-            target = int(to.split(":", 1)[1])
-            return target == member["seat"] or row["sender_seat"] == member["seat"]
-        if message.get("kind") == "instruction":
-            return True
-        if row["sender_role"] == "worker" and message.get("kind") in ("result", "progress", "question", "note"):
-            return row["sender_seat"] == member["seat"]
-        return True
+    def _on_work_stream(self, row):
+        """Work poll: instructions, results, tasks, membership. Not env or election."""
+        if row["kind"] == "environment" or self._protocol_note_row(row):
+            return False
+        return row["kind"] in ("message", "task", "joined", "state", "revoked")
 
-    def _page(self, actor, sid, after):
+    def _page(self, actor, sid, after, stream="work"):
         with self._read() as db:
             session, member = self._access(db, actor, sid)
+            if stream == "system":
+                last = int(session["protocol_seq"] or 0)
+                if after > last:
+                    raise ValueError("消息游标超过当前会话进度")
+                rows = db.execute("SELECT * FROM team_protocol WHERE session_id=? AND seq>? "
+                                  "ORDER BY seq LIMIT ?",
+                                  (sid, after, self.PAGE_SIZE + 1)).fetchall()
+                scanned = rows[:self.PAGE_SIZE]
+                return {"session": self._session(db, session, member), "stream": "system",
+                        "events": [self._protocol_event(row) for row in scanned],
+                        "next_cursor": scanned[-1]["seq"] if scanned else after,
+                        "has_more": len(rows) > self.PAGE_SIZE}
             if after > session["last_seq"]:
                 raise ValueError("消息游标超过当前会话进度")
             rows = db.execute("SELECT * FROM team_events WHERE session_id=? AND seq>? "
                               "ORDER BY seq LIMIT ?", (sid, after, self.PAGE_SIZE + 1)).fetchall()
             scanned = rows[:self.PAGE_SIZE]
-            visible = [row for row in scanned if self._visible(member, row)]
-            return {"session": self._session(db, session, member),
+            visible = [row for row in scanned if self._on_work_stream(row)]
+            return {"session": self._session(db, session, member), "stream": "work",
                     "events": [self._event(db, row) for row in visible],
                     "next_cursor": scanned[-1]["seq"] if scanned else after,
                     "has_more": len(rows) > self.PAGE_SIZE}
 
-    def events(self, actor, sid, after=0, wait=0, abandon=None):
+    def events(self, actor, sid, after=0, wait=0, abandon=None, stream="work"):
         key = _actor(actor)
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after须为非负整数")
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or not 0 <= wait <= 20:
             raise ValueError("wait须为0至20秒")
+        if not isinstance(stream, str) or stream not in ("work", "system"):
+            raise ValueError("stream须为 work 或 system")
         waiter = (sid, key)
         registered = False
         deadline = time.monotonic() + wait
         try:
             with self._condition:
                 while True:
-                    result = self._page(actor, sid, after)
+                    result = self._page(actor, sid, after, stream)
                     if _long_poll_ready(result, wait, deadline, abandon):
                         self._touch(sid, key)
                         with self._read() as db:
@@ -656,12 +715,16 @@ class RelayTeams:
         return self._session(db, session, member)
 
     def send(self, actor, sid, body):
-        body = _body(body, {"kind", "text", "request_id", "reply_to", "to", "attachments"})
+        body = _body(body, {"kind", "text", "request_id", "reply_to", "to", "attachments", "task_id"})
         kind = body.get("kind")
         if kind not in ("instruction", "progress", "result", "question", "note"):
             raise ValueError("未知消息类型")
         text = _text(body.get("text"), "消息", 8000)
         request_id = _text(body.get("request_id"), "request_id", 160)
+        if kind == "note" and protocol_op(text):
+            if any(body.get(key) is not None for key in ("reply_to", "to", "task_id")) or body.get("attachments"):
+                raise ValueError("选举与心跳备注只包含协议文本")
+            return self._ingest_protocol_note(actor, sid, text, request_id)
         reply = body.get("reply_to")
         if reply is not None and (isinstance(reply, bool) or not isinstance(reply, int) or reply < 1):
             raise ValueError("reply_to须为本会话消息序号")
@@ -683,6 +746,11 @@ class RelayTeams:
             message["to"] = to
         if attachments:
             message["attachments"] = attachments
+        task_id = body.get("task_id")
+        if task_id is not None:
+            if not isinstance(task_id, str) or not task_id.startswith("tt_") or len(task_id) > 80:
+                raise ValueError("task_id不合法")
+            message["task_id"] = task_id
         hashed = hashlib.sha256(json.dumps(message, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         with self._write() as db:
             session, member = self._access(db, actor, sid)
@@ -694,16 +762,17 @@ class RelayTeams:
                 return {"event": self._event(db, duplicate), "duplicate": True}
             if session["status"] == "closed":
                 raise AuthError("团队会话已结束，不能发送新消息", 409)
-            if kind == "instruction" and member["role"] not in ("mentor", "owner"):
-                raise AuthError("只有指挥端或管理者可以发送指令", 403)
-            if kind in ("progress", "result") and member["role"] != "worker":
-                raise AuthError("只有执行端可以回报进度或结果", 403)
+            leader = self._is_leader_member(session, member)
+            if kind == "instruction" and member["role"] not in ("mentor", "owner") and not leader:
+                raise AuthError("只有指挥端、领导者或管理者可以发送指令", 403)
+            if kind == "progress" and member["role"] != "worker":
+                raise AuthError("只有执行端可以回报进度", 403)
             if kind == "instruction" and session["status"] == "paused":
                 raise AuthError("团队会话已暂停，不能发送新指令", 409)
             if reply is not None and (reply > session["last_seq"] or not db.execute(
                     "SELECT 1 FROM team_events WHERE session_id=? AND seq=?", (sid, reply)).fetchone()):
                 raise ValueError("reply_to不属于本团队会话历史")
-            if to and to.startswith("worker:") and member["role"] not in ("mentor", "owner"):
+            if to and to.startswith("worker:") and member["role"] not in ("mentor", "owner") and not leader:
                 raise AuthError("执行端不能定向到具体席位；需要广播请用 to=\"all\"", 403)
             if to and to.startswith("worker:"):
                 target = int(to.split(":", 1)[1])
@@ -719,7 +788,10 @@ class RelayTeams:
                                    (sid, *attachments)).fetchone()[0]
                 if found != len(attachments):
                     raise ValueError("附件不属于本团队会话")
-            if kind == "result" and reply is not None:
+            if task_id and not db.execute("SELECT 1 FROM team_tasks WHERE id=? AND session_id=?",
+                                          (task_id, sid)).fetchone():
+                raise ValueError("任务不属于本团队会话")
+            if kind == "result" and reply is not None and member["role"] == "worker" and not leader:
                 target_row = db.execute("SELECT * FROM team_events WHERE session_id=? AND seq=?",
                                         (sid, reply)).fetchone()
                 target_message = (json.loads(target_row["payload"]).get("message") or {}) if target_row else {}
@@ -767,6 +839,7 @@ class RelayTeams:
         body = _body({} if body is None else body, {"environment"})
         with self._write() as db:
             session, member = self._access(db, actor, sid)
+            now = time.time()
             if "environment" in body:
                 if member["role"] != "worker":
                     raise AuthError("只有执行端可以上报系统环境", 403)
@@ -778,8 +851,11 @@ class RelayTeams:
                     db.execute("UPDATE team_members SET environment=? WHERE session_id=? AND actor_key=?",
                                (json.dumps(environment, sort_keys=True, ensure_ascii=False), sid,
                                 member["actor_key"]))
+            if self._is_leader_member(session, member, now):
+                db.execute("UPDATE team_sessions SET leader_lease=? WHERE id=?",
+                           (now + self.LEASE_SECONDS, sid))
             db.execute("UPDATE team_members SET last_seen=? WHERE session_id=? AND actor_key=?",
-                       (time.time(), sid, member["actor_key"]))
+                       (now, sid, member["actor_key"]))
             return {"session": self._view(db, actor, sid)}
 
     def revoke(self, actor, sid, body):
@@ -817,6 +893,11 @@ class RelayTeams:
                                  {"role": role, "seat": target}, critical=True)
                 db.execute("DELETE FROM team_members WHERE session_id=? AND role=? AND seat=?",
                            (sid, role, target))
+                if session["leader_key"] == row["actor_key"]:
+                    self._clear_leader(db, sid, time.time())
+                    self._append_protocol(db, sid, member, "leader_lost", {
+                        "op": "leader_lost", "term": int(session["leader_term"] or 0), "leader": None})
+                    session = self._load_session(db, sid)
                 db.execute("INSERT INTO team_revoked VALUES (?,?,?,?,?) "
                            "ON CONFLICT(session_id,role,seat) DO UPDATE SET actor_key=excluded.actor_key, "
                            "revoked_at=excluded.revoked_at",
@@ -1298,3 +1379,678 @@ class RelayTeams:
                         _name(actor), now))
             return {"session": self._session(db, db.execute(
                 "SELECT * FROM team_sessions WHERE id=?", (session["id"],)).fetchone(), member)}
+
+    # -- work surface: roster, election, tasks -------------------------
+
+    @staticmethod
+    def _roster_member(row):
+        return {"role": row["role"], "seat": row["seat"], "name": row["name"],
+                "online": time.time() - row["last_seen"] < RelayTeams.ONLINE_SECONDS,
+                "last_seen": _iso(row["last_seen"]), "ack_seq": row["ack_seq"]}
+
+    def _load_session(self, db, sid):
+        return db.execute("SELECT * FROM team_sessions WHERE id=?", (sid,)).fetchone()
+
+    def _leader_active(self, session, now=None):
+        now = time.time() if now is None else now
+        lease = session["leader_lease"]
+        if not session["leader_key"] or lease is None:
+            return False
+        return lease > now
+
+    def _leader_public(self, db, session, now=None):
+        now = time.time() if now is None else now
+        if not self._leader_active(session, now):
+            return None
+        row = db.execute("SELECT * FROM team_members WHERE session_id=? AND actor_key=?",
+                         (session["id"], session["leader_key"])).fetchone()
+        if row is None:
+            return None
+        return {"role": row["role"], "seat": row["seat"], "name": row["name"],
+                "online": now - row["last_seen"] < self.ONLINE_SECONDS,
+                "term": int(session["leader_term"] or 0),
+                "lease_until": _iso(session["leader_lease"])}
+
+    def _is_leader_member(self, session, member, now=None):
+        return self._leader_active(session, now) and session["leader_key"] == member["actor_key"]
+
+    def _eligible_rows(self, db, sid):
+        return db.execute(
+            "SELECT * FROM team_members WHERE session_id=? AND role IN ('mentor','worker') "
+            "ORDER BY role, seat", (sid,)).fetchall()
+
+    @staticmethod
+    def _majority(count):
+        return count // 2 + 1
+
+    def _election_open(self, session, now):
+        if self._leader_active(session, now):
+            return False
+        until = session["election_until"]
+        return until is not None and until > now and int(session["leader_term"] or 0) > 0
+
+    def _election_view(self, db, session, now=None):
+        now = time.time() if now is None else now
+        eligible = self._eligible_rows(db, session["id"])
+        term = int(session["leader_term"] or 0)
+        votes = db.execute("SELECT COUNT(*) FROM team_votes WHERE session_id=? AND term=?",
+                           (session["id"], term)).fetchone()[0]
+        open_election = self._election_open(session, now)
+        return {"term": term, "open": open_election, "votes": votes,
+                "needed": self._majority(len(eligible)) if eligible else 0,
+                "eligible": len(eligible),
+                "election_until": _iso(session["election_until"]) if open_election else None,
+                "leader": self._leader_public(db, session, now)}
+
+    def _clear_leader(self, db, sid, now):
+        db.execute("UPDATE team_sessions SET leader_role=NULL, leader_seat=NULL, leader_name=NULL, "
+                   "leader_key=NULL, leader_lease=NULL, updated=? WHERE id=?", (now, sid))
+
+    def _blocked_by_live_leader(self, db, session, now):
+        if not self._leader_active(session, now):
+            return False
+        row = db.execute("SELECT 1 FROM team_members WHERE session_id=? AND actor_key=?",
+                         (session["id"], session["leader_key"])).fetchone()
+        if row is None:
+            self._clear_leader(db, session["id"], now)
+            return False
+        return True
+
+    def _set_leader(self, db, sid, member, term, now):
+        db.execute("UPDATE team_sessions SET leader_role=?, leader_seat=?, leader_name=?, leader_key=?, "
+                   "leader_term=?, leader_lease=?, election_until=NULL, updated=? WHERE id=?",
+                   (member["role"], member["seat"], member["name"], member["actor_key"],
+                    term, now + self.LEASE_SECONDS, now, sid))
+
+    def _open_election(self, db, session, now):
+        if self._election_open(session, now):
+            return int(session["leader_term"])
+        term = int(session["leader_term"] or 0) + 1
+        db.execute("DELETE FROM team_votes WHERE session_id=?", (session["id"],))
+        db.execute("UPDATE team_sessions SET leader_term=?, election_until=?, leader_role=NULL, "
+                   "leader_seat=NULL, leader_name=NULL, leader_key=NULL, leader_lease=NULL, updated=? "
+                   "WHERE id=?",
+                   (term, now + self.ELECTION_WINDOW, now, session["id"]))
+        return term
+
+    def _cast_vote(self, db, sid, term, voter, candidate):
+        existing = db.execute("SELECT candidate_role, candidate_seat FROM team_votes "
+                              "WHERE session_id=? AND term=? AND voter_key=?",
+                              (sid, term, voter["actor_key"])).fetchone()
+        if existing is not None:
+            return False
+        db.execute("INSERT INTO team_votes VALUES (?,?,?,?,?,?)",
+                   (sid, term, voter["actor_key"], candidate["role"], candidate["seat"], time.time()))
+        return True
+
+    def _maybe_elect(self, db, sid, term, now):
+        eligible = len(self._eligible_rows(db, sid))
+        needed = self._majority(eligible) if eligible else 99
+        rows = db.execute(
+            "SELECT candidate_role, candidate_seat, COUNT(*) AS votes FROM team_votes "
+            "WHERE session_id=? AND term=? GROUP BY candidate_role, candidate_seat "
+            "ORDER BY votes DESC, candidate_seat ASC, candidate_role ASC",
+            (sid, term)).fetchall()
+        if not rows or rows[0]["votes"] < needed:
+            return None
+        member = db.execute("SELECT * FROM team_members WHERE session_id=? AND role=? AND seat=?",
+                            (sid, rows[0]["candidate_role"], rows[0]["candidate_seat"])).fetchone()
+        if member is None or member["role"] not in ("mentor", "worker"):
+            return None
+        self._set_leader(db, sid, member, term, now)
+        return member
+
+    def _append_protocol(self, db, sid, member, op, payload):
+        last = db.execute("SELECT protocol_seq FROM team_sessions WHERE id=?", (sid,)).fetchone()[0] or 0
+        if last >= self.MAX_PROTOCOL:
+            return None
+        seq = int(last) + 1
+        now = time.time()
+        db.execute("UPDATE team_sessions SET protocol_seq=?, updated=? WHERE id=?", (seq, now, sid))
+        db.execute("INSERT INTO team_protocol "
+                   "(session_id,seq,op,created,sender_role,sender_seat,sender_name,payload,sender_key) "
+                   "VALUES (?,?,?,?,?,?,?,?,?)",
+                   (sid, seq, op, now, member["role"], member["seat"], member["name"],
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True), member["actor_key"]))
+        return seq
+
+    def _protocol_event(self, row):
+        payload = json.loads(row["payload"])
+        leader = payload.get("leader")
+        candidate = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else None
+        if isinstance(leader, dict):
+            leader = {key: leader.get(key) for key in ("role", "seat", "name", "online", "term", "lease_until")}
+        if candidate is not None:
+            candidate = {key: candidate.get(key) for key in ("role", "seat", "name")}
+        return {"seq": row["seq"], "kind": "protocol", "op": row["op"],
+                "created_at": _iso(row["created"]),
+                "sender": {"role": row["sender_role"], "seat": row["sender_seat"],
+                           "name": row["sender_name"]},
+                "term": payload.get("term"), "candidate": candidate, "leader": leader}
+
+    def _require_running(self, session):
+        if session["status"] != "active":
+            raise AuthError("团队会话未在进行，不能发起选举", 409)
+
+    def _member_at(self, db, sid, role, seat):
+        if role not in ("mentor", "worker"):
+            raise ValueError("角色须为 mentor 或 worker")
+        if isinstance(seat, bool) or not isinstance(seat, int):
+            raise ValueError("seat必须是整数")
+        row = db.execute("SELECT * FROM team_members WHERE session_id=? AND role=? AND seat=?",
+                         (sid, role, seat)).fetchone()
+        if row is None:
+            raise ValueError("目标席位不存在")
+        return row
+
+    def _seat_brief(self, member):
+        return {"role": member["role"], "seat": member["seat"], "name": member["name"]}
+
+    def who_is_leader(self, actor, sid):
+        with self._read() as db:
+            session, member = self._access(db, actor, sid)
+            view = self._election_view(db, session)
+            view["role"] = member["role"]
+            view["seat"] = member["seat"]
+            return view
+
+    def list_online(self, actor, sid):
+        with self._read() as db:
+            session, member = self._access(db, actor, sid)
+            rows = db.execute("SELECT * FROM team_members WHERE session_id=? ORDER BY role, seat",
+                              (sid,)).fetchall()
+            roster = [self._roster_member(row) for row in rows]
+            return {"members": roster, "online": [item for item in roster if item["online"]],
+                    "leader": self._leader_public(db, session),
+                    "role": member["role"], "seat": member["seat"]}
+
+    def campaign(self, actor, sid):
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            self._require_running(session)
+            if member["role"] not in ("mentor", "worker"):
+                raise AuthError("只有指导端或执行端可以参选", 403)
+            now = time.time()
+            if self._blocked_by_live_leader(db, session, now):
+                raise AuthError("已有任期未结束的领导者", 409)
+            session = self._load_session(db, sid)
+            term = self._open_election(db, session, now)
+            changed = self._cast_vote(db, sid, term, member, member)
+            elected = self._maybe_elect(db, sid, term, now)
+            session = self._load_session(db, sid)
+            if changed or elected is not None:
+                self._append_protocol(db, sid, member, "elected" if elected is not None else "campaign", {
+                    "op": "elected" if elected is not None else "campaign", "term": term,
+                    "candidate": self._seat_brief(member),
+                    "leader": self._leader_public(db, session, now)})
+                session = self._load_session(db, sid)
+            return {"election": self._election_view(db, session, now),
+                    "session": self._session(db, session, member)}
+
+    def vote(self, actor, sid, body):
+        body = _body(body, {"role", "seat", "term"})
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            self._require_running(session)
+            if member["role"] not in ("mentor", "worker"):
+                raise AuthError("只有指导端或执行端可以投票", 403)
+            now = time.time()
+            if self._blocked_by_live_leader(db, session, now):
+                raise AuthError("已有任期未结束的领导者", 409)
+            session = self._load_session(db, sid)
+            if not self._election_open(session, now):
+                raise AuthError("没有进行中的选举", 409)
+            term = int(session["leader_term"])
+            requested = body.get("term")
+            if requested is not None and (isinstance(requested, bool) or not isinstance(requested, int)
+                                           or requested != term):
+                raise AuthError("投票任期与当前选举不一致", 409)
+            candidate = self._member_at(db, sid, body.get("role"), body.get("seat"))
+            changed = self._cast_vote(db, sid, term, member, candidate)
+            elected = self._maybe_elect(db, sid, term, now)
+            session = self._load_session(db, sid)
+            if changed or elected is not None:
+                won = elected is not None
+                self._append_protocol(db, sid, member, "elected" if won else "vote", {
+                    "op": "elected" if won else "vote", "term": term,
+                    "candidate": self._seat_brief(candidate),
+                    "leader": self._leader_public(db, session, now)})
+                session = self._load_session(db, sid)
+            return {"election": self._election_view(db, session, now),
+                    "session": self._session(db, session, member)}
+
+    def appoint(self, actor, sid, body):
+        body = _body(body, {"role", "seat"})
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            self._require_running(session)
+            if member["role"] not in ("owner", "mentor") and not self._is_leader_member(session, member):
+                raise AuthError("只有创建者、指导端或现任领导者可以指定领导者", 403)
+            target = self._member_at(db, sid, body.get("role"), body.get("seat"))
+            now = time.time()
+            term = int(session["leader_term"] or 0) + 1
+            db.execute("DELETE FROM team_votes WHERE session_id=?", (sid,))
+            self._set_leader(db, sid, target, term, now)
+            session = self._load_session(db, sid)
+            self._append_protocol(db, sid, member, "appoint", {
+                "op": "appoint", "term": term, "candidate": self._seat_brief(target),
+                "leader": self._leader_public(db, session, now)})
+            session = self._load_session(db, sid)
+            return {"leader": self._leader_public(db, session, now),
+                    "election": self._election_view(db, session, now),
+                    "session": self._session(db, session, member)}
+
+    def leader_heartbeat(self, actor, sid):
+        with self._write(notify=False) as db:
+            session, member = self._access(db, actor, sid)
+            now = time.time()
+            if not self._is_leader_member(session, member, now):
+                raise AuthError("只有现任领导者可以续约", 409)
+            db.execute("UPDATE team_sessions SET leader_lease=?, updated=? WHERE id=?",
+                       (now + self.LEASE_SECONDS, now, sid))
+            db.execute("UPDATE team_members SET last_seen=? WHERE session_id=? AND actor_key=?",
+                       (now, sid, member["actor_key"]))
+            session = self._load_session(db, sid)
+            return {"leader": self._leader_public(db, session, now),
+                    "session": self._session(db, session, member)}
+
+    def _parse_protocol(self, text):
+        body = text.strip()
+        pieces = body.split(None, 1)
+        op = pieces[0]
+        raw = pieces[1].strip() if len(pieces) == 2 else ""
+        if raw.startswith("{"):
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise ValueError("协议备注的JSON不合法") from error
+            if not isinstance(data, dict) or set(data) - {"term", "candidate", "role", "seat"}:
+                raise ValueError("协议备注字段不合法")
+            term = data.get("term")
+            role = seat = None
+            if "candidate" in data:
+                role, seat = self._split_target(data.get("candidate"))
+            elif "role" in data or "seat" in data:
+                role, seat = data.get("role"), data.get("seat")
+            self._check_term(term)
+            self._check_target(role, seat, allow_empty=op != "VOTE")
+            return {"op": op, "term": term, "role": role, "seat": seat}
+        rest = raw.split() if raw else []
+        term = None
+        if rest and rest[0].isdigit():
+            term = int(rest[0])
+            rest = rest[1:]
+        self._check_term(term)
+        if op == "HB":
+            return {"op": op, "term": term, "role": None, "seat": None}
+        role = seat = None
+        if rest:
+            if len(rest) != 1:
+                raise ValueError("协议备注格式不合法")
+            role, seat = self._split_target(rest[0])
+        if op == "VOTE" and role is None:
+            raise ValueError("VOTE必须带候选席位")
+        self._check_target(role, seat, allow_empty=op != "VOTE")
+        return {"op": op, "term": term, "role": role, "seat": seat}
+
+    @staticmethod
+    def _check_term(term):
+        if term is None:
+            return
+        if isinstance(term, bool) or not isinstance(term, int) or term < 0 or term > 1_000_000:
+            raise ValueError("term不合法")
+
+    @staticmethod
+    def _split_target(value):
+        if isinstance(value, str) and value.isdigit():
+            return "worker", int(value)
+        if not isinstance(value, str) or value.count(":") != 1:
+            raise ValueError("候选席位须为 mentor:0 或 worker:N")
+        role, seat = value.split(":", 1)
+        if role not in ("mentor", "worker") or not seat.isdigit():
+            raise ValueError("候选席位须为 mentor:0 或 worker:N")
+        return role, int(seat)
+
+    @staticmethod
+    def _check_target(role, seat, allow_empty):
+        if role is None and seat is None:
+            if allow_empty:
+                return
+            raise ValueError("候选席位不能为空")
+        if role not in ("mentor", "worker") or isinstance(seat, bool) or not isinstance(seat, int):
+            raise ValueError("候选席位须为 mentor:0 或 worker:N")
+
+    def _protocol_result(self, db, session, member, op, applied, duplicate, reason):
+        payload = {"protocol": True, "op": op, "applied": applied, "duplicate": duplicate,
+                   "leader": self._leader_public(db, session),
+                   "election": self._election_view(db, session),
+                   "session": self._session(db, session, member)}
+        if reason:
+            payload["reason"] = reason
+        return payload
+
+    def _apply_protocol_note(self, db, session, member, parsed):
+        op = parsed["op"]
+        now = time.time()
+        sid = session["id"]
+        if op == "HB":
+            if self._is_leader_member(session, member, now):
+                db.execute("UPDATE team_sessions SET leader_lease=? WHERE id=?",
+                           (now + self.LEASE_SECONDS, sid))
+            return True, None
+        if op == "LEADER":
+            if self._is_leader_member(session, member, now):
+                db.execute("UPDATE team_sessions SET leader_lease=? WHERE id=?",
+                           (now + self.LEASE_SECONDS, sid))
+                return True, None
+            return False, "not_leader"
+        if member["role"] not in ("mentor", "worker"):
+            return False, "not_eligible"
+        if session["status"] != "active":
+            return False, "not_active"
+        if self._blocked_by_live_leader(db, session, now):
+            return False, "leader_active"
+        session = self._load_session(db, sid)
+        if op == "ELECT":
+            target = member
+            if parsed["role"] is not None:
+                target = db.execute("SELECT * FROM team_members WHERE session_id=? AND role=? AND seat=?",
+                                    (sid, parsed["role"], parsed["seat"])).fetchone()
+                if target is None or target["role"] not in ("mentor", "worker"):
+                    return False, "unknown_seat"
+            term = self._open_election(db, session, now)
+            changed = self._cast_vote(db, sid, term, member, target)
+            elected = self._maybe_elect(db, sid, term, now)
+            if changed or elected is not None:
+                session = self._load_session(db, sid)
+                won = elected is not None
+                self._append_protocol(db, sid, member, "elected" if won else "campaign", {
+                    "op": "elected" if won else "campaign", "term": term,
+                    "candidate": self._seat_brief(target),
+                    "leader": self._leader_public(db, session, now)})
+            return True, None
+        if op == "VOTE":
+            if not self._election_open(session, now):
+                return False, "no_election"
+            target = db.execute("SELECT * FROM team_members WHERE session_id=? AND role=? AND seat=?",
+                                (sid, parsed["role"], parsed["seat"])).fetchone()
+            if target is None:
+                return False, "unknown_seat"
+            term = int(session["leader_term"])
+            changed = self._cast_vote(db, sid, term, member, target)
+            elected = self._maybe_elect(db, sid, term, now)
+            if changed or elected is not None:
+                session = self._load_session(db, sid)
+                won = elected is not None
+                self._append_protocol(db, sid, member, "elected" if won else "vote", {
+                    "op": "elected" if won else "vote", "term": term,
+                    "candidate": self._seat_brief(target),
+                    "leader": self._leader_public(db, session, now)})
+            return True, None
+        return False, "unknown_op"
+
+    def _ingest_protocol_note(self, actor, sid, text, request_id):
+        parsed = self._parse_protocol(text)
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            if session["status"] == "closed":
+                raise AuthError("团队会话已结束，不能发送新消息", 409)
+            previous = db.execute("SELECT op, content_hash FROM team_protocol_requests "
+                                  "WHERE session_id=? AND sender_key=? AND request_id=?",
+                                  (sid, member["actor_key"], request_id)).fetchone()
+            if previous is not None:
+                if previous["content_hash"] != digest:
+                    raise AuthError("相同request_id不能对应不同消息", 409)
+                return self._protocol_result(db, session, member, previous["op"], True, True, None)
+            applied, reason = self._apply_protocol_note(db, session, member, parsed)
+            db.execute("INSERT INTO team_protocol_requests VALUES (?,?,?,?,?)",
+                       (sid, member["actor_key"], request_id, digest, parsed["op"]))
+            db.execute("UPDATE team_members SET last_seen=? WHERE session_id=? AND actor_key=?",
+                       (time.time(), sid, member["actor_key"]))
+            session = self._load_session(db, sid)
+            return self._protocol_result(db, session, member, parsed["op"], applied, False, reason)
+
+    @staticmethod
+    def _protocol_note_row(row):
+        if row["kind"] != "message":
+            return False
+        try:
+            message = json.loads(row["payload"]).get("message") or {}
+        except json.JSONDecodeError:
+            return False
+        return protocol_op(message.get("text")) is not None
+
+    def _work_preview(self, db, session_id):
+        rows = db.execute(
+            "SELECT kind, created, payload FROM team_events WHERE session_id=? "
+            "AND kind IN ('message','task') ORDER BY seq DESC LIMIT 40",
+            (session_id,)).fetchall()
+        for row in rows:
+            if row["kind"] == "task":
+                task = json.loads(row["payload"]).get("task") or {}
+                title = task.get("title") if isinstance(task.get("title"), str) else ""
+                return {"kind": "task", "created_at": _iso(row["created"]), "preview": _preview(title)}
+            message = json.loads(row["payload"]).get("message") or {}
+            if protocol_op(message.get("text")):
+                continue
+            kind = message.get("kind") if message.get("kind") in (
+                "instruction", "progress", "result", "question", "note") else None
+            text = message.get("text") if isinstance(message.get("text"), str) else ""
+            return {"kind": kind, "created_at": _iso(row["created"]), "preview": _preview(text)}
+        return None
+
+    def _filtered_public_event(self, db, row, public_id=None):
+        if row["kind"] == "environment" or self._protocol_note_row(row):
+            return None
+        event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
+                 "sender": {"role": row["sender_role"], "seat": row["sender_seat"],
+                            "name": row["sender_name"]}}
+        if row["kind"] == "task":
+            payload = json.loads(row["payload"])
+            task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+            event["action"] = payload.get("action") if isinstance(payload.get("action"), str) else None
+            event["task"] = self._public_task(task)
+            return event
+        event.update(Relay._public_payload(
+            row["kind"], json.loads(row["payload"]), db, row["session_id"], "team_files",
+            public_id=public_id, file_base=self._base_url() if public_id else ""))
+        return event
+
+    def _task_rows(self, db, sid, status=None):
+        if status is None:
+            return db.execute("SELECT * FROM team_tasks WHERE session_id=? ORDER BY created ASC LIMIT ?",
+                              (sid, self.MAX_TASKS)).fetchall()
+        return db.execute("SELECT * FROM team_tasks WHERE session_id=? AND status=? "
+                          "ORDER BY created ASC LIMIT ?",
+                          (sid, status, self.MAX_TASKS)).fetchall()
+
+    def _task_row(self, db, sid, task_id):
+        if not isinstance(task_id, str) or not task_id.startswith("tt_"):
+            raise ValueError("task_id不合法")
+        row = db.execute("SELECT * FROM team_tasks WHERE id=? AND session_id=?",
+                         (task_id, sid)).fetchone()
+        if row is None:
+            raise AuthError("没有这个任务", 404)
+        return row
+
+    @staticmethod
+    def _task_json(row):
+        assignee = None
+        if row["assignee_role"]:
+            assignee = {"role": row["assignee_role"], "seat": row["assignee_seat"],
+                        "name": row["assignee_name"]}
+        return {"id": row["id"], "title": row["title"], "detail": row["detail"],
+                "status": row["status"], "progress": row["progress"], "assignee": assignee,
+                "parent_id": row["parent_id"],
+                "created_by": {"role": row["created_by_role"], "seat": row["created_by_seat"],
+                               "name": row["created_by_name"]},
+                "created_at": _iso(row["created"]), "updated_at": _iso(row["updated"]),
+                "revision": row["revision"]}
+
+    @staticmethod
+    def _public_task(task):
+        assignee = task.get("assignee") if isinstance(task.get("assignee"), dict) else None
+        created_by = task.get("created_by") if isinstance(task.get("created_by"), dict) else None
+        if assignee is not None:
+            assignee = {"role": assignee.get("role"), "seat": assignee.get("seat"),
+                        "name": assignee.get("name")}
+        if created_by is not None:
+            created_by = {"role": created_by.get("role"), "seat": created_by.get("seat"),
+                          "name": created_by.get("name")}
+        return {"id": task.get("id"), "title": task.get("title"), "detail": task.get("detail"),
+                "status": task.get("status"), "progress": task.get("progress"),
+                "assignee": assignee, "parent_id": task.get("parent_id"),
+                "created_by": created_by, "created_at": task.get("created_at"),
+                "updated_at": task.get("updated_at"), "revision": task.get("revision")}
+
+    @staticmethod
+    def _check_progress(value):
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+            raise ValueError("progress须为0到100的整数")
+        return value
+
+    def _require_task_open_session(self, session):
+        if session["status"] == "closed":
+            raise AuthError("团队会话已结束", 409)
+
+    def list_tasks(self, actor, sid, status=None):
+        if status is not None and status not in ("open", "in_progress", "done"):
+            raise ValueError("status须为 open、in_progress 或 done")
+        with self._read() as db:
+            session, _member = self._access(db, actor, sid)
+            return {"tasks": [self._task_json(row) for row in self._task_rows(db, sid, status)],
+                    "leader": self._leader_public(db, session)}
+
+    def create_task(self, actor, sid, body):
+        body = _body(body, {"title", "detail", "request_id", "parent_id"})
+        title = _text(body.get("title"), "标题", 160)
+        detail = body.get("detail") or ""
+        if not isinstance(detail, str) or len(detail) > 8000 or "\x00" in detail:
+            raise ValueError("任务说明不能超过长度限制")
+        detail = detail.strip()
+        request_id = _text(body.get("request_id"), "request_id", 160)
+        parent_id = body.get("parent_id")
+        if parent_id is not None and (not isinstance(parent_id, str) or not parent_id.startswith("tt_")):
+            raise ValueError("parent_id不合法")
+        digest = hashlib.sha256(json.dumps(
+            {"title": title, "detail": detail, "parent_id": parent_id},
+            ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            self._require_task_open_session(session)
+            existing = db.execute("SELECT * FROM team_tasks WHERE session_id=? AND creator_key=? AND request_id=?",
+                                  (sid, member["actor_key"], request_id)).fetchone()
+            if existing is not None:
+                if existing["content_hash"] != digest:
+                    raise AuthError("相同request_id不能对应不同任务", 409)
+                return {"task": self._task_json(existing), "duplicate": True}
+            if parent_id and not db.execute("SELECT 1 FROM team_tasks WHERE id=? AND session_id=?",
+                                            (parent_id, sid)).fetchone():
+                raise ValueError("父任务不属于本团队会话")
+            now = time.time()
+            task_id = "tt_" + secrets.token_hex(8)
+            db.execute("INSERT INTO team_tasks (id,session_id,title,detail,status,assignee_role,"
+                       "assignee_seat,assignee_name,assignee_key,progress,parent_id,created_by_role,"
+                       "created_by_seat,created_by_name,creator_key,request_id,content_hash,created,"
+                       "updated,revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (task_id, sid, title, detail, "open", None, None, None, None, 0, parent_id,
+                        member["role"], member["seat"], member["name"], member["actor_key"],
+                        request_id, digest, now, now, 1))
+            row = db.execute("SELECT * FROM team_tasks WHERE id=?", (task_id,)).fetchone()
+            task = self._task_json(row)
+            self._append(db, sid, member, "task", {"action": "created", "task": task})
+            return {"task": task, "duplicate": False}
+
+    def claim_task(self, actor, sid, task_id):
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            self._require_task_open_session(session)
+            if member["role"] not in ("mentor", "worker"):
+                raise AuthError("只有指导端或执行端可以认领任务", 403)
+            row = self._task_row(db, sid, task_id)
+            if row["status"] == "done":
+                raise AuthError("任务已完成", 409)
+            if row["assignee_key"] and row["assignee_key"] != member["actor_key"]:
+                raise AuthError("任务已被其他人认领", 409)
+            if row["assignee_key"] == member["actor_key"] and row["status"] == "in_progress":
+                return {"task": self._task_json(row), "duplicate": True}
+            now = time.time()
+            db.execute("UPDATE team_tasks SET status='in_progress', assignee_role=?, assignee_seat=?, "
+                       "assignee_name=?, assignee_key=?, updated=?, revision=revision+1 WHERE id=?",
+                       (member["role"], member["seat"], member["name"], member["actor_key"], now, row["id"]))
+            row = db.execute("SELECT * FROM team_tasks WHERE id=?", (row["id"],)).fetchone()
+            task = self._task_json(row)
+            self._append(db, sid, member, "task", {"action": "claimed", "task": task})
+            return {"task": task, "duplicate": False}
+
+    def assign_task(self, actor, sid, task_id, body):
+        body = _body(body, {"role", "seat", "task_id"})
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            self._require_task_open_session(session)
+            if member["role"] not in ("owner", "mentor") and not self._is_leader_member(session, member):
+                raise AuthError("只有创建者、指导端或现任领导者可以指派任务", 403)
+            target = self._member_at(db, sid, body.get("role"), body.get("seat"))
+            row = self._task_row(db, sid, task_id)
+            if row["status"] == "done":
+                raise AuthError("任务已完成", 409)
+            if row["assignee_key"] == target["actor_key"] and row["status"] == "in_progress":
+                return {"task": self._task_json(row), "duplicate": True}
+            now = time.time()
+            db.execute("UPDATE team_tasks SET status='in_progress', assignee_role=?, assignee_seat=?, "
+                       "assignee_name=?, assignee_key=?, updated=?, revision=revision+1 WHERE id=?",
+                       (target["role"], target["seat"], target["name"], target["actor_key"], now, row["id"]))
+            row = db.execute("SELECT * FROM team_tasks WHERE id=?", (row["id"],)).fetchone()
+            task = self._task_json(row)
+            self._append(db, sid, member, "task", {"action": "assigned", "task": task})
+            return {"task": task, "duplicate": False}
+
+    def update_task(self, actor, sid, task_id, body):
+        body = _body(body, {"progress", "status", "detail", "task_id"})
+        if not any(key in body for key in ("progress", "status", "detail")):
+            raise ValueError("需要 progress、status 或 detail")
+        progress = self._check_progress(body["progress"]) if "progress" in body else None
+        status = body.get("status") if "status" in body else None
+        if status is not None and status not in ("open", "in_progress", "done"):
+            raise ValueError("status须为 open、in_progress 或 done")
+        detail = None
+        if "detail" in body:
+            detail = body.get("detail")
+            if not isinstance(detail, str) or len(detail) > 8000 or "\x00" in detail:
+                raise ValueError("任务说明不能超过长度限制")
+            detail = detail.strip()
+        with self._write() as db:
+            session, member = self._access(db, actor, sid)
+            self._require_task_open_session(session)
+            row = self._task_row(db, sid, task_id)
+            staff = member["role"] in ("owner", "mentor") or self._is_leader_member(session, member)
+            if not staff and row["assignee_key"] != member["actor_key"]:
+                raise AuthError("只有认领者、领导者或创建者可以更新任务", 403)
+            new_status = row["status"] if status is None else status
+            new_progress = row["progress"] if progress is None else progress
+            new_detail = row["detail"] if detail is None else detail
+            assignee_role, assignee_seat = row["assignee_role"], row["assignee_seat"]
+            assignee_name, assignee_key = row["assignee_name"], row["assignee_key"]
+            if new_status == "open":
+                if not staff:
+                    raise AuthError("只有创建者、指导端或领导者可以把任务退回待认领", 403)
+                assignee_role = assignee_seat = assignee_name = assignee_key = None
+            elif new_status == "in_progress" and not assignee_key:
+                raise AuthError("进行中的任务需要认领者", 409)
+            elif new_status == "done" and progress is None:
+                new_progress = 100
+            unchanged = (new_status == row["status"] and new_progress == row["progress"]
+                         and new_detail == row["detail"] and assignee_key == row["assignee_key"])
+            if unchanged:
+                return {"task": self._task_json(row), "duplicate": True}
+            now = time.time()
+            db.execute("UPDATE team_tasks SET status=?, progress=?, detail=?, assignee_role=?, "
+                       "assignee_seat=?, assignee_name=?, assignee_key=?, updated=?, revision=revision+1 "
+                       "WHERE id=?",
+                       (new_status, new_progress, new_detail, assignee_role, assignee_seat,
+                        assignee_name, assignee_key, now, row["id"]))
+            row = db.execute("SELECT * FROM team_tasks WHERE id=?", (row["id"],)).fetchone()
+            task = self._task_json(row)
+            self._append(db, sid, member, "task", {"action": "updated", "task": task})
+            return {"task": task, "duplicate": False}
