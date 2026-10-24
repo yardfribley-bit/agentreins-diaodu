@@ -1,6 +1,7 @@
 """Credential-backed users, agent instances and execution IDs."""
 from __future__ import annotations
 import hashlib
+import math
 import re
 import hmac
 import secrets
@@ -11,9 +12,10 @@ from pathlib import Path
 
 
 class AuthError(Exception):
-    def __init__(self, message, status=401):
+    def __init__(self, message, status=401, retry_after=None):
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 def digest(token):
@@ -66,14 +68,36 @@ class Identity:
         finally:
             db.close()
 
-    def throttle(self, key):
+    WINDOW = 900
+    AUTH_LIMIT = 20
+    CONNECT_LIMIT = 60
+
+    def throttle(self, key, limit=None, scope="auth"):
+        """Count one attempt per (scope, key); reject without counting past limit.
+
+        `scope` keeps the connect bucket apart from sign-up/sign-in, whose lower
+        limit is the password-guessing ceiling. The window is fixed from the first
+        attempt; retry_after is the whole seconds left before that window resets.
+        """
+        limit = self.AUTH_LIMIT if limit is None else limit
+        stored = scope + ":" + str(key)
+        now = time.time()
+        retry_after = None
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("DELETE FROM attempts WHERE started < ?", (time.time()-900,))
-            db.execute("INSERT INTO attempts VALUES (?, 1, ?) ON CONFLICT(key) DO UPDATE SET count=count+1", (key, time.time()))
-            count = db.execute("SELECT count FROM attempts WHERE key=?", (key,)).fetchone()[0]
-        if count > 20:
-            raise AuthError("尝试过于频繁，请 15 分钟后重试", 429)
+            db.execute("DELETE FROM attempts WHERE started < ?", (now - self.WINDOW,))
+            row = db.execute("SELECT count, started FROM attempts WHERE key=?",
+                             (stored,)).fetchone()
+            if row is not None and row["count"] >= limit:
+                # A rejected attempt must not extend or inflate the window.
+                retry_after = max(1, int(math.ceil(row["started"] + self.WINDOW - now)))
+            elif row is None:
+                db.execute("INSERT INTO attempts VALUES (?, 1, ?)", (stored, now))
+            else:
+                db.execute("UPDATE attempts SET count=count+1 WHERE key=?", (stored,))
+        if retry_after is not None:
+            raise AuthError(f"尝试过于频繁，请 {retry_after} 秒后重试", 429,
+                            retry_after=retry_after)
 
     def register(self, username, display_name, password, invite):
         if not self.invite_code or not isinstance(invite, str) or not hmac.compare_digest(invite.encode(), self.invite_code.encode()):

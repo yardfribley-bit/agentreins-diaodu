@@ -19,8 +19,15 @@ class AgentAPI(unittest.TestCase):
   _,context=self.req('GET',path+'/context',agent=0)
   self.assertEqual(context['columns'][0]['latest_report']['text'],'done')
   self.assertEqual(len(context['chat']['mentions_me']),1)
-  _,updates=self.req('GET',path+'/updates?entry_after=1&chat_after='+str(context['chat']['next_cursor']),agent=0)
-  self.assertEqual(updates['entries'],[]);self.assertEqual(updates['chat']['messages'],[])
+  # 群聊 seq1=私密消息、2=加入系统事件、3=please check、4=提交成果系统事件；
+  # 游标按 sequence 推进，系统事件同样占位，next_cursor 等于最后一条 sequence。
+  _,updates=self.req('GET',path+'/updates?entry_after=1&chat_after=2',agent=0)
+  self.assertEqual(updates['entries'],[])
+  self.assertEqual([m['sequence'] for m in updates['chat']['messages']],[3,4])
+  self.assertEqual(updates['chat']['next_cursor'],4)
+  _,drained=self.req('GET',path+'/updates?entry_after=1&chat_after=4',agent=0)
+  self.assertEqual(drained['chat']['messages'],[])
+  self.assertEqual(drained['chat']['next_cursor'],4)
   _,other=self.req('GET',path+'/context',agent=1);self.assertIsNone(other['chat'])
   self.assertEqual(self.req('GET',path+'/updates?chat_after=1',agent=1)[0],403)
  def test_summary_and_machine_contract(self):

@@ -21,7 +21,7 @@ def context(library,task_id,actor,entry_after=0,chat_after=0,updates=False):
         if member:
             messages=raw.get('chat',[])
             if chat_after<0 or chat_after>len(messages):raise ValueError('chat_after 超出范围')
-            batch=[chat.decorate(raw,m) for m in messages[chat_after:chat_after+100]]
+            batch=[chat.decorate(raw,m) for m in messages[chat_after:chat_after+chat.PAGE_SIZE]]
             mid=chat.member_id(actor)
             private={'visibility':'members_only','messages':batch,'mentions_me':[m for m in batch if any(p['member_id']==mid for p in m.get('mentions',[]))],'members':list(chat.members(raw).values()),'next_cursor':chat_after+len(batch),'has_more':chat_after+len(batch)<len(messages)}
         elif chat_after:raise AuthError('未参与任务，不能读取群聊增量',403)

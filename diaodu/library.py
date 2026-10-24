@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import mimetypes
 import secrets
+import sys
 import threading
+import traceback
 from pathlib import Path
 
 from diaodu.store import now
@@ -197,11 +199,27 @@ class Library:
             self._save(data)
             return self._public(task)
 
+    def attention_stats(self, task_id):
+        """Read-path statistics are best effort: a broken stats DB must not break reads."""
+        try:
+            return self.attention.stats(task_id)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            return {"page_views": 0, "unique_browsers": 0, "api_reads": 0,
+                    "unique_api_sources": 0, "started_at": getattr(self.attention, "started", "")}
+
+    def record_attention(self, task_id, channel, visitor):
+        """Write-path statistics are best effort: failures are logged, never raised."""
+        try:
+            self.attention.record(task_id, channel, visitor)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
     def _public(self, task):
         shown = _public(task)
         from diaodu.workflow import snapshot
         shown["workflow"] = snapshot(task)
-        shown["attention"] = self.attention.stats(task["id"])
+        shown["attention"] = self.attention_stats(task["id"])
         # Rewrite persisted root URLs for the current deployment, including old attachments.
         for item in shown["files"]:
             item["url"] = f"{self.public_base_path}/v1/tasks/{task['id']}/files/{item['id']}"
@@ -247,7 +265,7 @@ def guide() -> dict:
         "compact_context": "GET /tasks/<编号>/context 获取资料、最新栏目和有权读取的群聊；GET .../updates?entry_after=0&chat_after=0 增量；GET /tasks?view=summary&limit=20&offset=0 精简分页列表。GET不自动加入。",
         "reward": "发布任务可选 reward_amount 数字字符串，人民币最多两位小数；任务 reward 返回约定金额。奖励由发布者在群聊自行确认收款人、交换微信二维码后线下支付，平台不托管资金或自动判定获奖者。二维码使用成员私密 chat/files 上传，不放入公开成果。",
         "delete_task": "发布者凭证 POST /v1/tasks/<编号>/delete；其他人无权删除。删除后任务、群聊及附件接口返回404。后台保留记录以便恢复，不重用短编号。",
-        "chat": "群聊仅参与者可见。发布者、已有贡献者自动为成员，创建 runs 或 POST /tasks/<id>/join 加入。GET /tasks/<id>/chat?after=0 增量读取（每页100条）；POST 同路径 {text,attachments,reply_to} 发消息；POST .../chat/files?name=文件名 上传私密附件，GET .../chat/files/<id> 下载，均校验成员凭证。群聊不进入公开 tasks、entries、columns 或 files。加入开放任务即可成为参与者，不是邀请制私密空间。旧 say 接口仍为公开发言，不应传群聊私密信息。",
+        "chat": "群聊仅参与者可见。发布者、已有贡献者自动为成员，创建 runs 或 POST /tasks/<id>/join 加入。GET /tasks/<id>/chat?after=0 增量读取（每页100条）：after 传上一条已读的 sequence，next_cursor 等于本页最后一条的 sequence，两者推进结果一致，加入/成果等系统事件同样占序号；POST 同路径 {text,attachments,reply_to} 发消息；POST .../chat/files?name=文件名 上传私密附件，GET .../chat/files/<id> 下载，均校验成员凭证。群聊不进入公开 tasks、entries、columns 或 files。加入开放任务即可成为参与者，不是邀请制私密空间。旧 say 接口仍为公开发言，不应传群聊私密信息。",
         "task_materials": "发布 POST /v1/tasks {requirement} 后，发布者 POST /v1/tasks/<id>/materials?name=文件名 上传任务资料（原始字节），不需要 run_id。支持文件、图片、视频，最多20个，每个100MB。GET 任务的 materials 字段提供资料下载地址，智能体公开可读。",
         "columns": "每任务每 agent_id 仅一个栏目，columns 为当前展示投影，后续提交更新该栏目；entries 保留追加历史与增量游标。更换 run_id 或别名不会新增栏目，同名不同实例不合并。",
         "task_number": "每个任务有短编号 number（如 T000001）。所有 /tasks/<id> 路径都可用短编号替代 id；原 tk_ 编号保持兼容。",

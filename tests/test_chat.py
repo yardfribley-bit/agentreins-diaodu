@@ -1,5 +1,7 @@
 import json,unittest
+from unittest.mock import patch
 import test_identity as fixtures
+from diaodu import chat
 
 class ChatAPI(unittest.TestCase):
     setUp=fixtures.IdentityAPI.setUp
@@ -32,10 +34,40 @@ class ChatAPI(unittest.TestCase):
         self.assertEqual(self.req('GET',file['url'],user=1,binary=True)[1],b'secretvideo')
         status,reply=self.req('POST',path+'/chat',{'text':'回复','reply_to':message['id']},user=1)
         self.assertEqual(status,201)
-        status,data=self.req('GET',path+'/chat?after=2',user=0)
-        self.assertEqual(len(data['messages']),1)
+        status,data=self.req('GET',path+'/chat?after=1',user=0)
+        # 加入任务产生一条系统事件（sequence 2），它同样占游标，所以这页是 2、3。
+        self.assertEqual([m['sequence'] for m in data['messages']],[2,3])
         self.assertEqual(data['next_cursor'],3)
+        self.assertEqual(data['messages'][-1]['text'],'回复')
         self.assertEqual(self.req('POST',path+'/chat',{'text':'坏引用','reply_to':'missing'},user=1)[0],400)
+
+    def test_cursor_by_next_cursor_or_last_sequence_is_identical(self):
+        path='/v1/tasks/'+self.task['number']
+        self.req('POST',path+'/chat',{'text':'m1'},user=0)
+        self.req('POST',path+'/join',{},user=1)
+        self.req('POST',path+'/chat',{'text':'m2'},user=0)
+        self.req('POST',path+'/chat',{'text':'m3'},user=0)
+        with patch.object(chat,'PAGE_SIZE',2):
+            status,first=self.req('GET',path+'/chat?after=0',user=0)
+            self.assertEqual(status,200)
+            self.assertEqual([m['sequence'] for m in first['messages']],[1,2])
+            self.assertTrue(first['has_more'])
+            last_sequence=first['messages'][-1]['sequence']
+            by_cursor=self.req('GET',path+f"/chat?after={first['next_cursor']}",user=0)[1]
+            by_sequence=self.req('GET',path+f'/chat?after={last_sequence}',user=0)[1]
+            self.assertEqual(by_cursor['messages'],by_sequence['messages'])
+            self.assertEqual(by_cursor['next_cursor'],by_sequence['next_cursor'])
+            seen=[];cursor=0
+            while True:
+                page=self.req('GET',path+f'/chat?after={cursor}',user=0)[1]
+                seen += [m['sequence'] for m in page['messages']]
+                if not page['has_more']:break
+                cursor=page['next_cursor']
+            self.assertEqual(seen,list(range(1,len(seen)+1)))
+            updates=self.req('GET',path+f"/updates?chat_after={first['next_cursor']}",user=0)[1]
+            updates_by_sequence=self.req('GET',path+f'/updates?chat_after={last_sequence}',user=0)[1]
+            self.assertEqual(updates['chat']['messages'],updates_by_sequence['chat']['messages'])
+            self.assertEqual(updates['chat']['next_cursor'],updates_by_sequence['chat']['next_cursor'])
 
     def test_run_join_membership_is_instance_bound(self):
         path='/v1/tasks/'+self.task['id']

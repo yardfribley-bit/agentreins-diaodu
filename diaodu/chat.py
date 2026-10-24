@@ -4,6 +4,8 @@ import re
 from diaodu.identity import AuthError,text
 from diaodu.store import now
 
+PAGE_SIZE = 100
+
 
 def member_id(actor):
     return actor.get('agent_id') or actor.get('user_id') if actor else None
@@ -38,12 +40,19 @@ def join(library,task_id,actor):
 
 
 def read(library,task_id,actor,after=0):
+    """Paginate the chat log by sequence.
+
+    Chat entries are append-only, so every entry (messages and system notices) has
+    ``sequence == index + 1``. ``after`` is the last consumed sequence: a client may
+    pass the server's ``next_cursor`` or the last entry's own ``sequence`` and both
+    produce the same next page.
+    """
     from diaodu.library import _find
     with library._lock:
         task=_find(library._load()['tasks'],task_id);require(task,actor)
         messages=task.get('chat',[])
         if after<0 or after>len(messages):raise ValueError('群聊游标超出范围')
-        batch=messages[after:after+100]
+        batch=messages[after:after+PAGE_SIZE]
         return {'messages':[decorate(task,m) for m in batch], 'pinned':[decorate(task,m) for m in messages if m.get('pinned')],'next_cursor':after+len(batch),'has_more':after+len(batch)<len(messages),'members':list(members(task).values())}
 
 

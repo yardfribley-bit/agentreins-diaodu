@@ -26,6 +26,11 @@ TOOLS=[
  ('chat','发送仅参与者可见消息；不是公开成果。',{**TASK,'text':S,'mentions':A,'reply_to':S,'intent':{'type':'string','enum':['relay','review']}},['task','text']),
  ('read_review','读取发布者验收结果；智能体不能自行验收。',TASK,['task'])]
 
+from diaodu.relay_mcp import TOOLS as RELAY_TOOLS
+TOOLS.extend(RELAY_TOOLS)
+from diaodu.relay_teams_mcp import TOOLS as TEAM_TOOLS
+TOOLS.extend(TEAM_TOOLS)
+
 def handle(request,session_id,actor,identity,library,base_url,throttle):
  method=request.get('method');rid=request.get('id');params=request.get('params') or {}
  if request.get('jsonrpc')!='2.0' or not isinstance(method,str):return {'jsonrpc':'2.0','id':rid,'error':{'code':-32600,'message':'Invalid Request'}},None
@@ -43,7 +48,7 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
  if session and session['expires']<time.time():session=None
  if session and actor is None:actor=session['actor']
  try:
-  if actor and session:
+  if actor and session and actor.get('kind')=='agent':
    with identity.db() as db: valid=db.execute('SELECT revoked FROM agents WHERE id=?',(actor.get('agent_id'),)).fetchone()
    if not valid or valid[0]:raise AuthError('实例已撤销',401)
    with identity.db() as db: row=db.execute('SELECT name,type,member_kind FROM agents WHERE id=?',(actor['agent_id'],)).fetchone()
@@ -64,7 +69,13 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
    name=params.get('name','').removeprefix('diaodu_');args=params.get('arguments') or {}
    definition=next((t for t in TOOLS if t[0]==name),None)
    if not definition:raise ValueError('未知工具')
-   if not isinstance(args,dict) or any(k not in definition[2] for k in args) or any(k not in args for k in definition[3]):raise ValueError('工具参数不合法')
+   if not isinstance(args,dict):raise ValueError('工具参数不合法：arguments 必须是对象')
+   missing=[k for k in definition[3] if k not in args]
+   extra=sorted(k for k in args if k not in definition[2])
+   if missing or extra:
+    # Names only: values may be invite codes or base64 payloads and must never echo back.
+    detail='；'.join((['缺少 '+'、'.join(missing)] if missing else [])+(['不允许 '+'、'.join(extra)] if extra else []))
+    raise ValueError('工具参数不合法：'+detail)
    if name=='connect':
     if session is None:raise AuthError('请先initialize，并携带Mcp-Session-Id；或使用已有Bearer凭证',401)
     if actor:payload={k:v for k,v in actor.items() if k not in ('csrf','token')}
@@ -72,6 +83,18 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
      throttle();connected=identity.connect(args['alias'],args['agent_type'],'agent',args.get('email'),args.get('contact_consent',False));payload={k:v for k,v in connected.items() if k not in ('token','csrf')}
      session['actor']=identity.agent(connected['token'])
     payload=dict(payload,credential_storage='当前MCP会话；重启后重新连接，长期复用请用REST获取Bearer并安全配置到客户端')
+   elif name.startswith('relay_team_'):
+    from diaodu.relay_teams_mcp import call as team_call
+    payload=team_call(name,args,actor,library.teams,identity)
+   elif name.startswith('relay_'):
+    from diaodu.relay_mcp import call
+    # A peer that only configured the MCP URL has no Bearer: fall back to the identity
+    # this MCP session established via diaodu_connect. The Mcp-Session-Id is a 32-byte
+    # in-memory token minted once at initialize, so it is a credential in its own right;
+    # explicit Bearer still wins above (actor is only filled from the session when the
+    # request carried none). relay_mcp re-checks revocation and the store re-checks
+    # membership/role on every call, so the fallback grants no extra access.
+    payload=call(name,args,actor,library.relay,identity)
    elif name in ('outreach_assignments','outreach_status','outreach_add','outreach_reply'):
     if not actor:raise AuthError('需实例凭证和邮箱本人明确授权',401)
     if name=='outreach_assignments':payload=library.outreach.assignments(actor)
@@ -124,4 +147,6 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
   else:return {'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'Method not found'}},None
   return {'jsonrpc':'2.0','id':rid,'result':result},None
  except (AuthError,ValueError,LookupError,LibraryError) as exc:
-  return {'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':json.dumps({'code':getattr(exc,'status',400),'message':str(exc)},ensure_ascii=False)}],'isError':True}},None
+  payload={'code':getattr(exc,'status',400),'message':str(exc)}
+  if getattr(exc,'retry_after',None) is not None:payload['retry_after']=exc.retry_after
+  return {'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':json.dumps(payload,ensure_ascii=False)}],'isError':True}},None

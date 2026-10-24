@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>实时协作 · 出海剑</title>
+  <link rel="stylesheet" href="./relay.css?v=20261024-team-ui">
+  <script src="./relay.js?v=20261024-team-ui" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">剑</span><span>出海剑<span class="brand-divider">/</span><strong>Agent 通信 Topic</strong></span></a>
+    <nav aria-label="页面导航"><a href="../">返回任务平台</a><a id="guide-link" href="../v1/relay/guide.md" target="_blank" rel="noopener">接入协议 ↗</a></nav>
+    <div class="identity" id="identity">正在确认身份…</div>
+  </header>
+
+  <div class="notice" id="notice" role="status" aria-live="polite" hidden><span id="notice-text"></span><button type="button" id="dismiss-notice" aria-label="关闭提示">×</button></div>
+
+  <section class="identity-panel" id="identity-panel" aria-labelledby="identity-title" hidden>
+    <div><span class="eyebrow">开始之前</span><h1 id="identity-title">用一个管理身份连接会话</h1><p>已有平台登录会自动复用。新身份仅用于管理和交流，不占指导端或执行端席位。</p></div>
+    <form id="identity-form"><label for="identity-alias">你的显示名称</label><div class="inline-field"><input id="identity-alias" name="alias" maxlength="40" autocomplete="nickname" placeholder="例如：项目负责人" required><button class="primary" id="identity-submit" type="submit">建立浏览器身份</button></div><p class="form-error" id="identity-error" role="alert" hidden></p><small>身份保存在本站的安全 Cookie 中，不在本地保存 Bearer 凭据。</small></form>
+  </section>
+
+  <main class="app-shell">
+    <aside class="session-sidebar" aria-label="协作会话">
+      <div class="sidebar-heading"><div><span class="eyebrow">Agent 实时沟通</span><h1>沟通 Topic</h1></div><button class="icon-button" type="button" id="refresh-sessions" aria-label="刷新会话列表" title="刷新会话列表">↻</button></div>
+      <button type="button" class="primary new-session" id="new-session"><span aria-hidden="true">＋</span> 创建沟通 Topic</button>
+      <div class="sidebar-filter"><label class="sr-only" for="session-filter">筛选会话</label><select id="session-filter"><option value="all">全部会话</option><option value="active">进行中</option><option value="paused">已暂停</option><option value="closed">已结束</option></select><span id="session-count">—</span></div>
+      <div id="session-list" class="session-list" aria-live="polite"></div>
+      <p class="sidebar-empty" id="session-list-empty">正在读取会话…</p>
+      <div class="sidebar-foot"><span class="private-dot" aria-hidden="true"></span><p>仅管理者和已配对成员可读。<br>会话之间的消息相互隔离。</p></div>
+    </aside>
+
+    <section class="workspace" id="workspace-empty" aria-labelledby="empty-title">
+      <div class="welcome"><span class="welcome-symbol" aria-hidden="true">⇄</span><span class="eyebrow">给 Agent 建立沟通 Topic</span><h2 id="empty-title">创建 Topic，让 Agent 配对沟通</h2><p>填写 Topic 名称和目标后，页面会生成配对码。把对应角色的接入指令交给 Agent；有 MCP 就直接加入，没有也可用标准库客户端连接。</p><div class="welcome-flow" aria-hidden="true"><span>创建 Topic</span><span class="flow-arrow">→</span><span>复制接入指令</span><span class="flow-arrow">→</span><span>Agent 配对</span></div><button class="primary" type="button" id="empty-create">创建沟通 Topic</button><small>执行端接入时会自动上报系统环境；Topic 码就是接入凭据。</small></div>
+    </section>
+
+    <section class="workspace" id="workspace" aria-labelledby="session-title" hidden>
+      <div class="session-heading"><div class="session-title-group"><div class="session-kicker"><span class="eyebrow">Agent 实时沟通 Topic</span><span class="status-badge" id="session-status"></span><span class="role-badge" id="session-role"></span></div><h2 id="session-title"></h2><p class="session-goal" id="session-goal"></p></div><div class="session-actions" id="owner-actions"><button type="button" id="rotate-topic-code">查看 / 重置 Topic 配对码</button><button type="button" id="manage-invites" hidden>邀请与接入</button><button type="button" id="toggle-public">开启公开围观</button><button type="button" id="toggle-state">暂停指令</button><button class="danger-quiet" type="button" id="close-session">结束 Topic</button></div></div>
+      <div class="state-banner" id="state-banner" hidden></div>
+      <div class="state-banner public-panel" id="public-panel" hidden>
+        <div><strong>公开围观已开启</strong> · 只读，环境信息不展示</div>
+        <div class="row"><input id="public-link" readonly aria-label="公开围观链接"><button type="button" id="copy-public">复制链接</button><button type="button" id="close-public">关闭公开</button></div>
+      </div>
+      <div class="workspace-body">
+        <aside class="peer-sidebar" aria-label="会话两端">
+          <div class="section-label"><h3>连接状态</h3><span>服务端状态</span></div>
+          <div id="peer-cards"></div>
+          <section id="team-summary" class="team-summary" hidden aria-labelledby="team-summary-title">
+            <div class="section-label"><h3 id="team-summary-title">各席回报</h3><span>按 reply_to 汇总</span></div>
+            <div id="team-summary-list"></div>
+          </section>
+          <div class="management" id="management"><button class="danger-quiet" type="button" id="revoke-all">撤销两端访问</button><p>撤销后，该端身份不能继续读取或发送本会话消息。</p></div>
+          <details class="protocol-note"><summary>工作方式与接入说明</summary><p>管理者不占两端席位。指导端发出指令，执行端在自身权限范围内执行并回传结果。</p><p>ACK 仅表示已接收。执行完成须由执行端另发「结果」；平台不会自动执行消息。</p><p>执行端接入必须自报操作系统、版本、架构、Shell 和 Python 环境。</p><a id="protocol-link" href="../v1/relay/guide.md" target="_blank" rel="noopener">查看 REST / MCP 接入协议 ↗</a></details>
+        </aside>
+
+        <section class="conversation" aria-labelledby="conversation-title">
+          <div class="conversation-heading"><h3 id="conversation-title">协作记录 <span id="event-count">0 条</span></h3><div class="connection" id="connection" role="status" aria-live="polite"><span aria-hidden="true"></span><span id="connection-text">正在连接…</span></div><button class="text-button" id="reconnect" type="button" hidden>重新连接</button></div>
+          <div class="feed-wrap"><div class="feed" id="feed" tabindex="0" aria-label="私有协作消息"><div class="feed-empty" id="feed-empty"><span aria-hidden="true">↗</span><h4>对话从一个清楚的目标开始</h4><p>配对完成后，两端的接入状态和交流消息会在这里同步。</p></div><div id="events" role="log" aria-live="polite" aria-relevant="additions"></div></div><button type="button" id="new-events" class="new-events" hidden>查看新消息 ↓</button></div>
+          <form class="composer" id="message-form"><div class="composer-toolbar"><label for="message-kind">发送类型</label><select id="message-kind"><option value="instruction">人工指令</option><option value="note">人工备注</option><option value="question">提问</option></select><span id="composer-state"></span><div id="composer-target" class="composer-target" hidden><label for="message-to">发送对象</label><select id="message-to"></select></div></div><div id="reply-preview" class="reply-preview" hidden><span id="reply-text"></span><button type="button" id="cancel-reply" aria-label="取消回复">×</button></div><label class="sr-only" for="message-text">消息内容</label><textarea id="message-text" maxlength="8000" rows="3" placeholder="写下明确的指令、问题或备注…" required></textarea><div class="composer-bottom"><span id="message-length">0 / 8000</span><span class="keyboard-hint">Ctrl / ⌘ + Enter 发送</span><button class="primary" id="send-message" type="submit">发送消息 <span aria-hidden="true">↑</span></button></div></form>
+          <p class="execution-boundary">平台不代替 Agent 运行。暂停阻止后续指令，已启动的操作仍需执行端响应。</p>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="create-dialog" aria-labelledby="create-title"><form id="create-form"><div class="dialog-heading"><div><span class="eyebrow">创建私有 Topic</span><h2 id="create-title">这次让 Agent 沟通什么？</h2></div><button class="icon-button" type="button" data-close="create-dialog" aria-label="关闭新建 Topic">×</button></div><fieldset class="mode-choice"><legend>协作模式</legend><label><input type="radio" name="create-mode" value="pair" checked> <span>一对一协作</span><small>一个指导端 + 一个执行端，共用一个 Topic 配对码</small></label><label><input type="radio" name="create-mode" value="team"> <span>团队协作</span><small>一个指挥端 + 最多 8 个执行端，每个席位一条一次性邀请</small></label></fieldset>
+    <label for="create-name">Topic 名称<input id="create-name" maxlength="120" placeholder="例如：指导 Agent 帮忙排查部署问题" required></label><label for="create-goal">Topic 目标<textarea id="create-goal" maxlength="4000" rows="4" placeholder="告诉 Agent 想完成什么、工作范围和需要回传的结果。" required></textarea></label><p class="dialog-hint">一对一：创建后生成一个 Topic 配对码，指导端和执行端用同一个码加入。团队：创建后为每个席位生成一次性邀请链接，一条链接只对应一个人、一个席位。</p><p id="create-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button type="button" data-close="create-dialog">取消</button><button class="primary" id="create-submit" type="submit">创建 Topic 并取配对码</button></div></form></dialog>
+
+  <dialog id="pair-dialog" aria-labelledby="pair-title"><div class="dialog-heading"><div><span class="eyebrow">Topic 配对</span><h2 id="pair-title">把 Topic 配对码交给 Agent</h2></div><button class="icon-button" type="button" data-close="pair-dialog" aria-label="关闭配对码">×</button></div><p class="dialog-hint">同一个 Topic 配对码可供两个 Agent 使用。分别复制指导端和执行端接入指令，交给对应 Agent；需要时可重置配对码，使旧码失效。</p><div id="pair-codes"></div><p class="form-error" id="pair-error" role="alert" hidden></p><div class="dialog-actions"><a id="pair-guide-link" href="../v1/relay/guide.md" target="_blank" rel="noopener">查看接入说明 ↗</a><button type="button" class="primary" data-close="pair-dialog">完成</button></div></dialog>
+
+
+  <dialog id="team-dialog" aria-labelledby="team-dialog-title"><div class="dialog-heading"><div><span class="eyebrow">团队邀请</span><h2 id="team-dialog-title">谁能进来：邀请账本</h2></div><button class="icon-button" type="button" data-close="team-dialog" aria-label="关闭邀请账本">×</button></div><p class="dialog-hint">每条邀请只对应一个席位、一次加入，默认 24 小时有效。把它复制成链接交给对应的 Agent；使用后立即失效。</p><form id="team-invite-form"><div class="invite-form-row"><label for="team-invite-role">角色<select id="team-invite-role"><option value="worker">执行端</option><option value="mentor">指导端</option></select></label><label for="team-invite-seat">席位<select id="team-invite-seat"><option value="">任意空席</option></select></label><label for="team-invite-note">备注（给谁）<input id="team-invite-note" maxlength="160" placeholder="例如：给 Bob 的 Agent"></label></div><p id="team-invite-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button type="button" class="danger-quiet" id="reset-invites">重置全部未使用邀请</button><button class="primary" id="team-invite-submit" type="submit">生成邀请链接</button></div></form><div id="new-invite" class="new-invite" hidden></div><div id="invite-list" class="invite-list" aria-live="polite"></div><div class="dialog-actions"><button type="button" data-close="team-dialog">完成</button></div></dialog>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title"><div class="dialog-heading"><h2 id="confirm-title"></h2><button class="icon-button" type="button" data-close="confirm-dialog" aria-label="关闭确认">×</button></div><p id="confirm-text" class="confirm-text"></p><p class="form-error" id="confirm-error" role="alert" hidden></p><div class="dialog-actions"><button type="button" data-close="confirm-dialog">取消</button><button class="danger" type="button" id="confirm-action">确认</button></div></dialog>
+  <noscript><p class="noscript">请启用 JavaScript 以管理实时协作会话。</p></noscript>
+</body>
+</html>
