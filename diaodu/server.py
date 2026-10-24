@@ -125,9 +125,23 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
 
         def do_GET(self):
             parsed = urlparse(self.path)
+            base_path = library.public_base_path if library else ''
             if parsed.path == '/relay':
                 self.send_response(308)
-                self.send_header('Location', (library.public_base_path if library else '') + '/relay/')
+                self.send_header('Location', base_path + '/relay/')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            if parsed.path == '/conversations':
+                self.send_response(308)
+                self.send_header('Location', base_path + '/conversations/')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            bare = re.fullmatch(r'/conversations/(C-[pt][0-9a-f]{8})', parsed.path)
+            if bare:
+                self.send_response(308)
+                self.send_header('Location', base_path + parsed.path + '/')
                 self.send_header('Content-Length', '0')
                 self.end_headers()
                 return
@@ -151,9 +165,15 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 '/relay/relay.css': 'relay.css',
                 '/relay.css': 'relay.css',
                 '/relay-watch.js': 'relay-watch.js',
+                '/conversations/': 'conversations.html',
+                '/conversations/conversations.js': 'conversations.js',
+                '/conversations/conversations.css': 'conversations.css',
             }
             if parsed.path in static_files:
                 self._file(STATIC / static_files[parsed.path])
+                return
+            if re.fullmatch(r'/conversations/C-[pt][0-9a-f]{8}/', parsed.path):
+                self._file(STATIC / 'conversation.html')
                 return
             if library is not None and parsed.path.startswith('/relay/join/'):
                 from diaodu import relay_http

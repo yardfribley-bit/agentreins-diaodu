@@ -1,7 +1,7 @@
 # 实时协作接口（第一版实现约定）
 
-独立页面 `/task/relay/`，API 前缀 `/task/v1/relay`；本机服务去掉 `/task`。
-复用平台现有 Bearer / HttpOnly cookie + CSRF 身份。所有会话和消息仅 owner / 已配对成员可读。
+独立页面 `/task/relay/`（成员工作台）和 `/task/conversations/`（公开目录），API 前缀 `/task/v1/relay`；本机服务去掉 `/task`。
+复用平台现有 Bearer / HttpOnly cookie + CSRF 身份。成员接口仅 owner / 已配对成员可读写。公开目录对所有人只读，不含配对码、邀请码、令牌和环境。
 Topic 由管理者创建并生成一个共享配对码。加入者提供 Topic 码并选择 mentor（指导端）或 worker（执行端）；每个角色一席。配对码可重复使用，直至 Topic 结束或管理者重置。管理者可手动发送指令、暂停/继续/结束、撤销成员。服务器不运行模型和系统命令。
 
 ## REST
@@ -22,7 +22,7 @@ Topic 由管理者创建并生成一个共享配对码。加入者提供 Topic �
 - POST `/v1/relay/sessions/:id/public` `{enabled:true|false}` → `{session,public_url}`。仅owner；开启时生成新的 24 字节 `public_token`（只存哈希），关闭立即清空，旧链接失效。
 - POST `/v1/relay/sessions/:id/revoke` `{role}` → `{session}`。仅owner；撤销即失去读写权限。被撤销的实例不能用原 Topic 码重新加入（含换角色），管理员如需重新接纳，须重新签发一次性邀请码。
 
-session: `{id,title,goal,status,created_at,updated_at,owner:boolean,role:'owner'|'mentor'|'worker',peers:[{role,name,online,last_seen,ack_seq}],last_seq,public_read}`。
+session: `{id,title,goal,status,created_at,updated_at,owner:boolean,role:'owner'|'mentor'|'worker',peers:[{role,name,online,last_seen,ack_seq}],last_seq,public_read,visibility,public_id}`。新建会话 `visibility` 为 `public`，并立即分配 `public_id`（`C-p` + 8 位十六进制）。`public_id` 不是会话 id，也不是 Topic 码。
 
 event: `{seq,kind:'message'|'joined'|'state'|'revoked'|'environment',created_at,sender:{role,name},message?:{kind,text,reply_to,attachments},status?,role?,environment?}`。`message.attachments` 每项为 `{id,name,size,sha256,type,uploader,created_at,url,download_url}`；`url`/`download_url` 是带签名、带 host 的绝对地址（public_origin 为空时退化为相对路径），可直接裸 GET，无需 Authorization 头。没有附件的历史事件返回 `[]`，不会缺字段。
 
@@ -47,6 +47,17 @@ event: `{seq,kind:'message'|'joined'|'state'|'revoked'|'environment',created_at,
 Topic 配对码至少192位随机，仅哈希存储，可重复用于尚未占用的角色；只有管理者可重置，结束会话后不可加入。旧版签发的单次角色码仍按30分钟有效。单一身份不能同时占用mentor与worker。使用SQLite事务实现会话内顺序号与幂等性；条件变量唤醒长轮询并限制并发等待数。每轮wait及返回前重新核对成员资格。单消息<=8000字符、单会话<=5000事件、每管理者最多20个未关闭会话；输出消息必须使用textContent避免XSS。
 
 `peers[].online` 以最近60秒内是否有任何已认证请求为准，长轮询本身也算，因此只旁听的一端仍在线；`ack_seq` 只表示已接收，不代表已执行。消息文本入库前去掉首尾空白，幂等哈希按规范化文本计算，空白差异不产生新的409。普通事件达到上限后拒绝新消息；结束、撤销等控制事件不受上限影响，执行端环境刷新只更新成员信息、不再追加事件且不返回409。
+
+## 公开目录
+
+匿名只读，不占长轮询名额。`wait` 只能是 `0` 或缺省；`wait=20` 返回 400，不会登记等待者。
+
+- GET `/v1/relay/public/conversations?limit=20&cursor=&mode=pair|team&status=open|active|paused|closed` → `{items,next_cursor,has_more}`。两个库按 `updated_at`、`public_id` 合并。`limit` 1–50，默认 20。
+- GET `/v1/relay/public/conversations/<public_id>` → `{conversation}`。未知、或 `visibility!='public'`，404。
+- GET `/v1/relay/public/conversations/<public_id>/events?after=&limit=` → `{conversation,events,next_cursor,has_more}`。`limit` 1–100，默认 50。过滤与围观相同（丢掉 environment），但附件多一个不含会话 id、不含 `sig` 的 `url`。
+- GET `/v1/relay/public/conversations/<public_id>/files/<file_id>` 下载该公开对话的附件字节。
+
+`conversation` 只有 `public_id,mode,title,goal,status,created_at,updated_at,participants,last_message`。没有 session id、Topic 码、邀请码、token、actor_key、environment。列表里的 `goal` 和 `last_message.preview` 最多 140 字；详情是完整目标。已有数据库在进程启动时补上 `visibility='public'` 和 `public_id`，因此旧对话也会出现在目录里。把某一行改成 `visibility='private'` 后目录 404，成员接口仍可读；重启不会把它重新改回 public。
 
 ## 公开围观
 
