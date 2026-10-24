@@ -20,7 +20,10 @@ from pathlib import Path
 
 from diaodu import relay_files
 from diaodu.identity import AuthError
-from diaodu.relay import Relay, _actor, _body, _environment, _iso, _name, _text
+from diaodu.relay import (
+    FILE_ID_RE, PUBLIC_ID_RE, Relay, _actor, _body, _environment, _iso, _message_preview,
+    _mint_public_id, _name, _preview, _text, directory_rows, ensure_directory_columns,
+)
 
 
 class RelayTeams:
@@ -62,7 +65,8 @@ class RelayTeams:
                   status TEXT NOT NULL, owner_key TEXT NOT NULL,
                   created REAL NOT NULL, updated REAL NOT NULL,
                   last_seq INTEGER NOT NULL DEFAULT 0,
-                  public_read INTEGER NOT NULL DEFAULT 0, public_token_hash TEXT);
+                  public_read INTEGER NOT NULL DEFAULT 0, public_token_hash TEXT,
+                  visibility TEXT NOT NULL DEFAULT 'public', public_id TEXT);
                 CREATE INDEX IF NOT EXISTS team_sessions_owner ON team_sessions(owner_key,status);
                 CREATE TABLE IF NOT EXISTS team_members (
                   session_id TEXT NOT NULL, role TEXT NOT NULL, seat INTEGER NOT NULL,
@@ -101,6 +105,7 @@ class RelayTeams:
                            "INTEGER NOT NULL DEFAULT 0")
             if "public_token_hash" not in columns:
                 db.execute("ALTER TABLE team_sessions ADD COLUMN public_token_hash TEXT")
+            ensure_directory_columns(db, "team_sessions")
 
     # -- plumbing -------------------------------------------------------
 
@@ -185,6 +190,8 @@ class RelayTeams:
                 "owner": member["role"] == "owner", "owner_name": owner["name"],
                 "role": member["role"], "seat": member["seat"],
                 "public_read": bool(session["public_read"]),
+                "visibility": session["visibility"] or "public",
+                "public_id": session["public_id"],
                 "max_workers": self.max_workers,
                 "mentor": self._peer(mentor) if mentor else None,
                 "workers": [self._peer(row, member["role"] != "worker"
@@ -230,10 +237,11 @@ class RelayTeams:
         now = time.time()
         sid = "tm_" + secrets.token_hex(16)
         with self._write() as db:
+            public_id = _mint_public_id(db, "team_sessions")
             db.execute("INSERT INTO team_sessions "
-                       "(id,title,goal,status,owner_key,created,updated,last_seq) "
-                       "VALUES (?,?,?,?,?,?,?,?)",
-                       (sid, title, goal, "active", key, now, now, 0))
+                       "(id,title,goal,status,owner_key,created,updated,last_seq,visibility,public_id) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (sid, title, goal, "active", key, now, now, 0, "public", public_id))
             db.execute("INSERT INTO team_members VALUES (?,?,?,?,?,?,?,?)",
                        (sid, "owner", 0, key, _name(actor), now, 0, None))
             return {"session": self._session(db, db.execute(
@@ -432,6 +440,105 @@ class RelayTeams:
                            "updated=? WHERE id=?", (now, sid))
             view = self._view(db, actor, sid)
             return {"session": view, "public_url": url}
+
+    # -- public directory (anonymous, no long-poll) ---------------------
+
+    PUBLIC_MARK = "t"
+
+    def _directory_item(self, db, session, summary=True):
+        rows = db.execute("SELECT role,seat,name FROM team_members WHERE session_id=?",
+                          (session["id"],)).fetchall()
+        order = {"owner": 0, "mentor": 1, "worker": 2}
+        participants = []
+        for row in sorted(rows, key=lambda item: (order.get(item["role"], 9), item["seat"])):
+            participants.append({"role": row["role"], "seat": row["seat"], "name": row["name"]})
+        goal = session["goal"]
+        return {"public_id": session["public_id"], "mode": "team", "title": session["title"],
+                "goal": _preview(goal) if summary else goal, "status": session["status"],
+                "created_at": _iso(session["created"]), "updated_at": _iso(session["updated"]),
+                "participants": participants,
+                "last_message": _message_preview(db, session["id"], "team_events")}
+
+    def directory_candidates(self, limit, cursor_updated=None, cursor_public_id=None, status=None):
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 51:
+            raise ValueError("limit须为1至50")
+        with self._read() as db:
+            rows = directory_rows(db, "team_sessions", limit, cursor_updated, cursor_public_id, status)
+            return [(row["updated"], row["public_id"], self._directory_item(db, row, summary=True))
+                    for row in rows]
+
+    def directory_conversation(self, public_id):
+        if not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None:
+            return None
+        if public_id[2] != self.PUBLIC_MARK:
+            return None
+        with self._read() as db:
+            session = db.execute(
+                "SELECT * FROM team_sessions WHERE public_id=? AND visibility='public'",
+                (public_id,)).fetchone()
+            if session is None:
+                return None
+            return self._directory_item(db, session, summary=False)
+
+    def _directory_event(self, db, row, public_id):
+        if row["kind"] == "environment":
+            return None
+        event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
+                 "sender": {"role": row["sender_role"], "seat": row["sender_seat"],
+                            "name": row["sender_name"]}}
+        event.update(Relay._public_payload(row["kind"], json.loads(row["payload"]),
+                                           db, row["session_id"], "team_files",
+                                           public_id=public_id, file_base=self._base_url()))
+        return event
+
+    def directory_events(self, public_id, after, limit):
+        if (not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None
+                or public_id[2] != self.PUBLIC_MARK):
+            return None
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ValueError("after须为非负整数")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit须为1至100")
+        with self._read() as db:
+            session = db.execute(
+                "SELECT * FROM team_sessions WHERE public_id=? AND visibility='public'",
+                (public_id,)).fetchone()
+            if session is None:
+                return None
+            if after > session["last_seq"]:
+                raise ValueError("消息游标超过当前会话进度")
+            rows = db.execute("SELECT * FROM team_events WHERE session_id=? AND seq>? "
+                              "ORDER BY seq LIMIT ?",
+                              (session["id"], after, limit + 1)).fetchall()
+            scanned = rows[:limit]
+            events = [event for event in (self._directory_event(db, row, public_id) for row in scanned)
+                      if event is not None]
+            return {"conversation": self._directory_item(db, session, summary=False),
+                    "events": events,
+                    "next_cursor": scanned[-1]["seq"] if scanned else after,
+                    "has_more": len(rows) > limit}
+
+    def locate_public_file(self, public_id, file_id):
+        if (not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None
+                or public_id[2] != self.PUBLIC_MARK or not isinstance(file_id, str)
+                or FILE_ID_RE.fullmatch(file_id) is None):
+            raise AuthError("没有这个公开附件", 404)
+        with self._read() as db:
+            session = db.execute(
+                "SELECT id FROM team_sessions WHERE public_id=? AND visibility='public'",
+                (public_id,)).fetchone()
+            if session is None:
+                raise AuthError("没有这个公开附件", 404)
+            row = db.execute("SELECT name,size,type FROM team_files WHERE id=? AND session_id=?",
+                             (file_id, session["id"])).fetchone()
+            if row is None:
+                raise AuthError("没有这个公开附件", 404)
+            meta = {"name": row["name"], "size": row["size"], "type": row["type"],
+                    "inline": row["type"].startswith(("image/", "video/")) or row["type"] == "text/plain"}
+        path = self.files_dir / file_id
+        if not path.is_file():
+            raise AuthError("附件已不存在", 404)
+        return meta, path
 
     # -- events ---------------------------------------------------------
 

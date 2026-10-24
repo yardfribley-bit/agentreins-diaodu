@@ -332,6 +332,10 @@
     $('owner-actions').hidden = !owner(); $('management').hidden = !owner() || isTeam();
     $('manage-invites').hidden = !owner() || !isTeam(); $('manage-invites').disabled = mutationBusy || current.status === 'closed';
     $('rotate-topic-code').hidden = !!isTeam();
+    const directory = $('directory-link');
+    const listed = current.public_id && current.visibility !== 'private' && /^C-[pt][0-9a-f]{8}$/.test(current.public_id);
+    directory.hidden = !listed;
+    if (listed) directory.href = '../conversations/' + current.public_id + '/';
     $('toggle-public').textContent = current.public_read ? '关闭公开围观' : '开启公开围观';
     $('toggle-public').disabled = mutationBusy;
     $('public-panel').hidden = !current.public_read;

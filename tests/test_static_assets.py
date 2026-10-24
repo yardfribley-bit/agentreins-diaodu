@@ -47,7 +47,8 @@ class StaticAssets(unittest.TestCase):
                 return error.code, error.headers.get("Content-Type", ""), error.read()
 
     def test_every_css_and_js_reference_returns_200(self):
-        pages = ("/", "/relay/", "/relay/watch/sample-token")
+        pages = ("/", "/relay/", "/relay/watch/sample-token",
+                 "/conversations/", "/conversations/C-p00000000/")
         for path in pages:
             page_url = self.base + path
             status, content_type, body = self.fetch(page_url)
@@ -80,12 +81,14 @@ class StaticAssets(unittest.TestCase):
         self.assertIn(b"--primary", body)
 
     def test_shipped_pages_use_the_hub_name(self):
-        for path in ("/", "/relay/", "/relay/watch/sample-token"):
+        for path in ("/", "/relay/", "/relay/watch/sample-token",
+                     "/conversations/", "/conversations/C-p00000000/"):
             status, _, body = self.fetch(self.base + path)
             self.assertEqual(status, 200, path)
             page = body.decode()
             self.assertNotIn("出海剑", page, path)
             self.assertIn("AgentReins Hub", page, path)
+            self.assertIn("对话", page, path)
         _, _, script = self.fetch(self.base + "/relay/relay.js")
         source = script.decode()
         self.assertIn("instruction:'指令'", source)

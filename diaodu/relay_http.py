@@ -8,14 +8,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from diaodu.identity import AuthError
+from diaodu.relay import unpack_directory_cursor, pack_directory_cursor
 
 # Public share links are rate limited per source IP. 24-byte codes are not enumerable,
 # but this keeps a cheap ceiling on scanning and accidental loops.
 RATE_LIMIT = 60
 PUBLIC_RATE_LIMIT = 30
+DIRECTORY_RATE_LIMIT = 120
 RATE_WINDOW = 60.0
 _HITS = {}
 _PUBLIC_HITS = {}
+_DIRECTORY_HITS = {}
 _HITS_LOCK = threading.Lock()
 
 
@@ -46,6 +49,117 @@ def _rate_limit(handler):
 
 def _public_rate_limit(handler):
     _limit(handler, _PUBLIC_HITS, PUBLIC_RATE_LIMIT)
+
+
+def _directory_rate_limit(handler):
+    _limit(handler, _DIRECTORY_HITS, DIRECTORY_RATE_LIMIT)
+
+
+def _uint(value, label, upper):
+    if not isinstance(value, str) or not value.isdigit() or len(value) > 12:
+        raise ValueError(label + "不合法")
+    number = int(value)
+    if number > upper:
+        raise ValueError(label + "不合法")
+    return number
+
+
+def _one_query(query, allowed):
+    if set(query) - set(allowed) or any(len(values) != 1 for values in query.values()):
+        raise ValueError("查询参数不合法")
+
+
+def _directory_stores(library, mode):
+    stores = []
+    if mode != "team":
+        stores.append(library.relay)
+    teams = getattr(library, "teams", None)
+    if mode != "pair" and teams is not None:
+        stores.append(teams)
+    return stores
+
+
+def _public_conversations(handler, library, parsed):
+    """Anonymous directory. Never long-polls, so it cannot take a member wait slot."""
+    _directory_rate_limit(handler)
+    parts = parsed.path.strip("/").split("/")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if len(parts) == 4:
+        _one_query(query, {"limit", "cursor", "mode", "status"})
+        limit = 20
+        if "limit" in query:
+            limit = _uint(query["limit"][0], "limit", 50)
+            if limit < 1:
+                raise ValueError("limit须为1至50")
+        status = query.get("status", [""])[0] or None
+        if status is not None and status not in ("open", "active", "paused", "closed"):
+            raise ValueError("status不合法")
+        mode = query.get("mode", [""])[0] or None
+        if mode is not None and mode not in ("pair", "team"):
+            raise ValueError("mode不合法")
+        cursor_updated = cursor_public_id = None
+        if query.get("cursor", [""])[0]:
+            cursor_updated, cursor_public_id = unpack_directory_cursor(query["cursor"][0])
+        rows = []
+        for store in _directory_stores(library, mode):
+            rows.extend(store.directory_candidates(limit + 1, cursor_updated, cursor_public_id, status))
+        rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        page = rows[:limit]
+        has_more = len(rows) > limit
+        handler._json(200, {
+            "items": [item[2] for item in page],
+            "next_cursor": pack_directory_cursor(page[-1][0], page[-1][1]) if has_more else None,
+            "has_more": has_more,
+        })
+        return
+    if len(parts) == 5:
+        _one_query(query, set())
+        found = library.relay.directory_conversation(parts[4])
+        teams = getattr(library, "teams", None)
+        if found is None and teams is not None:
+            found = teams.directory_conversation(parts[4])
+        if found is None:
+            raise AuthError("没有这个公开对话", 404)
+        handler._json(200, {"conversation": found})
+        return
+    if len(parts) == 6 and parts[5] == "events":
+        _one_query(query, {"after", "limit", "wait"})
+        if "wait" in query and query["wait"][0] != "0":
+            raise ValueError("公开目录不支持长轮询，请使用 wait=0")
+        after = _uint(query.get("after", ["0"])[0], "after", 10 ** 12)
+        limit = 50
+        if "limit" in query:
+            limit = _uint(query["limit"][0], "limit", 100)
+            if limit < 1:
+                raise ValueError("limit须为1至100")
+        result = library.relay.directory_events(parts[4], after, limit)
+        teams = getattr(library, "teams", None)
+        if result is None and teams is not None:
+            result = teams.directory_events(parts[4], after, limit)
+        if result is None:
+            raise AuthError("没有这个公开对话", 404)
+        handler._json(200, result)
+        return
+    if len(parts) == 7 and parts[5] == "files":
+        _one_query(query, set())
+        public_id, file_id = parts[4], parts[6]
+        item = path = None
+        error = None
+        for store in (library.relay, getattr(library, "teams", None)):
+            if store is None:
+                continue
+            try:
+                item, path = store.locate_public_file(public_id, file_id)
+                break
+            except AuthError as found:
+                if found.status != 404:
+                    raise
+                error = found
+        if item is None:
+            raise error or AuthError("没有这个公开附件", 404)
+        handler._stream_file(item, path, content_type=item.get("type"), inline=item.get("inline", False))
+        return
+    handler._json(404, {"error": "没有这个公开对话"})
 
 
 def _base_url(handler, library):
@@ -323,6 +437,9 @@ def get(handler, library, parsed):
     if len(parts) == 4 and parts[:3] == ['v1', 'relay', 'topics']:
         _rate_limit(handler)
         handler._json(200, _topic_info(handler, library, parts[3]))
+        return
+    if parts[:4] == ['v1', 'relay', 'public', 'conversations']:
+        _public_conversations(handler, library, parsed)
         return
     if len(parts) == 5 and parts[:3] == ['v1', 'relay', 'public'] and parts[4] == 'events':
         _public_rate_limit(handler)

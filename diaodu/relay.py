@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import base64
+import binascii
 import hashlib
 import hmac
 import io
@@ -10,8 +12,10 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
+import struct
 import threading
 import time
 
@@ -74,6 +78,110 @@ def _environment(value):
 _safe_name = relay_files.safe_name
 _content_type = relay_files.content_type
 
+# Public directory ids are short and unguessable enough to live in a URL, and the
+# store mark (p/t) keeps the two SQLite files from ever issuing the same id.
+PUBLIC_ID_RE = re.compile(r"^C-[pt][0-9a-f]{8}$")
+FILE_ID_RE = re.compile(r"^fl_[0-9a-f]{24}$")
+PREVIEW_LIMIT = 140
+_DIRECTORY_MARK = {"sessions": "p", "team_sessions": "t"}
+_MESSAGE_KINDS = ("instruction", "progress", "result", "question", "note")
+
+
+def _preview(value, limit=PREVIEW_LIMIT):
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1] + "…"
+
+
+def pack_directory_cursor(updated, public_id):
+    raw = struct.pack(">d", float(updated)) + str(public_id).encode("ascii")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def unpack_directory_cursor(value):
+    if not isinstance(value, str) or not value or len(value) > 80:
+        raise ValueError("cursor不合法")
+    try:
+        padded = value + ("=" * (-len(value) % 4))
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        if len(raw) < 9:
+            raise ValueError("cursor不合法")
+        updated = struct.unpack(">d", raw[:8])[0]
+        public_id = raw[8:].decode("ascii")
+    except (ValueError, struct.error, UnicodeDecodeError, binascii.Error):
+        raise ValueError("cursor不合法")
+    if not math.isfinite(updated) or PUBLIC_ID_RE.fullmatch(public_id) is None:
+        raise ValueError("cursor不合法")
+    return updated, public_id
+
+
+def _mint_public_id(db, table):
+    mark = _DIRECTORY_MARK[table]
+    for _ in range(8):
+        public_id = "C-" + mark + secrets.token_hex(4)
+        if db.execute(f"SELECT 1 FROM {table} WHERE public_id=?", (public_id,)).fetchone() is None:
+            return public_id
+    raise AuthError("暂时无法分配公开编号", 503)
+
+
+def ensure_directory_columns(db, table):
+    """Add visibility + public_id, and list every existing row in the directory."""
+    if table not in _DIRECTORY_MARK:
+        raise RuntimeError("unknown relay table")
+    columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if "visibility" not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'")
+    if "public_id" not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN public_id TEXT")
+    pending = db.execute(f"SELECT id FROM {table} WHERE public_id IS NULL").fetchall()
+    for row in pending:
+        public_id = _mint_public_id(db, table)
+        db.execute(
+            f"UPDATE {table} SET visibility='public', public_id=? WHERE id=? AND public_id IS NULL",
+            (public_id, row["id"]))
+    db.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_public_id ON {table}(public_id)")
+    db.execute(f"CREATE INDEX IF NOT EXISTS {table}_directory ON {table}(visibility, updated, public_id)")
+
+
+def directory_rows(db, table, limit, cursor_updated, cursor_public_id, status):
+    if table not in _DIRECTORY_MARK:
+        raise RuntimeError("unknown relay table")
+    clauses = ["visibility='public'", "public_id IS NOT NULL"]
+    params = []
+    if status == "open":
+        clauses.append("status!='closed'")
+    elif status in ("active", "paused", "closed"):
+        clauses.append("status=?")
+        params.append(status)
+    elif status is not None:
+        raise ValueError("status不合法")
+    if cursor_updated is not None:
+        clauses.append("(updated < ? OR (updated = ? AND public_id < ?))")
+        params.extend([cursor_updated, cursor_updated, cursor_public_id])
+    params.append(limit)
+    return db.execute(
+        f"SELECT * FROM {table} WHERE " + " AND ".join(clauses)
+        + " ORDER BY updated DESC, public_id DESC LIMIT ?",
+        params).fetchall()
+
+
+def _message_preview(db, session_id, table):
+    if table not in ("events", "team_events"):
+        raise RuntimeError("unknown event table")
+    row = db.execute(
+        f"SELECT created, payload FROM {table} WHERE session_id=? AND kind='message' "
+        "ORDER BY seq DESC LIMIT 1",
+        (session_id,)).fetchone()
+    if row is None:
+        return None
+    message = json.loads(row["payload"]).get("message") or {}
+    kind = message.get("kind") if message.get("kind") in _MESSAGE_KINDS else None
+    text = message.get("text") if isinstance(message.get("text"), str) else ""
+    return {"kind": kind, "created_at": _iso(row["created"]), "preview": _preview(text)}
+
 
 class Relay:
     MAX_EVENTS = 5000
@@ -113,7 +221,8 @@ class Relay:
                   status TEXT NOT NULL, owner_key TEXT NOT NULL,
                   created REAL NOT NULL, updated REAL NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0,
                   topic_code_hash TEXT, public_read INTEGER NOT NULL DEFAULT 0,
-                  public_token_hash TEXT);
+                  public_token_hash TEXT,
+                  visibility TEXT NOT NULL DEFAULT 'public', public_id TEXT);
                 CREATE INDEX IF NOT EXISTS sessions_owner ON sessions(owner_key,status);
                 CREATE TABLE IF NOT EXISTS members (
                   session_id TEXT NOT NULL, role TEXT NOT NULL, actor_key TEXT NOT NULL,
@@ -145,6 +254,7 @@ class Relay:
                 db.execute("ALTER TABLE sessions ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0")
             if "public_token_hash" not in columns:
                 db.execute("ALTER TABLE sessions ADD COLUMN public_token_hash TEXT")
+            ensure_directory_columns(db, "sessions")
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -222,7 +332,9 @@ class Relay:
                 "status": session["status"], "created_at": _iso(session["created"]),
                 "updated_at": _iso(session["updated"]), "owner": member["role"] == "owner",
                 "role": member["role"], "peers": peers, "last_seq": session["last_seq"],
-                "public_read": bool(session["public_read"])}
+                "public_read": bool(session["public_read"]),
+                "visibility": session["visibility"] or "public",
+                "public_id": session["public_id"]}
 
     def _view(self, db, actor, sid):
         session, member = self._access(db, actor, sid)
@@ -278,8 +390,13 @@ class Relay:
                 "worker": {"role": "worker", "name": members["worker"]} if "worker" in members else None}
 
     @staticmethod
-    def _public_payload(kind, payload, db=None, session_id=None, files_table="files"):
-        """Whitelist public fields; environment and credentials never leave the server."""
+    def _public_payload(kind, payload, db=None, session_id=None, files_table="files", *,
+                        public_id=None, file_base=""):
+        """Whitelist public fields; environment and credentials never leave the server.
+
+        Watch-token responses omit download URLs. The directory passes public_id so a
+        public conversation can link to its own attachment bytes without the session id.
+        """
         if files_table not in ("files", "team_files"):
             files_table = "files"
         if kind == "message":
@@ -294,8 +411,12 @@ class Relay:
                                      "WHERE id=? AND session_id=?",
                                      (item, session_id)).fetchone()
                     if row is not None:
-                        attachments.append({"name": row["name"], "size": row["size"],
-                                            "type": row["type"]})
+                        attachment = {"name": row["name"], "size": row["size"],
+                                      "type": row["type"]}
+                        if public_id and FILE_ID_RE.fullmatch(item):
+                            attachment["url"] = (f"{file_base}/v1/relay/public/conversations/"
+                                                 f"{public_id}/files/{item}")
+                        attachments.append(attachment)
             public = {"kind": message.get("kind"), "text": message.get("text"),
                       "reply_to": message.get("reply_to")}
             if message.get("to") is not None:
@@ -399,6 +520,99 @@ class Relay:
             view = self._session(db, db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone(), member)
             return {"session": view, "public_url": url}
 
+    # -- public directory (anonymous, no long-poll) ---------------------
+
+    PUBLIC_MARK = "p"
+
+    def _directory_item(self, db, session, summary=True):
+        participants = []
+        for role in ("owner", "mentor", "worker"):
+            row = db.execute("SELECT name FROM members WHERE session_id=? AND role=?",
+                             (session["id"], role)).fetchone()
+            if row is not None:
+                participants.append({"role": role, "name": row["name"]})
+        goal = session["goal"]
+        return {"public_id": session["public_id"], "mode": "pair", "title": session["title"],
+                "goal": _preview(goal) if summary else goal, "status": session["status"],
+                "created_at": _iso(session["created"]), "updated_at": _iso(session["updated"]),
+                "participants": participants,
+                "last_message": _message_preview(db, session["id"], "events")}
+
+    def directory_candidates(self, limit, cursor_updated=None, cursor_public_id=None, status=None):
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 51:
+            raise ValueError("limit须为1至50")
+        with self._read() as db:
+            rows = directory_rows(db, "sessions", limit, cursor_updated, cursor_public_id, status)
+            return [(row["updated"], row["public_id"], self._directory_item(db, row, summary=True))
+                    for row in rows]
+
+    def directory_conversation(self, public_id):
+        if not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None:
+            return None
+        if public_id[2] != self.PUBLIC_MARK:
+            return None
+        with self._read() as db:
+            session = db.execute("SELECT * FROM sessions WHERE public_id=? AND visibility='public'",
+                                 (public_id,)).fetchone()
+            if session is None:
+                return None
+            return self._directory_item(db, session, summary=False)
+
+    def _directory_event(self, db, row, public_id):
+        if row["kind"] == "environment":
+            return None
+        event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
+                 "sender": {"role": row["sender_role"], "name": row["sender_name"]}}
+        event.update(self._public_payload(row["kind"], json.loads(row["payload"]),
+                                          db, row["session_id"], "files",
+                                          public_id=public_id, file_base=self._public_base()))
+        return event
+
+    def directory_events(self, public_id, after, limit):
+        if not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None or public_id[2] != self.PUBLIC_MARK:
+            return None
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ValueError("after须为非负整数")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit须为1至100")
+        with self._read() as db:
+            session = db.execute("SELECT * FROM sessions WHERE public_id=? AND visibility='public'",
+                                 (public_id,)).fetchone()
+            if session is None:
+                return None
+            if after > session["last_seq"]:
+                raise ValueError("消息游标超过当前会话进度")
+            rows = db.execute("SELECT * FROM events WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
+                              (session["id"], after, limit + 1)).fetchall()
+            scanned = rows[:limit]
+            events = [event for event in (self._directory_event(db, row, public_id) for row in scanned)
+                      if event is not None]
+            return {"conversation": self._directory_item(db, session, summary=False),
+                    "events": events,
+                    "next_cursor": scanned[-1]["seq"] if scanned else after,
+                    "has_more": len(rows) > limit}
+
+    def locate_public_file(self, public_id, file_id):
+        if (not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None
+                or public_id[2] != self.PUBLIC_MARK or not isinstance(file_id, str)
+                or FILE_ID_RE.fullmatch(file_id) is None):
+            raise AuthError("没有这个公开附件", 404)
+        with self._read() as db:
+            session = db.execute("SELECT id FROM sessions WHERE public_id=? AND visibility='public'",
+                                 (public_id,)).fetchone()
+            if session is None:
+                raise AuthError("没有这个公开附件", 404)
+            row = db.execute("SELECT name,size,type FROM files WHERE id=? AND session_id=?",
+                             (file_id, session["id"])).fetchone()
+            if row is None:
+                raise AuthError("没有这个公开附件", 404)
+            meta = {"name": row["name"], "size": row["size"], "type": row["type"],
+                    "inline": row["type"].startswith(("image/", "video/")) or row["type"] == "text/plain"}
+        path = self.files_dir / file_id
+        if not path.is_file():
+            raise AuthError("附件已不存在", 404)
+        return meta, path
+
     def _event(self, db, row):
         result = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
                   "sender": {"role": row["sender_role"], "name": row["sender_name"]}}
@@ -463,9 +677,11 @@ class Relay:
             count = db.execute("SELECT COUNT(*) FROM sessions WHERE owner_key=? AND status!='closed'", (key,)).fetchone()[0]
             if count >= self.MAX_OPEN_SESSIONS:
                 raise AuthError("每个管理者最多20个未关闭会话", 429)
-            db.execute("INSERT INTO sessions (id,title,goal,status,owner_key,created,updated,last_seq,topic_code_hash) VALUES (?,?,?,?,?,?,?,?,?)",
+            public_id = _mint_public_id(db, "sessions")
+            db.execute("INSERT INTO sessions (id,title,goal,status,owner_key,created,updated,last_seq,"
+                       "topic_code_hash,visibility,public_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (sid, title, goal, "active", key, now, now, 0,
-                        hashlib.sha256(topic_code.encode()).hexdigest()))
+                        hashlib.sha256(topic_code.encode()).hexdigest(), "public", public_id))
             db.execute("INSERT INTO members VALUES (?,?,?,?,?,?,?)", (sid, "owner", key, _name(actor), now, 0, None))
             return {"session": self._view(db, actor, sid), "topic_code": topic_code}
 
