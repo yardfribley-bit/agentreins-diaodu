@@ -1,0 +1,24 @@
+[Unit]
+Description=AgentReins Linux worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__HOME__
+EnvironmentFile=__ENV__
+Environment=PYTHONPATH=/opt/linux-worker
+ExecStart=/usr/bin/python3 -m linux_worker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__HOME__
+PrivateTmp=true
+MemoryMax=384M
+
+[Install]
+WantedBy=multi-user.target
