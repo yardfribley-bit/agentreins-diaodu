@@ -12,7 +12,13 @@
 
 服务文件兼容读取 /etc/diaodu.env；文件 root 所有、0600，可留空。DIAODU_INVITE_CODE 只影响旧账号注册接口，不影响当前接入流程。
 
-在已有 www.chuhaijian.com HTTPS server 中 include nginx-task.conf，修改前备份；nginx -t 通过后 reload。/task 自动跳转 /task/，代理剥离前缀转发，附件 URL 保留 /task；旧 /task/api/ 接口不对外开放。
+在已有 www.chuhaijian.com HTTPS server 中 include nginx-task.conf，修改前备份；nginx -t 通过后 reload。/task 自动跳转 /task/，代理剥离前缀转发，附件 URL 保留 /task；旧 /task/api/ 接口不对外开放。relay 附件单文件上限 100MB，因此 `client_max_body_size` 已调到 110m；升级这版配置后必须执行 `nginx -t` 并 `systemctl reload nginx`，否则 100MB 附近的上传会在 Nginx 层被拦成 HTML 413。
+
+生产机上实际 include 的文件是 `/etc/nginx/snippets/diaodu-task-local.conf`；修改 `deploy/nginx-task.conf` 后必须同步到该文件再 `nginx -t` + reload，避免仓库与线上配置漂移。
+
+relay 私有附件保存在 data/library/relay-files/（SQLite 记录在 data/library/relay.sqlite3），随 data/library 一起备份；不要单独公开该目录。
+
+附件签名链接（`?exp=&sig=`）会出现在 URL query 中。应用本身不记录请求行，但 Nginx 默认 access log 会记录完整 URI；若不希望签名落盘，可在该 location 配置只记录 `$uri` 的 log_format 或关闭访问日志。签名密钥在 data/library/relay-files.key，备份 data/library 时必须包含它，否则旧链接会失效。
 
 ## 验证与备份
 

@@ -8,6 +8,8 @@ import re
 import os
 import hmac
 import secrets
+import sys
+import traceback
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +18,7 @@ from urllib.parse import parse_qs, urlparse, quote
 from diaodu.control import PHASE_LABELS, ControlError, actions
 from diaodu.library import LibraryError
 from diaodu import chat, agent_api
+from diaodu.http_util import discard_body
 from diaodu.identity import AuthError, Identity, text, digest
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
@@ -72,6 +75,15 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
     if library is not None and identity is None:
         identity = Identity(library.root / "identity.sqlite3")
     if library is not None:
+        from diaodu.relay import Relay
+        library.relay = Relay(library.root, library.public_base_path, public_origin)
+        from diaodu.relay_teams import RelayTeams
+        try:
+            max_workers = int(os.environ.get("DIAODU_RELAY_MAX_WORKERS", "8"))
+        except ValueError:
+            max_workers = 8
+        library.teams = RelayTeams(library.root, max_workers,
+                                   library.public_base_path, public_origin)
         from diaodu.mailbox import Mailbox
         mailbox = mailbox or Mailbox(library.root)
         library.mailbox = mailbox
@@ -113,6 +125,31 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
 
         def do_GET(self):
             parsed = urlparse(self.path)
+            if parsed.path == '/relay':
+                self.send_response(308)
+                self.send_header('Location', (library.public_base_path if library else '') + '/relay/')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            if parsed.path.startswith('/relay/watch/'):
+                self._file(STATIC / 'relay-watch.html')
+                return
+            if parsed.path == '/relay-watch.js':
+                self._file(STATIC / 'relay-watch.js')
+                return
+            relay_static = {'/relay/': 'relay.html', '/relay/relay.js': 'relay.js', '/relay/relay.css': 'relay.css'}
+            if parsed.path in relay_static:
+                self._file(STATIC / relay_static[parsed.path])
+                return
+            if library is not None and parsed.path.startswith('/relay/join/'):
+                from diaodu import relay_http
+                try:
+                    relay_http.join_document(self, library, parsed)
+                except AuthError as exc:
+                    self._fail(exc)
+                except Exception as exc:
+                    self._internal_error(exc)
+                return
             if library is not None and (parsed.path == "/v1" or parsed.path.startswith("/v1/")):
                 self._v1_get(parsed)
                 return
@@ -220,12 +257,20 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self._json(409, {"error": str(exc)})
                 return
             except Exception as exc:
-                self._json(500, {"error": str(exc)})
+                self._internal_error(exc)
                 return
             self._json(404, {"error": "没有这个地址"})
 
         def _v1_get(self, parsed):
             try:
+                if parsed.path == '/v1/relay/teams' or parsed.path.startswith('/v1/relay/teams/'):
+                    from diaodu import relay_teams_http
+                    relay_teams_http.get(self, library, parsed)
+                    return
+                if parsed.path == '/v1/relay' or parsed.path.startswith('/v1/relay/'):
+                    from diaodu import relay_http
+                    relay_http.get(self, library, parsed)
+                    return
                 if parsed.path=="/v1/mcp":
                     self._json(405,{"name":"diaodu","version":"2026.10.19","transport":"Streamable HTTP JSON","method":"POST","guide":library.public_base_path+"/v1/agent-guide.md"},{"Allow":"POST"})
                     return
@@ -290,7 +335,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if len(parts) >= 3 and parts[:2] == ["v1", "tasks"]:
                     parts[2] = library.read_task(parts[2])["id"]
                     if len(parts)==3 or (len(parts)==4 and parts[3]=='context'):
-                        library.attention.record(parts[2],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
+                        library.record_attention(parts[2],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
                 if len(parts)==4 and parts[:2]==["v1","tasks"] and parts[3] in ("context","updates"):
                     actor=None
                     if self.headers.get("Authorization") or "diaodu_session=" in self.headers.get("Cookie",""):
@@ -326,36 +371,52 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     return
                 self._json(404, {"error": "没有这个地址"})
             except AuthError as exc:
-                self._json(exc.status, {"error": str(exc)})
+                self._fail(exc)
             except LookupError:
                 self._json(404, {"error": "没有这件任务"})
             except ValueError as exc:
                 self._json(400, {"error": str(exc)})
+            except Exception as exc:
+                self._internal_error(exc)
 
         def _v1_post(self, parts):
             try:
                 self._origin()
+                if parts[:3] == ['v1', 'relay', 'teams']:
+                    from diaodu import relay_teams_http
+                    relay_teams_http.post(self, library, parts)
+                    return
+                if parts[:2] == ['v1', 'relay']:
+                    from diaodu import relay_http
+                    relay_http.post(self, library, parts)
+                    return
                 if parts==['v1','mail','unsubscribe']:
                     length=int(self.headers.get('Content-Length','0'))
-                    if not 0<=length<=1024:raise ValueError('退订请求过大')
+                    if not 0<=length<=1024:self._reject_oversized(length,'退订请求过大')
                     self.rfile.read(length)
                     self._json(200,library.outreach.unsubscribe(parse_qs(urlparse(self.path).query).get('token',[''])[0]));return
                 if parts==["v1","mcp"]:
                     from diaodu import mcp
                     length=int(self.headers.get("Content-Length","0"))
-                    if length<0 or length>15*1024*1024:raise ValueError("MCP请求最大15MB")
+                    if length<0 or length>15*1024*1024:self._reject_oversized(length,"MCP请求最大15MB")
                     body=json.loads(self.rfile.read(length))
                     if not isinstance(body,dict):raise ValueError("JSON-RPC请求须为对象")
                     actor=self._actor(mutation=True) if self.headers.get("Authorization") or self.headers.get("Cookie") else None
                     base=(public_origin or ("http://"+self.headers.get("Host","localhost")))+library.public_base_path+"/v1"
-                    result,sid=mcp.handle(body,self.headers.get("Mcp-Session-Id"),actor,identity,library,base,lambda:identity.throttle(self.headers.get("X-Real-IP",self.client_address[0])))
+                    result,sid=mcp.handle(body,self.headers.get("Mcp-Session-Id"),actor,identity,library,base,lambda:identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]),limit=identity.CONNECT_LIMIT,scope="connect"))
+                    if body.get('method') == 'tools/call' and str((body.get('params') or {}).get('name', '')).startswith(('diaodu_relay_', 'relay_')):
+                        # A cookie/session or Bearer can expire during a long poll. Requests
+                        # that authenticate only through the MCP session skip this recheck;
+                        # mcp.handle revalidates that session actor against the identity DB.
+                        if self.headers.get("Authorization") or self.headers.get("Cookie"):
+                            self._actor(mutation=True)
                     if result and not result.get('error') and not result.get('result',{}).get('isError'):
                         params=body.get('params') or {};task_ref=None
                         if body.get('method')=='tools/call' and params.get('name')=='diaodu_read_task':task_ref=(params.get('arguments') or {}).get('task')
                         if body.get('method')=='resources/read' and str(params.get('uri','')).startswith('diaodu://task/'):task_ref=params['uri'][len('diaodu://task/'):]
                         if task_ref:
                             task=library.read_task(task_ref)
-                            library.attention.record(task['id'],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
+                            library.record_attention(task['id'],'api',self.headers.get('X-Real-IP',self.client_address[0]) if public_origin else self.client_address[0])
                     if result is None:
                         self.send_response(202);self.send_header("Content-Length","0");self.end_headers()
                     else:self._json(200,result,{"Mcp-Session-Id":sid} if sid else None)
@@ -371,7 +432,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         self._json(200, {"csrf":csrf}, {"Set-Cookie":self._cookie(token)})
                     return
                 if parts == ["v1", "connect"]:
-                    identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]) if public_origin else self.client_address[0])
+                    identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]) if public_origin else self.client_address[0],limit=identity.CONNECT_LIMIT,scope="connect")
                     body = self._body()
                     result = identity.connect(body.get("alias"),body.get("agent_type","访客"),body.get("member_kind","agent"),body.get("email"),body.get("contact_consent",False))
                     result["csrf"] = digest("csrf:"+result["token"])
@@ -384,9 +445,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     if not re.fullmatch(r'[a-f0-9]{32}',visitor):visitor=secrets.token_hex(16)
                     ua=self.headers.get('User-Agent','').lower()
                     if not any(bot in ua for bot in ('bot','spider','crawler','curl','python','headless')):
-                        library.attention.record(task['id'],'browser',visitor)
+                        library.record_attention(task['id'],'browser',visitor)
                     header=f"diaodu_visitor={visitor}; HttpOnly; SameSite=Lax; Path={library.public_base_path}/; Max-Age=31536000"+('; Secure' if secure_cookies else '')
-                    self._json(200,library.attention.stats(task['id']),{'Set-Cookie':header})
+                    self._json(200,library.attention_stats(task['id']),{'Set-Cookie':header})
                     return
                 actor = self._actor(mutation=True)
                 if parts[:2]==['v1','mail']:
@@ -433,7 +494,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         chat.read(library,parts[2],actor)
                         length = int(self.headers.get("Content-Length","0"))
                         if length < 0 or length > 100*1024*1024:
-                            raise ValueError("文件不能超过100MB")
+                            self._reject_oversized(length, "文件不能超过100MB")
                         filename = parse_qs(urlparse(self.path).query).get("name",[""])[0]
                         content = self.rfile.read(length)
                         if len(content) != length:raise ValueError("上传未完成")
@@ -490,7 +551,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         raise AuthError("只有任务发布者可以添加任务资料",403)
                     length = int(self.headers.get("Content-Length", "0"))
                     if length < 0 or length > 100 * 1024 * 1024:
-                        raise ValueError("单个文件不能超过 100 MB")
+                        self._reject_oversized(length, "单个文件不能超过 100 MB")
                     filename = parse_qs(urlparse(self.path).query).get("name",[""])[0]
                     content = self.rfile.read(length)
                     if len(content) != length:
@@ -500,7 +561,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if len(parts) == 4 and parts[:2] == ["v1", "tasks"] and parts[3] == "files":
                     length = int(self.headers.get("Content-Length", "0"))
                     if length < 0 or length > 100 * 1024 * 1024:
-                        raise ValueError("单个文件不能超过 100 MB")
+                        self._reject_oversized(length, "单个文件不能超过 100 MB")
                     if actor["kind"] != "agent":
                         raise AuthError("上传需要智能体实例凭证",403)
                     query = parse_qs(urlparse(self.path).query)
@@ -532,7 +593,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     return
                 self._json(404, {"error": "没有这个地址"})
             except AuthError as exc:
-                self._json(exc.status,{"error":str(exc)})
+                self._fail(exc)
             except LibraryError as exc:
                 self._json(409, {"error": str(exc)})
             except LookupError as exc:
@@ -541,8 +602,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self._json(400, {"error": "请求不是 JSON"})
             except ValueError as exc:
                 self._json(400, {"error": str(exc)})
+            except Exception as exc:
+                self._internal_error(exc)
 
-        def _stream_file(self,item,path):
+        def _stream_file(self,item,path,content_type=None,inline=True):
             size=path.stat().st_size
             start,end=0,size-1
             ranged=self.headers.get("Range")
@@ -564,9 +627,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     self.end_headers();return
             self.send_response(206 if ranged else 200)
             self.send_header("Accept-Ranges","bytes")
-            self.send_header("Content-Type",item["type"] if item["type"].startswith(("image/","video/")) and item["type"]!="image/svg+xml" else "application/octet-stream")
+            self.send_header("Content-Type",content_type or (item["type"] if item["type"].startswith(("image/","video/")) and item["type"]!="image/svg+xml" else "application/octet-stream"))
             self.send_header("Content-Length",str(max(0,end-start+1)))
-            self.send_header("Content-Disposition","inline; filename*=UTF-8''"+quote(item["name"]))
+            self.send_header("Content-Disposition",("inline" if inline else "attachment")+"; filename*=UTF-8''"+quote(item["name"]))
             self.send_header("Cache-Control","private, no-store")
             self.send_header("X-Content-Type-Options","nosniff")
             if ranged:self.send_header("Content-Range",f"bytes {start}-{end}/{size}")
@@ -608,10 +671,16 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             except (KeyError, FileNotFoundError, ValueError) as exc:
                 self._json(404, {"error": str(exc)})
 
+        def _reject_oversized(self, length, message):
+            """Consume what we can of a rejected body, then close this connection."""
+            discard_body(self.rfile, length)
+            self.close_connection = True
+            raise ValueError(message)
+
         def _body(self, limit=1_200_000) -> dict:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > limit:
-                raise ValueError("请求过大")
+                self._reject_oversized(length, "请求过大")
             if length == 0:
                 return {}
             raw = self.rfile.read(length)
@@ -628,10 +697,30 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
-            for key, value in (headers or {}).items():
+            headers = dict(headers or {})
+            if status >= 400:
+                # An error response may leave an unread request body behind; do not
+                # invite the peer to reuse this connection.
+                headers.setdefault("Connection", "close")
+            for key, value in headers.items():
                 self.send_header(key,value)
             self.end_headers()
             if not getattr(self,"_head_only",False):self.wfile.write(data)
+
+        def _fail(self, exc):
+            """AuthError to JSON; 429 keeps the wait the caller needs to back off."""
+            payload={"error":str(exc)}
+            if getattr(exc,"retry_after",None) is not None:
+                payload["retry_after"]=exc.retry_after
+            self._json(exc.status,payload)
+
+        def _internal_error(self, exc):
+            """Log the detail server-side, return only a generic JSON error to the client."""
+            traceback.print_exc(file=sys.stderr)
+            try:
+                self._json(500, {"error": "服务暂时不可用，请稍后重试"})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _file(self, path: Path):
             if not path.is_file():
@@ -646,6 +735,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             self.end_headers()
             if not getattr(self,"_head_only",False):self.wfile.write(data)
 
+    Handler.public_origin = public_origin
     return Handler
 
 
