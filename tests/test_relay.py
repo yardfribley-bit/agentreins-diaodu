@@ -285,6 +285,7 @@ class RelayStoreTests(unittest.TestCase):
             self.wait_until_waiting()
             self.relay.revoke(self.owner, self.sid, {"role": "worker"})
             self.error(404, lambda: waiting.result(timeout=1))
+        self.assertEqual(self.relay._waiters, set())
         self.assertEqual(self.relay.list_sessions(self.worker), {"sessions": []})
         for call in [lambda: self.relay.get(self.worker, self.sid), lambda: self.send(self.worker),
                      lambda: self.relay.ack(self.worker, self.sid, {"seq": 0}),
@@ -371,13 +372,142 @@ class RelayStoreTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(1) as pool:
             waiting = pool.submit(self.relay.events, self.worker, self.sid, cursor, .2)
             self.wait_until_waiting()
-            self.error(429, lambda: self.relay.events(self.worker, self.sid, cursor, 1))
-            self.error(429, lambda: self.relay.events(self.mentor, self.sid, cursor, 1))
+            with self.assertRaises(AuthError) as same:
+                self.relay.events(self.worker, self.sid, cursor, 1)
+            self.assertEqual(same.exception.status, 429)
+            self.assertIn("该身份已有实时等待连接", str(same.exception))
+            with self.assertRaises(AuthError) as other:
+                self.relay.events(self.mentor, self.sid, cursor, 1)
+            self.assertEqual(other.exception.status, 429)
+            self.assertIn("实时等待连接已达上限", str(other.exception))
+            self.assertIn("全局剩余 0/1", str(other.exception))
+            # A non-waiting read must not take the last slot or wait for it.
+            quiet = self.relay.events(self.mentor, self.sid, cursor, 0)
+            self.assertEqual(quiet["events"], [])
+            self.assertEqual(len(self.relay._waiters), 1)
             self.assertEqual(waiting.result(timeout=1)["events"], [])
         self.assertEqual(len(self.relay._waiters), 0)
         for after, wait in [(-1, 0), (True, 0), (0, -1), (0, 21), (0, float("nan")), (0, float("inf")), (0, True)]:
             with self.subTest(after=after, wait=wait), self.assertRaises(ValueError):
                 self.relay.events(self.worker, self.sid, after, wait)
+
+    def test_waiter_caps_come_from_the_environment(self):
+        with patch.dict(os.environ, {"DIAODU_RELAY_MAX_WAITERS": "", "DIAODU_RELAY_SESSION_WAITERS": ""}):
+            plain = Relay(self.root / "plain-caps")
+        self.assertEqual((plain.MAX_WAITERS, plain.MAX_SESSION_WAITERS), (256, 32))
+        with patch.dict(os.environ, {"DIAODU_RELAY_MAX_WAITERS": "20", "DIAODU_RELAY_SESSION_WAITERS": "5"}):
+            tuned = Relay(self.root / "tuned-caps")
+        self.assertEqual((tuned.MAX_WAITERS, tuned.MAX_SESSION_WAITERS), (20, 5))
+        with patch.dict(os.environ, {"DIAODU_RELAY_MAX_WAITERS": "20", "DIAODU_RELAY_SESSION_WAITERS": "100"}):
+            clamped = Relay(self.root / "clamped-caps")
+        self.assertEqual((clamped.MAX_WAITERS, clamped.MAX_SESSION_WAITERS), (20, 20))
+        with patch.dict(os.environ, {"DIAODU_RELAY_MAX_WAITERS": "nope", "DIAODU_RELAY_SESSION_WAITERS": "0"}):
+            fallback = Relay(self.root / "fallback-caps")
+        self.assertEqual((fallback.MAX_WAITERS, fallback.MAX_SESSION_WAITERS), (256, 32))
+
+    def test_session_waiter_cap_does_not_starve_other_sessions(self):
+        self.paired()
+        self.relay.MAX_WAITERS = 8
+        self.relay.MAX_SESSION_WAITERS = 1
+        other = self.relay.create(self.other, {"title": "另一场", "goal": "不被挤占"})["session"]["id"]
+        cursor = self.relay.get(self.worker, self.sid)["session"]["last_seq"]
+        stop = threading.Event()
+
+        def abandon():
+            return stop.is_set()
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            try:
+                first = pool.submit(self.relay.events, self.worker, self.sid, cursor, 20, abandon)
+                self.wait_until_waiting(1)
+                with self.assertRaises(AuthError) as caught:
+                    self.relay.events(self.mentor, self.sid, cursor, 1)
+                self.assertEqual(caught.exception.status, 429)
+                self.assertIn("本会话实时等待已达上限", str(caught.exception))
+                self.assertIn("1/1", str(caught.exception))
+                self.assertIn("全局剩余 7/8", str(caught.exception))
+                second = pool.submit(self.relay.events, self.other, other, 0, 20, abandon)
+                self.wait_until_waiting(2)
+                stop.set()
+                with self.relay._condition:
+                    self.relay._condition.notify_all()
+                self.assertEqual(first.result(timeout=2)["events"], [])
+                self.assertEqual(second.result(timeout=2)["events"], [])
+            finally:
+                stop.set()
+                with self.relay._condition:
+                    self.relay._condition.notify_all()
+        self.assertEqual(self.relay._waiters, set())
+
+    def test_abandoned_and_failed_long_poll_discards_the_waiter(self):
+        self.paired()
+        cursor = self.relay.get(self.worker, self.sid)["session"]["last_seq"]
+        stop = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            waiting = pool.submit(self.relay.events, self.worker, self.sid, cursor, 20, lambda: stop.is_set())
+            self.wait_until_waiting()
+            stop.set()
+            with self.relay._condition:
+                self.relay._condition.notify_all()
+            self.assertEqual(waiting.result(timeout=2)["events"], [])
+        self.assertEqual(self.relay._waiters, set())
+
+        state = {"raise": False}
+
+        def probe():
+            if state["raise"]:
+                raise OSError("socket died")
+            return False
+
+        real_page = self.relay._page
+
+        def flaky(*args, **kwargs):
+            if state["raise"]:
+                raise RuntimeError("store failed")
+            return real_page(*args, **kwargs)
+
+        with patch.object(self.relay, "_page", side_effect=flaky):
+            with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                waiting = pool.submit(self.relay.events, self.mentor, self.sid, cursor, 20, probe)
+                self.wait_until_waiting()
+                state["raise"] = True
+                with self.relay._condition:
+                    self.relay._condition.notify_all()
+                with self.assertRaises(RuntimeError):
+                    waiting.result(timeout=2)
+        self.assertEqual(self.relay._waiters, set())
+
+        # A probe that fails before the next page read still drops the slot.
+        state["raise"] = False
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            waiting = pool.submit(self.relay.events, self.owner, self.sid, cursor, 20, probe)
+            self.wait_until_waiting()
+            state["raise"] = True
+            with self.relay._condition:
+                self.relay._condition.notify_all()
+            self.assertEqual(waiting.result(timeout=2)["events"], [])
+        self.assertEqual(self.relay._waiters, set())
+
+    def test_public_long_poll_shares_the_pool_and_releases_when_abandoned(self):
+        self.paired()
+        self.relay.MAX_WAITERS = 1
+        token = self.relay.set_public(self.owner, self.sid, {"enabled": True})["public_url"].rsplit("/", 1)[-1]
+        cursor = self.relay.get(self.owner, self.sid)["session"]["last_seq"]
+        stop = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            try:
+                waiting = pool.submit(self.relay.public_events, token, cursor, 20, lambda: stop.is_set())
+                self.wait_until_waiting()
+                self.error(429, lambda: self.relay.events(self.worker, self.sid, cursor, 1))
+                stop.set()
+                with self.relay._condition:
+                    self.relay._condition.notify_all()
+                self.assertEqual(waiting.result(timeout=2)["events"], [])
+            finally:
+                stop.set()
+                with self.relay._condition:
+                    self.relay._condition.notify_all()
+        self.assertEqual(self.relay._waiters, set())
 
     def test_long_poll_rechecks_membership_before_return_and_each_wait(self):
         self.paired()

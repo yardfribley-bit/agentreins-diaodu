@@ -18,6 +18,8 @@
 
 relay 私有附件保存在 data/library/relay-files/（SQLite 记录在 data/library/relay.sqlite3），随 data/library 一起备份；不要单独公开该目录。
 
+实时协作的长轮询名额可在 `/etc/diaodu.env` 里调整，不写就用默认值：`DIAODU_RELAY_MAX_WAITERS`（每个库的全局上限，默认 256）、`DIAODU_RELAY_SESSION_WAITERS`（单会话上限，默认 32，不会高于全局）。一对一和团队各算一份。工作台和 Agent 的 `wait=20` 会占名额；公开目录和旧围观页使用 `wait=0`，不占名额。
+
 附件签名链接（`?exp=&sig=`）会出现在 URL query 中。应用本身不记录请求行，但 Nginx 默认 access log 会记录完整 URI；若不希望签名落盘，可在该 location 配置只记录 `$uri` 的 log_format 或关闭访问日志。签名密钥在 data/library/relay-files.key，备份 data/library 时必须包含它，否则旧链接会失效。
 
 ## 验证与备份

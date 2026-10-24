@@ -13,6 +13,7 @@ import socket
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from diaodu import relay_http
 from diaodu.identity import Identity, digest
 from diaodu.library import Library
 from diaodu.relay_client import RelayClient, RelayError, environment, load_state, main
@@ -61,6 +62,58 @@ class RelayHTTP(unittest.TestCase):
     def join(self):
         self.clients['mentor'].join(self.created['topic_code'], 'mentor')
         self.clients['worker'].join(self.created['topic_code'], 'worker')
+
+    def test_client_abandoned_detects_peer_close(self):
+        left, right = socket.socketpair()
+        try:
+            handler = type("Handler", (), {"connection": left})()
+            self.assertFalse(relay_http.client_abandoned(handler))
+            right.close()
+            right = None
+            self.assertTrue(relay_http.client_abandoned(handler))
+        finally:
+            left.close()
+            if right is not None:
+                right.close()
+
+    def test_disconnected_long_poll_releases_the_waiter(self):
+        self.join()
+        cursor = self.clients['worker'].get(self.sid)['session']['last_seq']
+        port = self.server.server_address[1]
+        sock = socket.create_connection(('127.0.0.1', port))
+        try:
+            token = self.identities['worker']['token']
+            sock.sendall((
+                f"GET /v1/relay/sessions/{self.sid}/events?after={cursor}&wait=20 HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Authorization: Bearer {token}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with self.library.relay._condition:
+                    if self.library.relay._waiters:
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("long poll did not register")
+            sock.close()
+            sock = None
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                with self.library.relay._condition:
+                    if not self.library.relay._waiters:
+                        break
+                time.sleep(0.02)
+            else:
+                self.fail("waiter still held after the client disconnected")
+        finally:
+            if sock is not None:
+                sock.close()
+        status, _ = self.req('GET', f'/v1/relay/sessions/{self.sid}/events?after={cursor}&wait=0', role='worker')
+        self.assertEqual(status, 200)
+        self.assertEqual(self.library.relay._waiters, set())
 
     def test_anonymous_routes_private_history_and_required_os(self):
         for route in ('/v1/relay/sessions', '/v1/relay/sessions/' + self.sid):

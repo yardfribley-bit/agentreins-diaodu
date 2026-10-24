@@ -21,8 +21,10 @@ from pathlib import Path
 from diaodu import relay_files
 from diaodu.identity import AuthError
 from diaodu.relay import (
-    FILE_ID_RE, PUBLIC_ID_RE, Relay, _actor, _body, _environment, _iso, _message_preview,
-    _mint_public_id, _name, _preview, _text, directory_rows, ensure_directory_columns,
+    DEFAULT_MAX_WAITERS, DEFAULT_SESSION_WAITERS, FILE_ID_RE, PUBLIC_ID_RE, Relay,
+    _actor, _body, _claim_waiter, _environment, _iso, _long_poll_ready, _message_preview,
+    _mint_public_id, _name, _preview, _resolve_waiter_limits, _text, directory_rows,
+    ensure_directory_columns,
 )
 
 
@@ -30,7 +32,10 @@ class RelayTeams:
     MAX_WORKERS_CAP = 8
     MAX_EVENTS = 5000
     PAGE_SIZE = 100
-    MAX_WAITERS = 32
+    # Same ceiling as Topic. See diaodu.relay.DEFAULT_MAX_WAITERS: the old 32
+    # was one set for every team session, so one busy team starved the rest.
+    MAX_WAITERS = DEFAULT_MAX_WAITERS
+    MAX_SESSION_WAITERS = DEFAULT_SESSION_WAITERS
     ONLINE_SECONDS = 60
     TOUCH_SECONDS = 60
     SIGNED_SECONDS = relay_files.SIGNED_SECONDS
@@ -58,6 +63,7 @@ class RelayTeams:
         os.chmod(self.path, 0o600)
         self._condition = threading.Condition(threading.RLock())
         self._waiters = set()
+        self.MAX_WAITERS, self.MAX_SESSION_WAITERS = _resolve_waiter_limits()
         with self._write() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS team_sessions (
@@ -387,18 +393,18 @@ class RelayTeams:
                     "next_cursor": scanned[-1]["seq"] if scanned else after,
                     "has_more": len(rows) > self.PAGE_SIZE}
 
-    def public_events(self, token, after=0, wait=0):
+    def public_events(self, token, after=0, wait=0, abandon=None):
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or not 0 <= wait <= 20:
             raise ValueError("wait须为0至20秒")
-        hashed = hashlib.sha256(token.encode()).hexdigest() if isinstance(token, str) else b""
-        waiter = ("team-public", hashed)
+        hashed = hashlib.sha256(token.encode()).hexdigest() if isinstance(token, str) else ""
+        waiter = None
         registered = False
         deadline = time.monotonic() + wait
         try:
             with self._condition:
                 while True:
                     result = self._public_page(token, after)
-                    if result["events"] or not wait or result["session"]["status"] == "closed" or time.monotonic() >= deadline:
+                    if _long_poll_ready(result, wait, deadline, abandon):
                         # Re-check after waiting: disabling or rotating must close the link.
                         with self._read() as db:
                             session = self._public_row(db, hashed)
@@ -408,9 +414,10 @@ class RelayTeams:
                         after = result["next_cursor"]
                         continue
                     if not registered:
-                        if waiter in self._waiters or len(self._waiters) >= self.MAX_WAITERS:
-                            raise AuthError("实时等待连接已达上限，请稍后重试", 429)
-                        self._waiters.add(waiter)
+                        with self._read() as db:
+                            public_sid = self._public_row(db, hashed)["id"]
+                        waiter = (public_sid, "public:" + hashed)
+                        _claim_waiter(self._waiters, waiter, self.MAX_WAITERS, self.MAX_SESSION_WAITERS)
                         registered = True
                     self._condition.wait(min(1.0, max(0, deadline - time.monotonic())))
         finally:
@@ -574,20 +581,20 @@ class RelayTeams:
                     "next_cursor": scanned[-1]["seq"] if scanned else after,
                     "has_more": len(rows) > self.PAGE_SIZE}
 
-    def events(self, actor, sid, after=0, wait=0):
+    def events(self, actor, sid, after=0, wait=0, abandon=None):
         key = _actor(actor)
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after须为非负整数")
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or not 0 <= wait <= 20:
             raise ValueError("wait须为0至20秒")
-        token = (sid, key)
+        waiter = (sid, key)
         registered = False
         deadline = time.monotonic() + wait
         try:
             with self._condition:
                 while True:
                     result = self._page(actor, sid, after)
-                    if result["events"] or not wait or result["session"]["status"] == "closed" or time.monotonic() >= deadline:
+                    if _long_poll_ready(result, wait, deadline, abandon):
                         self._touch(sid, key)
                         with self._read() as db:
                             result["session"] = self._view(db, actor, sid)
@@ -598,15 +605,13 @@ class RelayTeams:
                         after = result["next_cursor"]
                         continue
                     if not registered:
-                        if token in self._waiters or len(self._waiters) >= self.MAX_WAITERS:
-                            raise AuthError("实时等待连接已达上限，请稍后重试", 429)
-                        self._waiters.add(token)
+                        _claim_waiter(self._waiters, waiter, self.MAX_WAITERS, self.MAX_SESSION_WAITERS)
                         registered = True
                     self._condition.wait(min(1.0, max(0, deadline - time.monotonic())))
         finally:
             if registered:
                 with self._condition:
-                    self._waiters.discard(token)
+                    self._waiters.discard(waiter)
 
     def _view(self, db, actor, sid):
         session, member = self._access(db, actor, sid)

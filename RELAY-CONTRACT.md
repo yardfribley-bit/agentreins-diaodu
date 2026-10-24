@@ -44,7 +44,7 @@ event: `{seq,kind:'message'|'joined'|'state'|'revoked'|'environment',created_at,
 
 同一make_handler创建一次store挂到library.relay。actor键使用`agent_id`（agent）或`user_id`（user），不能以user_id合并不同agent。成员名只存公开展示名，不存token。owner身份不自动占用两Agent角色。
 
-Topic 配对码至少192位随机，仅哈希存储，可重复用于尚未占用的角色；只有管理者可重置，结束会话后不可加入。旧版签发的单次角色码仍按30分钟有效。单一身份不能同时占用mentor与worker。使用SQLite事务实现会话内顺序号与幂等性；条件变量唤醒长轮询并限制并发等待数。每轮wait及返回前重新核对成员资格。单消息<=8000字符、单会话<=5000事件、每管理者最多20个未关闭会话；输出消息必须使用textContent避免XSS。
+Topic 配对码至少192位随机，仅哈希存储，可重复用于尚未占用的角色；只有管理者可重置，结束会话后不可加入。旧版签发的单次角色码仍按30分钟有效。单一身份不能同时占用mentor与worker。使用SQLite事务实现会话内顺序号与幂等性；条件变量唤醒长轮询。等待名额按存储分开：一对一、团队各自默认全局 256、单会话 32（`DIAODU_RELAY_MAX_WAITERS`、`DIAODU_RELAY_SESSION_WAITERS`，合法 1 到 4096）。超时、异常和客户端断开都会释放；`wait=0` 不登记。每轮wait及返回前重新核对成员资格。单消息<=8000字符、单会话<=5000事件、每管理者最多20个未关闭会话；输出消息必须使用textContent避免XSS。
 
 `peers[].online` 以最近60秒内是否有任何已认证请求为准，长轮询本身也算，因此只旁听的一端仍在线；`ack_seq` 只表示已接收，不代表已执行。消息文本入库前去掉首尾空白，幂等哈希按规范化文本计算，空白差异不产生新的409。普通事件达到上限后拒绝新消息；结束、撤销等控制事件不受上限影响，执行端环境刷新只更新成员信息、不再追加事件且不返回409。
 
@@ -64,7 +64,7 @@ Topic 配对码至少192位随机，仅哈希存储，可重复用于尚未占�
 `GET /v1/relay/public/<public_token>/events?after=&wait=` 为匿名只读视图，不需要任何凭证。一对一与团队会话复用这个地址和同一套过滤；两边 token 命名空间独立，互不串用。
 
 - 服务端过滤：`environment` 事件整条不下发；`joined` 一对一只有 `role`，团队另带 `seat`；`message` 只保留 kind/text/reply_to 和附件 `name,size,type`（不含 id、下载链接或签名）；`state`/`revoked` 只保留状态/角色。任何 os/architecture/shells/ip 等环境字段在服务端剔除。
-- 响应不含 session id、actor_key、token、签名；`next_cursor` 仍是扫描到的全局 seq，允许空洞；长轮询 wait 0..20 秒。
+- 响应不含 session id、actor_key、token、签名；`next_cursor` 仍是扫描到的全局 seq，允许空洞；长轮询 wait 0..20 秒。围观页脚本使用 `wait=0`，每 3 秒轮询，不占成员名额。
 - 关闭公开或轮换 token 后旧链接立即 404，等待中的长轮询也会被唤醒并收到 404；公开接口不接受写操作。
 - 公开接口按来源 IP 限流，阈值低于成员接口（默认 30 次/分钟）。
 - 公开视图会完整展示对话正文；环境字段被剔除不代表正文安全，开启前需自行确认正文不含敏感信息。
