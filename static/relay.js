@@ -14,14 +14,14 @@
   const guideURL = new URL('relay/guide.md', apiBase).href;
   const roles = {owner:'管理者', mentor:'指导端', worker:'执行端'};
   const states = {active:'进行中', paused:'已暂停', closed:'已结束'};
-  const kinds = {instruction:'人工指令', progress:'进度', result:'结果', question:'提问', note:'人工备注'};
+  const kinds = {instruction:'指令', progress:'进度', result:'结果', question:'提问', note:'备注'};
   let identity = null, csrf = '', sessions = [], current = null, cursor = 0;
   let generation = 0, pollController = null, listGeneration = 0, listController = null;
   let retryTimer = null, heartbeatAt = 0, replyTo = null, outgoing = null, mutationBusy = false;
   let sending = false, createBusy = false, stopped = false, confirmTask = null, unread = 0;
   const events = new Map();
 
-  for (const id of ['guide-link','protocol-link','pair-guide-link']) $(id).href = guideURL;
+  for (const id of ['protocol-link','pair-guide-link']) $(id).href = guideURL;
 
   function timestamp(value) {
     if (value == null || value === '') return null;
@@ -478,7 +478,7 @@
       for (const role of (isTopicCode ? ['mentor','worker'] : [value.role])) {
         const promptButton = element('button',isTopicCode ? '复制' + roles[role] + '接入指令' : '复制 Agent 接入指令',isTopicCode && role === 'mentor' ? 'primary' : ''); promptButton.type = 'button';
         const joinPrompt = [
-          `请加入出海剑 Agent 通信 Topic「${topicTitle}」。`,
+          `请加入 AgentReins Hub 的通信 Topic「${topicTitle}」。`,
           `Topic 目标：${topicGoal}`,
           `把 MCP 地址 ${new URL('mcp',apiBase).href} 配置为 MCP 服务器（Streamable HTTP，不需要 token）；先调用 diaodu_connect 建立身份，再调用 diaodu_relay_join，参数为 code: ${value.code}、role: ${role}`,
           role === 'worker' ? '你是执行端。加入时请根据当前机器真实情况填写 environment：os_name、os_version、architecture、shells、python_version；不要猜测。' : '你是指导端。加入后先读取执行端上报的环境，再提供适用于该环境的指导。',
@@ -521,7 +521,7 @@
     const roleText = role === 'mentor' ? '指导端（mentor）' : '执行端（worker）';
     const seatText = role === 'mentor' ? '指导端席位' : (seat ? seat + ' 号席' : '任意空席（由服务端分配）');
     return [
-      `请加入出海剑团队协作「${text(current?.title) || '未命名团队'}」。`,
+      `请加入 AgentReins Hub 团队协作「${text(current?.title) || '未命名团队'}」。`,
       `团队目标：${text(current?.goal) || '请先读取团队目标'}`,
       `把 MCP 地址 ${new URL('mcp',apiBase).href} 配置为 MCP 服务器（Streamable HTTP，不需要 token）；先调用 diaodu_connect，再调用 diaodu_relay_team_join，code 使用：${code}`,
       `你的角色是${roleText}，席位：${seatText}。` + (role === 'worker'

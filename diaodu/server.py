@@ -134,12 +134,26 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             if parsed.path.startswith('/relay/watch/'):
                 self._file(STATIC / 'relay-watch.html')
                 return
-            if parsed.path == '/relay-watch.js':
-                self._file(STATIC / 'relay-watch.js')
-                return
-            relay_static = {'/relay/': 'relay.html', '/relay/relay.js': 'relay.js', '/relay/relay.css': 'relay.css'}
-            if parsed.path in relay_static:
-                self._file(STATIC / relay_static[parsed.path])
+            # Exact paths only. Nginx strips the /task prefix, so a browser
+            # request for /task/tokens.css arrives here as /tokens.css.
+            # /relay.css is the path the old watch page resolved to; keep it
+            # so a stale relative URL still receives the stylesheet.
+            static_files = {
+                '/': 'index.html',
+                '/favicon.svg': 'favicon.svg',
+                '/share.png': 'share.png',
+                '/style.css': 'style.css',
+                '/tokens.css': 'tokens.css',
+                '/mail.js': 'mail.js',
+                '/app.js': 'app.js',
+                '/relay/': 'relay.html',
+                '/relay/relay.js': 'relay.js',
+                '/relay/relay.css': 'relay.css',
+                '/relay.css': 'relay.css',
+                '/relay-watch.js': 'relay-watch.js',
+            }
+            if parsed.path in static_files:
+                self._file(STATIC / static_files[parsed.path])
                 return
             if library is not None and parsed.path.startswith('/relay/join/'):
                 from diaodu import relay_http
@@ -152,24 +166,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 return
             if library is not None and (parsed.path == "/v1" or parsed.path.startswith("/v1/")):
                 self._v1_get(parsed)
-                return
-            if parsed.path == "/":
-                self._file(STATIC / "index.html")
-                return
-            if parsed.path == "/share.png":
-                self._file(STATIC / "share.png")
-                return
-            if parsed.path == "/favicon.svg":
-                self._file(STATIC / "favicon.svg")
-                return
-            if parsed.path == "/style.css":
-                self._file(STATIC / "style.css")
-                return
-            if parsed.path == "/mail.js":
-                self._file(STATIC / "mail.js")
-                return
-            if parsed.path == "/app.js":
-                self._file(STATIC / "app.js")
                 return
             if service is None:
                 self._json(404, {"error":"没有这个地址"})
