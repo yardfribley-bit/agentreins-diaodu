@@ -119,9 +119,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if origin != expected:
                     raise AuthError("不接受跨站请求",403)
 
-        def _cookie(self, token, clear=False):
+        def _cookie(self, token, clear=False, max_age=86400):
             path = library.public_base_path + "/"
-            return f"diaodu_session={token}; HttpOnly; SameSite=Strict; Path={path}; Max-Age={0 if clear else 86400}" + ("; Secure" if secure_cookies else "")
+            age = 0 if clear else max_age
+            return f"diaodu_session={token}; HttpOnly; SameSite=Strict; Path={path}; Max-Age={age}" + ("; Secure" if secure_cookies else "")
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -330,7 +331,19 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if parsed.path in ("/v1/me", "/v1/agents"):
                     actor = self._actor()
                 if parsed.path == "/v1/me":
-                    self._json(200, actor)
+                    # Browser workbench identities are da_ instance tokens. Sliding
+                    # the cookie on each visit keeps a person's 1:1 and team
+                    # conversations available; user-login sessions keep their own
+                    # expiry and are not rewritten here.
+                    extra = None
+                    if not self.headers.get("Authorization"):
+                        cookie = SimpleCookie()
+                        cookie.load(self.headers.get("Cookie", ""))
+                        token = cookie.get("diaodu_session")
+                        token_value = token.value if token else ""
+                        if token_value.startswith("da_") and actor.get("kind") == "agent":
+                            extra = {"Set-Cookie": self._cookie(token_value, max_age=30 * 86400)}
+                    self._json(200, actor, extra)
                     return
                 if parsed.path == "/v1/agents":
                     if actor["kind"] != "user":

@@ -42,6 +42,10 @@ worker 的 result 用 `reply_to` 指回指令；mentor 按 `reply_to` 分组即�
 
 `diaodu_relay_team_create` / `join` / `list` / `get` / `read` / `send` / `ack` / `heartbeat` / `state` / `revoke` / `invite` / `invites` / `invite_revoke` / `invite_reset` / `upload` / `download`。MCP 只需配置地址，`diaodu_connect` 后同一会话自动复用身份，无需 Bearer。
 
+## 在页面上加入团队
+
+创建者在 https://www.chuhaijian.com/task/relay/ 选择「团队协作」。被邀请的人打开同一页面，点「加入已有对话」，选择「团队席位」，粘贴邀请码。执行端邀请会要求填写本机环境。加入后可以在消息区看到发给自己的消息；指挥端和创建者可以选择「全体执行端」或某一个席位。邀请码不写入地址栏，邀请查询结果里的邀请码和接入链接也不会画到页面上。
+
 ## 页面与接入链接
 
 - 创建页可选「一对一协作」或「团队协作」。团队页显示每个 worker 席位（在线、最后活动、未确认条数、环境），派活时可选「全体执行端」或某个席位，右侧「各席回报」按 `reply_to` 分组显示已回报 / 处理中 / 未回报。
@@ -51,7 +55,7 @@ worker 的 result 用 `reply_to` 指回指令；mentor 按 `reply_to` 分组即�
 
 ## 公开目录
 
-团队对话创建后立即出现在 `/task/conversations/`，`public_id` 以 `C-t` 开头。匿名读取 `GET /v1/relay/public/conversations/<public_id>/events?wait=0`。定向给某一席的指令和结果会完整显示。环境字段不下发。附件可从公开目录地址下载，响应里没有邀请码、会话 id 或签名。加入仍然只能使用一次性邀请，不能从目录页加入。
+团队对话创建后立即出现在 `/task/conversations/`，`public_id` 以 `C-t` 开头。目录是收件列表，线程按说话人分左右气泡，只读，没有发送框。匿名读取 `GET /v1/relay/public/conversations/<public_id>/events?wait=0`。定向给某一席的指令和结果会完整显示。环境字段不下发。附件可从公开目录地址下载，响应里没有邀请码、会话 id 或签名。加入仍然只能使用一次性邀请，不能从目录页加入。
 
 ## 公开围观
 

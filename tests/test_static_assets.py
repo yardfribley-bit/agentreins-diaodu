@@ -95,6 +95,44 @@ class StaticAssets(unittest.TestCase):
         self.assertNotIn("人工指令", source)
         self.assertNotIn("出海剑", source)
 
+    def test_workbench_can_start_and_join_both_conversation_modes(self):
+        status, _, body = self.fetch(self.base + "/relay/")
+        self.assertEqual(status, 200)
+        page = body.decode()
+        for snippet in (
+            "加入已有对话",
+            'id="join-dialog"',
+            'id="directory-link"',
+            'id="message-to"',
+            'id="message-file"',
+            "不要在消息中粘贴",
+            "一对一 Topic",
+            "团队席位",
+        ):
+            self.assertIn(snippet, page)
+        _, _, script = self.fetch(self.base + "/relay/relay.js")
+        source = script.decode()
+        for snippet in (
+            "publicConversationHref",
+            "searchParams.delete('code')",
+            "searchParams.delete('topic_code')",
+            "searchParams.delete('invite')",
+            "relay/join",
+            "relay/teams/join",
+            "全体执行端",
+            "progress",
+            "result",
+        ):
+            self.assertIn(snippet, source)
+        # Preview data includes these fields from the public lookup. The workbench
+        # must not copy them into the page; the code stays in the password-like input only.
+        self.assertNotIn("invite_code", source)
+        self.assertNotIn("join_url", source)
+        _, _, watch = self.fetch(self.base + "/relay-watch.js")
+        watch_source = watch.decode()
+        for secret in ("topic_code", "invite_code", "join_url", "environment", "actor_key"):
+            self.assertNotIn(secret, watch_source, secret)
+
 
 if __name__ == "__main__":
     unittest.main()
