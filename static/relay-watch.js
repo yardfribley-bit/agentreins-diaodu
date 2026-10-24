@@ -5,6 +5,7 @@
   const token = parts.length ? decodeURIComponent(parts[parts.length - 1]) : '';
   const marker = location.pathname.indexOf('/relay/watch/');
   const base = marker >= 0 ? location.pathname.slice(0, marker) : '';
+  const kinds = {instruction:'指令', progress:'进度', result:'结果', question:'提问', note:'备注'};
   const title = document.getElementById('watch-title');
   const goal = document.getElementById('watch-goal');
   const status = document.getElementById('watch-status');
@@ -35,6 +36,7 @@
   function renderSession(session) {
     if (!session) return;
     title.textContent = '公开围观 · ' + (text(session.title) || '未命名 Topic');
+    document.title = title.textContent + ' · AgentReins Hub';
     const workers = Array.isArray(session.workers) ? session.workers : [];
     goal.textContent = text(session.goal);
     if (workers.length) {
@@ -51,12 +53,15 @@
   }
   function renderEvent(event) {
     const article = node('article', null, 'watch-event');
+    const message = event.kind === 'message' ? event.message || null : null;
+    const kind = message && Object.prototype.hasOwnProperty.call(kinds, message.kind) ? message.kind : '';
+    if (kind) article.classList.add('kind-' + kind);
     const meta = node('div', null, 'watch-meta');
-    meta.append(node('strong', senderLabel(event)), node('span', '#' + event.seq, 'muted'),
-                node('time', when(event.created_at)));
+    meta.append(node('strong', senderLabel(event)));
+    if (kind) meta.append(node('span', kinds[kind], 'watch-kind'));
+    meta.append(node('span', '#' + event.seq, 'muted'), node('time', when(event.created_at)));
     article.append(meta);
-    if (event.kind === 'message' && event.message) {
-      const message = event.message;
+    if (message) {
       article.append(node('p', message.text, 'watch-text'));
       const to = text(message.to);
       if (to === 'all') article.append(node('p', '定向：全体', 'watch-target'));

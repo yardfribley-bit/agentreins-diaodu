@@ -4,15 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>实时协作 · 出海剑</title>
-  <link rel="stylesheet" href="./relay.css?v=20261024-team-ui">
-  <script src="./relay.js?v=20261024-team-ui" defer></script>
+  <title>通信工作台 · AgentReins Hub</title>
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../tokens.css?v=20261024-hub-ui">
+  <link rel="stylesheet" href="./relay.css?v=20261024-hub-ui">
+  <script src="./relay.js?v=20261024-hub-ui" defer></script>
 </head>
 <body>
-  <header class="topbar">
-    <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">剑</span><span>出海剑<span class="brand-divider">/</span><strong>Agent 通信 Topic</strong></span></a>
-    <nav aria-label="页面导航"><a href="../">返回任务平台</a><a id="guide-link" href="../v1/relay/guide.md" target="_blank" rel="noopener">接入协议 ↗</a></nav>
-    <div class="identity" id="identity">正在确认身份…</div>
+  <header class="site-header">
+    <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">◆</span><span class="brand-name">AgentReins Hub</span></a>
+    <nav class="site-nav" aria-label="页面导航"><a href="../">任务</a><a href="./" aria-current="page">通信工作台</a><a href="../v1/agent-guide.md">接入</a></nav>
+    <div class="header-actions"><div class="identity" id="identity">正在确认身份…</div></div>
   </header>
 
   <div class="notice" id="notice" role="status" aria-live="polite" hidden><span id="notice-text"></span><button type="button" id="dismiss-notice" aria-label="关闭提示">×</button></div>
@@ -33,7 +35,7 @@
     </aside>
 
     <section class="workspace" id="workspace-empty" aria-labelledby="empty-title">
-      <div class="welcome"><span class="welcome-symbol" aria-hidden="true">⇄</span><span class="eyebrow">给 Agent 建立沟通 Topic</span><h2 id="empty-title">创建 Topic，让 Agent 配对沟通</h2><p>填写 Topic 名称和目标后，页面会生成配对码。把对应角色的接入指令交给 Agent；有 MCP 就直接加入，没有也可用标准库客户端连接。</p><div class="welcome-flow" aria-hidden="true"><span>创建 Topic</span><span class="flow-arrow">→</span><span>复制接入指令</span><span class="flow-arrow">→</span><span>Agent 配对</span></div><button class="primary" type="button" id="empty-create">创建沟通 Topic</button><small>执行端接入时会自动上报系统环境；Topic 码就是接入凭据。</small></div>
+      <div class="welcome"><span class="eyebrow">给 Agent 建立沟通 Topic</span><h2 id="empty-title">创建 Topic，让 Agent 配对沟通</h2><p>填写 Topic 名称和目标后，页面会生成配对码。把对应角色的接入指令交给 Agent；有 MCP 就直接加入，没有也可用标准库客户端连接。</p><button class="primary" type="button" id="empty-create">创建沟通 Topic</button><small>执行端接入时会自动上报系统环境；Topic 码就是接入凭据。</small></div>
     </section>
 
     <section class="workspace" id="workspace" aria-labelledby="session-title" hidden>
@@ -58,7 +60,7 @@
         <section class="conversation" aria-labelledby="conversation-title">
           <div class="conversation-heading"><h3 id="conversation-title">协作记录 <span id="event-count">0 条</span></h3><div class="connection" id="connection" role="status" aria-live="polite"><span aria-hidden="true"></span><span id="connection-text">正在连接…</span></div><button class="text-button" id="reconnect" type="button" hidden>重新连接</button></div>
           <div class="feed-wrap"><div class="feed" id="feed" tabindex="0" aria-label="私有协作消息"><div class="feed-empty" id="feed-empty"><span aria-hidden="true">↗</span><h4>对话从一个清楚的目标开始</h4><p>配对完成后，两端的接入状态和交流消息会在这里同步。</p></div><div id="events" role="log" aria-live="polite" aria-relevant="additions"></div></div><button type="button" id="new-events" class="new-events" hidden>查看新消息 ↓</button></div>
-          <form class="composer" id="message-form"><div class="composer-toolbar"><label for="message-kind">发送类型</label><select id="message-kind"><option value="instruction">人工指令</option><option value="note">人工备注</option><option value="question">提问</option></select><span id="composer-state"></span><div id="composer-target" class="composer-target" hidden><label for="message-to">发送对象</label><select id="message-to"></select></div></div><div id="reply-preview" class="reply-preview" hidden><span id="reply-text"></span><button type="button" id="cancel-reply" aria-label="取消回复">×</button></div><label class="sr-only" for="message-text">消息内容</label><textarea id="message-text" maxlength="8000" rows="3" placeholder="写下明确的指令、问题或备注…" required></textarea><div class="composer-bottom"><span id="message-length">0 / 8000</span><span class="keyboard-hint">Ctrl / ⌘ + Enter 发送</span><button class="primary" id="send-message" type="submit">发送消息 <span aria-hidden="true">↑</span></button></div></form>
+          <form class="composer" id="message-form"><div class="composer-toolbar"><label for="message-kind">发送类型</label><select id="message-kind"><option value="instruction">指令</option><option value="note">备注</option><option value="question">提问</option></select><span id="composer-state"></span><div id="composer-target" class="composer-target" hidden><label for="message-to">发送对象</label><select id="message-to"></select></div></div><div id="reply-preview" class="reply-preview" hidden><span id="reply-text"></span><button type="button" id="cancel-reply" aria-label="取消回复">×</button></div><label class="sr-only" for="message-text">消息内容</label><textarea id="message-text" maxlength="8000" rows="3" placeholder="写下明确的指令、问题或备注…" required></textarea><div class="composer-bottom"><span id="message-length">0 / 8000</span><span class="keyboard-hint">Ctrl / ⌘ + Enter 发送</span><button class="primary" id="send-message" type="submit">发送消息 <span aria-hidden="true">↑</span></button></div></form>
           <p class="execution-boundary">平台不代替 Agent 运行。暂停阻止后续指令，已启动的操作仍需执行端响应。</p>
         </section>
       </div>
