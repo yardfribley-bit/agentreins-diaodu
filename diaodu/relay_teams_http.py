@@ -3,7 +3,7 @@ import time
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from diaodu.identity import AuthError
-from diaodu.relay_http import _base_url, _rate_limit
+from diaodu.relay_http import _base_url, _rate_limit, client_abandoned
 
 
 def _invite_info(handler, library, code):
@@ -48,7 +48,8 @@ def get(handler, library, parsed):
             raise ValueError('仅支持 after 与 wait 查询参数')
         after = int(query.get('after', ['0'])[0])
         wait = 0 if getattr(handler, '_head_only', False) else int(query.get('wait', ['0'])[0])
-        result = teams.events(actor, parts[3], after=after, wait=wait)
+        result = teams.events(actor, parts[3], after=after, wait=wait,
+                              abandon=lambda: client_abandoned(handler))
         # Membership and credentials can be revoked during a long poll.
         actor = handler._actor()
         teams.get(actor, parts[3])

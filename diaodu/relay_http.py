@@ -1,6 +1,8 @@
 """Private relay REST routes; the shared handler owns authentication and CSRF."""
 import html
 import re
+import select
+import socket
 import threading
 import time
 import unicodedata
@@ -20,6 +22,32 @@ _HITS = {}
 _PUBLIC_HITS = {}
 _DIRECTORY_HITS = {}
 _HITS_LOCK = threading.Lock()
+
+
+def client_abandoned(handler):
+    """True when the peer has closed this HTTP connection.
+
+    A long poll blocks for up to 20 seconds. If a tab navigates away or aborts
+    its fetch, the socket closes while the handler is still waiting. Peek only,
+    so a pipelined request is left for the next read. Any socket error counts
+    as gone: the slot must not stay reserved until the wait deadline.
+    """
+    connection = getattr(handler, "connection", None)
+    if connection is None:
+        return False
+    try:
+        readable, _, _ = select.select([connection], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    if not readable:
+        return False
+    try:
+        peeked = connection.recv(1, socket.MSG_PEEK)
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
+    return peeked == b""
 
 
 def _client_ip(handler):
@@ -448,15 +476,16 @@ def get(handler, library, parsed):
             raise ValueError('仅支持 after 与 wait 查询参数')
         after = int(query.get('after', ['0'])[0])
         wait = 0 if getattr(handler, '_head_only', False) else int(query.get('wait', ['0'])[0])
+        gone = lambda: client_abandoned(handler)
         try:
-            result = library.relay.public_events(parts[3], after=after, wait=wait)
+            result = library.relay.public_events(parts[3], after=after, wait=wait, abandon=gone)
         except AuthError as error:
             # Team sessions reuse the exact same public endpoint and filter; the
             # token namespaces are disjoint, so only a 404 may fall through.
             teams = getattr(library, 'teams', None)
             if error.status != 404 or teams is None:
                 raise
-            result = teams.public_events(parts[3], after=after, wait=wait)
+            result = teams.public_events(parts[3], after=after, wait=wait, abandon=gone)
         handler._json(200, result)
         return
     if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'sessions'] and parts[4] == 'files':
@@ -490,7 +519,8 @@ def get(handler, library, parsed):
             raise ValueError('仅支持 after 与 wait 查询参数')
         after = int(query.get('after', ['0'])[0])
         wait = 0 if getattr(handler, '_head_only', False) else int(query.get('wait', ['0'])[0])
-        result = relay.events(actor, parts[3], after=after, wait=wait)
+        result = relay.events(actor, parts[3], after=after, wait=wait,
+                              abandon=lambda: client_abandoned(handler))
         # Credentials and membership can be revoked during a long poll.
         actor = handler._actor()
         relay.get(actor, parts[3])

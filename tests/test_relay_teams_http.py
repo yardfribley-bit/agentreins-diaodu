@@ -1,9 +1,11 @@
 import base64
 import hashlib
 import json
+import socket
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
@@ -130,6 +132,44 @@ class TeamsHTTP(unittest.TestCase):
                                 'params': {'name': 'diaodu_' + name, 'arguments': args}}, sid)
         result = response['result']
         return result, json.loads(result['content'][0]['text'])
+
+    def test_disconnected_long_poll_releases_the_waiter(self):
+        status, view = self.req('GET', f'/v1/relay/teams/{self.sid}', role='w1')
+        self.assertEqual(status, 200)
+        cursor = view['session']['last_seq']
+        port = self.server.server_address[1]
+        sock = socket.create_connection(('127.0.0.1', port))
+        try:
+            token = self.actors['w1']['token']
+            sock.sendall((
+                f"GET /v1/relay/teams/{self.sid}/events?after={cursor}&wait=20 HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Authorization: Bearer {token}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with self.library.teams._condition:
+                    if self.library.teams._waiters:
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("long poll did not register")
+            sock.close()
+            sock = None
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                with self.library.teams._condition:
+                    if not self.library.teams._waiters:
+                        break
+                time.sleep(0.02)
+            else:
+                self.fail("waiter still held after the client disconnected")
+        finally:
+            if sock is not None:
+                sock.close()
+        self.assertEqual(self.library.teams._waiters, set())
 
     def test_visibility_between_workers(self):
         broadcast = self.send('mentor', 'instruction', '全体指令', 'inst-all')[1]['event']

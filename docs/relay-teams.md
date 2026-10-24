@@ -5,6 +5,7 @@
 ## 成员与席位
 
 - 一个团队会话有一个 owner（创建者，不占席位）、一个 mentor（指导席 seat 0）、最多 8 个 worker（seat 1..8，`DIAODU_RELAY_MAX_WORKERS` 可调）。
+- 长轮询名额与一对一分开计算，默认全局 256、单会话 32（`DIAODU_RELAY_MAX_WAITERS`、`DIAODU_RELAY_SESSION_WAITERS`）。一个满员团队不能把其他团队挤成 HTTP 429。`wait=0` 不占名额；超时、报错和客户端断开都会释放。
 - `create` 不再返回通用配对码。owner 通过邀请把链接发给具体的人，一席一码。
 
 ## 邀请

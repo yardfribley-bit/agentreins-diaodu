@@ -183,10 +183,95 @@ def _message_preview(db, session_id, table):
     return {"kind": kind, "created_at": _iso(row["created"]), "preview": _preview(text)}
 
 
+# Long polls (wait up to 20s) used to share one process-wide set of 32 slots
+# per store. Workbench tabs (static/relay.js) and agents hold a slot for the
+# whole wait, so a few busy Topic or Team sessions made every other session
+# get HTTP 429 「实时等待连接已达上限」. 256 is the per-store ceiling; Topic and
+# Team keep separate pools. The per-session cap stops one room from taking
+# that pool. Both are read from the environment when the store is constructed:
+#   DIAODU_RELAY_MAX_WAITERS      1..4096, default 256
+#   DIAODU_RELAY_SESSION_WAITERS  1..4096, default 32, never above the global cap
+# wait=0 does not register. Timeout, errors, and client disconnect always discard.
+DEFAULT_MAX_WAITERS = 256
+DEFAULT_SESSION_WAITERS = 32
+WAITER_HARD_CAP = 4096
+
+
+def _bounded_env_int(name, default, lower, upper):
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip(), 10)
+    except (TypeError, ValueError):
+        return default
+    if value < lower or value > upper:
+        return default
+    return value
+
+
+def _resolve_waiter_limits():
+    global_cap = _bounded_env_int(
+        "DIAODU_RELAY_MAX_WAITERS", DEFAULT_MAX_WAITERS, 1, WAITER_HARD_CAP)
+    session_cap = _bounded_env_int(
+        "DIAODU_RELAY_SESSION_WAITERS", DEFAULT_SESSION_WAITERS, 1, WAITER_HARD_CAP)
+    return global_cap, min(session_cap, global_cap)
+
+
+def _abandoned(probe):
+    """True when the long poll should drop its slot. A broken probe counts as gone."""
+    if probe is None:
+        return False
+    try:
+        return bool(probe())
+    except Exception:
+        return True
+
+
+def _long_poll_ready(result, wait, deadline, abandon):
+    """Return now, without taking (or while releasing) a waiter slot."""
+    if result["events"] or not wait or result["session"]["status"] == "closed":
+        return True
+    if time.monotonic() >= deadline:
+        return True
+    return _abandoned(abandon)
+
+
+def _claim_waiter(waiters, token, max_waiters, max_session_waiters):
+    """Register token=(session_id, identity) or raise AuthError 429.
+
+    Caller holds the store condition. One identity holds one slot per session,
+    so a second tab does not stack. The message names the cap that fired.
+    """
+    sid = token[0]
+    used = len(waiters)
+    session_used = sum(1 for item in waiters if item[0] == sid)
+    session_cap = max_session_waiters
+    global_left = max(0, max_waiters - used)
+    session_left = max(0, session_cap - session_used)
+    if token in waiters:
+        raise AuthError(
+            "该身份已有实时等待连接，请稍后重试"
+            f"（本会话 {session_used}/{session_cap}，全局 {used}/{max_waiters}）",
+            429)
+    if session_used >= session_cap:
+        raise AuthError(
+            "本会话实时等待已达上限，请稍后重试"
+            f"（本会话 {session_used}/{session_cap}，全局剩余 {global_left}/{max_waiters}）",
+            429)
+    if used >= max_waiters:
+        raise AuthError(
+            "实时等待连接已达上限，请稍后重试"
+            f"（全局剩余 {global_left}/{max_waiters}，本会话剩余 {session_left}/{session_cap}）",
+            429)
+    waiters.add(token)
+
+
 class Relay:
     MAX_EVENTS = 5000
     MAX_OPEN_SESSIONS = 20
-    MAX_WAITERS = 32
+    MAX_WAITERS = DEFAULT_MAX_WAITERS
+    MAX_SESSION_WAITERS = DEFAULT_SESSION_WAITERS
     PAGE_SIZE = 100
     INVITE_SECONDS = 30 * 60
     ONLINE_SECONDS = 60
@@ -214,6 +299,7 @@ class Relay:
         os.chmod(self.path, 0o600)
         self._condition = threading.Condition(threading.RLock())
         self._waiters = set()
+        self.MAX_WAITERS, self.MAX_SESSION_WAITERS = _resolve_waiter_limits()
         with self._write() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -464,33 +550,36 @@ class Relay:
                     "next_cursor": scanned[-1]["seq"] if scanned else after,
                     "has_more": len(rows) > self.PAGE_SIZE}
 
-    def public_events(self, token, after=0, wait=0):
+    def public_events(self, token, after=0, wait=0, abandon=None):
         if not isinstance(token, str) or not token or len(token) > 160:
             raise AuthError("公开视图不可用或已关闭", 404)
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after须为非负整数")
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or not 0 <= wait <= 20:
             raise ValueError("wait须为0至20秒")
-        waiter = ("public", hashlib.sha256(token.encode()).hexdigest())
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        waiter = None
         registered = False
         deadline = time.monotonic() + wait
         try:
             with self._condition:
                 while True:
                     result = self._public_page(token, after)
-                    if result["events"] or not wait or result["session"]["status"] == "closed" or time.monotonic() >= deadline:
+                    if _long_poll_ready(result, wait, deadline, abandon):
                         # Re-check the token after waiting: disabling or rotating must close it.
                         with self._read() as db:
-                            session = self._public_row(db, waiter[1])
+                            session = self._public_row(db, hashed)
                             result["session"] = self._public_view(db, session)
                         return result
                     if result["next_cursor"] > after:
                         after = result["next_cursor"]
                         continue
                     if not registered:
-                        if waiter in self._waiters or len(self._waiters) >= self.MAX_WAITERS:
-                            raise AuthError("实时等待连接已达上限，请稍后重试", 429)
-                        self._waiters.add(waiter)
+                        with self._read() as db:
+                            public_sid = self._public_row(db, hashed)["id"]
+                        # Share the member pool, but one public token is one slot.
+                        waiter = (public_sid, "public:" + hashed)
+                        _claim_waiter(self._waiters, waiter, self.MAX_WAITERS, self.MAX_SESSION_WAITERS)
                         registered = True
                     self._condition.wait(min(1.0, max(0, deadline - time.monotonic())))
         finally:
@@ -767,20 +856,20 @@ class Relay:
             return {"session": self._session(db, session, member), "events": [self._event(db, row) for row in batch],
                     "next_cursor": batch[-1]["seq"] if batch else after, "has_more": len(rows) > self.PAGE_SIZE}
 
-    def events(self, actor, sid, after=0, wait=0):
+    def events(self, actor, sid, after=0, wait=0, abandon=None):
         key = _actor(actor)
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after须为非负整数")
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or not 0 <= wait <= 20:
             raise ValueError("wait须为0至20秒")
-        token = (sid, key)
+        waiter = (sid, key)
         registered = False
         deadline = time.monotonic() + wait
         try:
             with self._condition:
                 while True:
                     result = self._page(actor, sid, after)
-                    if result["events"] or not wait or result["session"]["status"] == "closed" or time.monotonic() >= deadline:
+                    if _long_poll_ready(result, wait, deadline, abandon):
                         # A listening client is alive even when it never sends: refresh
                         # presence (60s throttle) before the final membership recheck.
                         self._touch(sid, key)
@@ -789,15 +878,13 @@ class Relay:
                             result["session"] = self._view(db, actor, sid)
                         return result
                     if not registered:
-                        if token in self._waiters or len(self._waiters) >= self.MAX_WAITERS:
-                            raise AuthError("实时等待连接已达上限，请稍后重试", 429)
-                        self._waiters.add(token)
+                        _claim_waiter(self._waiters, waiter, self.MAX_WAITERS, self.MAX_SESSION_WAITERS)
                         registered = True
                     self._condition.wait(min(1.0, max(0, deadline - time.monotonic())))
         finally:
             if registered:
                 with self._condition:
-                    self._waiters.discard(token)
+                    self._waiters.discard(waiter)
 
     def send(self, actor, sid, body):
         body = _body(body, {"kind", "text", "request_id", "reply_to", "attachments"})

@@ -1,4 +1,5 @@
-/* Public read-only relay view. Data is inserted with textContent only. */
+/* Public read-only relay view. Data is inserted with textContent only.
+   Polling uses wait=0 so visitors cannot take the members' long-poll slots. */
 (() => {
   'use strict';
   const parts = location.pathname.split('/').filter(Boolean);
@@ -96,7 +97,7 @@
     if (stopped || !token) { status.textContent = '公开链接无效。'; return; }
     try {
       const response = await fetch(base + '/v1/relay/public/' + encodeURIComponent(token) +
-                                   '/events?after=' + cursor + '&wait=20',
+                                   '/events?after=' + cursor + '&wait=0',
                                    {headers: {'Accept': 'application/json'}});
       if (response.status === 404) {
         stopped = true;
@@ -113,7 +114,7 @@
       const closed = data.session && data.session.status === 'closed';
       status.textContent = closed ? '会话已结束，这里只保留历史。' : '只读同步中 · 环境信息不展示';
       if (closed && !data.has_more) return;
-      setTimeout(poll, data.has_more ? 0 : 300);
+      setTimeout(poll, data.has_more ? 0 : 3000);
     } catch (error) {
       failures += 1;
       status.textContent = '连接中断，重试中…';

@@ -1,10 +1,14 @@
 import concurrent.futures
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from diaodu import relay_teams_mcp
 from diaodu.identity import AuthError
@@ -254,6 +258,72 @@ class TeamsTest(unittest.TestCase):
         with self.assertRaises(AuthError):
             self.send(self.worker1, "result", "结果", "same-id", to="all")
         self.assertFalse(first["duplicate"])
+
+    def test_waiter_cap_is_per_session_and_releases_on_abandon_or_error(self):
+        self.assertEqual((self.teams.MAX_WAITERS, self.teams.MAX_SESSION_WAITERS), (256, 32))
+        with patch.dict(os.environ, {"DIAODU_RELAY_MAX_WAITERS": "9", "DIAODU_RELAY_SESSION_WAITERS": "4"}):
+            tuned = RelayTeams(self.root / "tuned", max_workers=3)
+        self.assertEqual((tuned.MAX_WAITERS, tuned.MAX_SESSION_WAITERS), (9, 4))
+        self.teams.MAX_WAITERS = 8
+        self.teams.MAX_SESSION_WAITERS = 1
+        cursor = self.teams.get(self.worker1, self.sid)["session"]["last_seq"]
+        other = self.teams.create(self.owner, {"title": "另一队", "goal": "隔离"})["session"]["id"]
+        stop = threading.Event()
+
+        def abandon():
+            return stop.is_set()
+
+        def wait_for(count):
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with self.teams._condition:
+                    if len(self.teams._waiters) == count:
+                        return
+                time.sleep(0.005)
+            self.fail("long poll did not register")
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            try:
+                first = pool.submit(self.teams.events, self.worker1, self.sid, cursor, 20, abandon)
+                wait_for(1)
+                with self.assertRaises(AuthError) as caught:
+                    self.teams.events(self.worker2, self.sid, cursor, 1)
+                self.assertEqual(caught.exception.status, 429)
+                self.assertIn("本会话实时等待已达上限", str(caught.exception))
+                self.assertIn("全局剩余 7/8", str(caught.exception))
+                second = pool.submit(self.teams.events, self.owner, other, 0, 20, abandon)
+                wait_for(2)
+                held = {item[0] for item in self.teams._waiters}
+                self.assertEqual(held, {self.sid, other})
+                stop.set()
+                with self.teams._condition:
+                    self.teams._condition.notify_all()
+                self.assertEqual(first.result(timeout=2)["events"], [])
+                self.assertEqual(second.result(timeout=2)["events"], [])
+            finally:
+                stop.set()
+                with self.teams._condition:
+                    self.teams._condition.notify_all()
+        self.assertEqual(self.teams._waiters, set())
+
+        real_page = self.teams._page
+        state = {"armed": False}
+
+        def flaky(*args, **kwargs):
+            if state["armed"]:
+                raise RuntimeError("store failed")
+            return real_page(*args, **kwargs)
+
+        with patch.object(self.teams, "_page", side_effect=flaky):
+            with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                waiting = pool.submit(self.teams.events, self.mentor, self.sid, cursor, 20)
+                wait_for(1)
+                state["armed"] = True
+                with self.teams._condition:
+                    self.teams._condition.notify_all()
+                with self.assertRaises(RuntimeError):
+                    waiting.result(timeout=2)
+        self.assertEqual(self.teams._waiters, set())
 
     def test_team_storage_is_separate_from_one_to_one_relay(self):
         with self.teams._read() as db:

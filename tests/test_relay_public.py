@@ -2,6 +2,7 @@ import json
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
@@ -154,6 +155,10 @@ class RelayPublic(unittest.TestCase):
         with urlopen(self.base + '/relay-watch.js', timeout=10) as response:
             self.assertEqual(response.status, 200)
             self.assertIn('javascript', response.headers.get('Content-Type'))
+        script = (Path(__file__).resolve().parent.parent / 'static' / 'relay-watch.js').read_text()
+        self.assertIn('wait=0', script)
+        self.assertNotIn('wait=20', script)
+        self.assertIn('data.has_more ? 0 : 3000', script)
 
 
 if __name__ == '__main__':
