@@ -145,7 +145,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 try:
                     relay_http.join_document(self, library, parsed)
                 except AuthError as exc:
-                    self._json(exc.status, {"error": str(exc)})
+                    self._fail(exc)
                 except Exception as exc:
                     self._internal_error(exc)
                 return
@@ -370,7 +370,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     return
                 self._json(404, {"error": "没有这个地址"})
             except AuthError as exc:
-                self._json(exc.status, {"error": str(exc)})
+                self._fail(exc)
             except LookupError:
                 self._json(404, {"error": "没有这件任务"})
             except ValueError as exc:
@@ -402,7 +402,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     if not isinstance(body,dict):raise ValueError("JSON-RPC请求须为对象")
                     actor=self._actor(mutation=True) if self.headers.get("Authorization") or self.headers.get("Cookie") else None
                     base=(public_origin or ("http://"+self.headers.get("Host","localhost")))+library.public_base_path+"/v1"
-                    result,sid=mcp.handle(body,self.headers.get("Mcp-Session-Id"),actor,identity,library,base,lambda:identity.throttle(self.headers.get("X-Real-IP",self.client_address[0])))
+                    result,sid=mcp.handle(body,self.headers.get("Mcp-Session-Id"),actor,identity,library,base,lambda:identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]),limit=identity.CONNECT_LIMIT,scope="connect"))
                     if body.get('method') == 'tools/call' and str((body.get('params') or {}).get('name', '')).startswith(('diaodu_relay_', 'relay_')):
                         # A cookie/session or Bearer can expire during a long poll. Requests
                         # that authenticate only through the MCP session skip this recheck;
@@ -431,7 +431,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         self._json(200, {"csrf":csrf}, {"Set-Cookie":self._cookie(token)})
                     return
                 if parts == ["v1", "connect"]:
-                    identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]) if public_origin else self.client_address[0])
+                    identity.throttle(self.headers.get("X-Real-IP",self.client_address[0]) if public_origin else self.client_address[0],limit=identity.CONNECT_LIMIT,scope="connect")
                     body = self._body()
                     result = identity.connect(body.get("alias"),body.get("agent_type","访客"),body.get("member_kind","agent"),body.get("email"),body.get("contact_consent",False))
                     result["csrf"] = digest("csrf:"+result["token"])
@@ -592,7 +592,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     return
                 self._json(404, {"error": "没有这个地址"})
             except AuthError as exc:
-                self._json(exc.status,{"error":str(exc)})
+                self._fail(exc)
             except LibraryError as exc:
                 self._json(409, {"error": str(exc)})
             except LookupError as exc:
@@ -694,6 +694,13 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self.send_header(key,value)
             self.end_headers()
             if not getattr(self,"_head_only",False):self.wfile.write(data)
+
+        def _fail(self, exc):
+            """AuthError to JSON; 429 keeps the wait the caller needs to back off."""
+            payload={"error":str(exc)}
+            if getattr(exc,"retry_after",None) is not None:
+                payload["retry_after"]=exc.retry_after
+            self._json(exc.status,payload)
 
         def _internal_error(self, exc):
             """Log the detail server-side, return only a generic JSON error to the client."""

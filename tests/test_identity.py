@@ -186,3 +186,82 @@ class IdentityAPI(unittest.TestCase):
         self.assertEqual(status,403)
         status,_=self.req('POST',path+'/materials?name=bad.txt',raw=b'bad',agent=1)
         self.assertEqual(status,403)
+
+    def test_connect_and_login_use_separate_rate_limit_buckets(self):
+        for _ in range(45):
+            status, _body = self.req('POST', '/v1/connect', {'alias': '批量接入', 'agent_type': 'Dev'})
+            self.assertEqual(status, 201)
+        for _ in range(15):
+            status, _body = self.req('POST', '/v1/connect', {'alias': '批量接入', 'agent_type': 'Dev'})
+            self.assertEqual(status, 201)
+        status, body = self.req('POST', '/v1/connect', {'alias': '批量接入', 'agent_type': 'Dev'})
+        self.assertEqual(status, 429)
+        self.assertEqual(body['code'], 'rate_limited')
+        self.assertIsInstance(body['retry_after'], int)
+        self.assertGreater(body['retry_after'], 0)
+        self.assertIn('秒后重试', body['error'])
+
+        # The sign-in bucket must stay at the strict 20 and be unaffected by connect.
+        for _ in range(20):
+            status, _body = self.req('POST', '/v1/auth/login',
+                                     {'username': 'person0', 'password': 'a-secure-password'})
+            self.assertEqual(status, 200)
+        status, body = self.req('POST', '/v1/auth/login',
+                                {'username': 'person0', 'password': 'a-secure-password'})
+        self.assertEqual(status, 429)
+        self.assertIsInstance(body['retry_after'], int)
+
+
+class RateLimitBuckets(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.identity = Identity(Path(self.tmp.name) / 'identity.sqlite3', '')
+        self.key = '203.0.113.9'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def count(self, stored):
+        with self.identity.db() as db:
+            row = db.execute('SELECT count FROM attempts WHERE key=?', (stored,)).fetchone()
+        return row['count'] if row else 0
+
+    def test_connect_allows_sixty_then_rejects_with_retry_after(self):
+        for _ in range(45):
+            self.identity.throttle(self.key, limit=self.identity.CONNECT_LIMIT, scope='connect')
+        for _ in range(15):
+            self.identity.throttle(self.key, limit=self.identity.CONNECT_LIMIT, scope='connect')
+        with self.assertRaises(AuthError) as caught:
+            self.identity.throttle(self.key, limit=self.identity.CONNECT_LIMIT, scope='connect')
+        error = caught.exception
+        self.assertEqual(error.status, 429)
+        self.assertIsInstance(error.retry_after, int)
+        self.assertTrue(0 < error.retry_after <= self.identity.WINDOW)
+        self.assertIn(f'{error.retry_after} 秒后重试', str(error))
+
+    def test_auth_bucket_still_allows_twenty(self):
+        for _ in range(20):
+            self.identity.throttle(self.key)
+        with self.assertRaises(AuthError) as caught:
+            self.identity.throttle(self.key)
+        self.assertEqual(caught.exception.status, 429)
+
+    def test_buckets_have_independent_quota(self):
+        for _ in range(20):
+            self.identity.throttle(self.key)
+        for _ in range(60):
+            self.identity.throttle(self.key, limit=self.identity.CONNECT_LIMIT, scope='connect')
+        with self.assertRaises(AuthError):
+            self.identity.throttle(self.key)
+        with self.assertRaises(AuthError):
+            self.identity.throttle(self.key, limit=self.identity.CONNECT_LIMIT, scope='connect')
+
+    def test_rejected_attempt_is_not_counted_and_does_not_extend_window(self):
+        for _ in range(20):
+            self.identity.throttle(self.key)
+        with self.assertRaises(AuthError) as first:
+            self.identity.throttle(self.key)
+        with self.assertRaises(AuthError) as later:
+            self.identity.throttle(self.key)
+        self.assertEqual(self.count('auth:' + self.key), 20)
+        self.assertLessEqual(later.exception.retry_after, first.exception.retry_after)

@@ -147,4 +147,6 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
   else:return {'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'Method not found'}},None
   return {'jsonrpc':'2.0','id':rid,'result':result},None
  except (AuthError,ValueError,LookupError,LibraryError) as exc:
-  return {'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':json.dumps({'code':getattr(exc,'status',400),'message':str(exc)},ensure_ascii=False)}],'isError':True}},None
+  payload={'code':getattr(exc,'status',400),'message':str(exc)}
+  if getattr(exc,'retry_after',None) is not None:payload['retry_after']=exc.retry_after
+  return {'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':json.dumps(payload,ensure_ascii=False)}],'isError':True}},None
