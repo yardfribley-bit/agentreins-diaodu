@@ -20,11 +20,20 @@ sys.path.insert(0, str(ROOT / "agents" / "linux-worker"))
 from diaodu.identity import Identity  # noqa: E402
 from diaodu.library import Library  # noqa: E402
 from diaodu.server import make_handler  # noqa: E402
-from linux_worker.config import Config, ConfigError, load_config, parse_allowlist  # noqa: E402
+from linux_worker.config import (  # noqa: E402
+    DEFAULT_MAX_STEPS,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_SEARCH_URL,
+    Config,
+    ConfigError,
+    load_config,
+    parse_allowlist,
+)
 from linux_worker.hub import CredentialsError, HubClient  # noqa: E402
+from linux_worker.loop import account_turn, system_prompt  # noqa: E402
 from linux_worker.redact import RedactingFilter, redact  # noqa: E402
 from linux_worker.safety import Policy, decide  # noqa: E402
-from linux_worker.search import SearchClient  # noqa: E402
+from linux_worker.search import SearchClient, _results_from_html  # noqa: E402
 from linux_worker.state import State, StateError  # noqa: E402
 from linux_worker.tools import Tools, clean_shell_env  # noqa: E402
 from linux_worker.worker import Worker  # noqa: E402
@@ -33,8 +42,9 @@ import linux_worker.hub as hub_module  # noqa: E402
 API_KEY = "sk-test-secret-value"
 ENV_KEYS = (
     "HUB_BASE_URL", "AGENT_ALIAS", "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
-    "WORKSPACE_DIR", "STATE_FILE", "TEAM_INVITE_CODE", "TARGET_ALLOWLIST",
+    "WORKSPACE_DIR", "STATE_FILE", "TEAM_INVITE_CODE", "TOPIC_INVITE_CODE", "TARGET_ALLOWLIST",
     "SEARCH_BACKEND", "SEARCH_URL", "SEARCH_BASE_URL", "SEARCH_API_KEY", "SEARCH_MODEL",
+    "LLM_FALLBACK_MODEL",
     "MAX_STEPS", "MAX_TOKENS", "SHELL_TIMEOUT", "SHELL_OUTPUT_LIMIT", "RELAY_WAIT",
     "ERROR_SLEEP", "LLM_MAX_OUTPUT", "SHELL_USER", "LINUX_WORKER_CONFIG",
 )
@@ -103,7 +113,13 @@ class ScriptedHandler(BaseHTTPRequestHandler):
         if not self.server.responses:
             self._send(500, {"error": "no scripted response"})
             return
-        self._send(200, self.server.responses.pop(0))
+        item = self.server.responses.pop(0)
+        if isinstance(item, dict) and "_http_status" in item:
+            status = item["_http_status"]
+            body = {key: value for key, value in item.items() if key != "_http_status"}
+            self._send(status, body)
+            return
+        self._send(200, item)
 
     def _send(self, status, payload):
         data = json.dumps(payload).encode()
@@ -269,6 +285,10 @@ class ConfigTests(unittest.TestCase):
         os.chmod(wide_state, 0o644)
         with self.assertRaises(StateError):
             State(wide_state).load()
+        saved_env = {key: os.environ.pop(key) for key in (
+            "SEARCH_URL", "MAX_STEPS", "MAX_TOKENS", "LLM_FALLBACK_MODEL", "TOPIC_INVITE_CODE",
+        ) if key in os.environ}
+        self.addCleanup(lambda: os.environ.update(saved_env))
         cfg = Config({
             "HUB_BASE_URL": "https://www.chuhaijian.com/task",
             "AGENT_ALIAS": "demo",
@@ -279,16 +299,87 @@ class ConfigTests(unittest.TestCase):
             "STATE_FILE": str(directory / "state.json"),
         })
         self.assertNotIn(API_KEY, repr(cfg))
+        self.assertEqual(cfg.search_url, DEFAULT_SEARCH_URL)
+        legacy = Config({
+            "HUB_BASE_URL": "https://www.chuhaijian.com/task",
+            "AGENT_ALIAS": "demo",
+            "LLM_BASE_URL": "https://aigc.gether.net/v1",
+            "LLM_API_KEY": API_KEY,
+            "LLM_MODEL": "claude-sonnet-4-6",
+            "SEARCH_URL": "https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1",
+            "WORKSPACE_DIR": str(directory / "workspace"),
+            "STATE_FILE": str(directory / "state.json"),
+        })
+        self.assertEqual(legacy.search_url, DEFAULT_SEARCH_URL)
+        self.assertIn("cn.bing.com", cfg.search_url)
+        self.assertIn("{query}", cfg.search_url)
+        self.assertEqual(cfg.max_steps, DEFAULT_MAX_STEPS)
+        self.assertEqual(cfg.max_steps, 40)
+        self.assertEqual(cfg.max_tokens, DEFAULT_MAX_TOKENS)
+        self.assertGreaterEqual(cfg.max_tokens, 80000)
+        self.assertEqual(cfg.fallback_model, "")
+        self.assertEqual(cfg.topic_invite, "")
+        prompt = system_prompt(cfg, 1)
+        self.assertIn("stdout", prompt)
+        self.assertIn("不要只写", prompt)
         with self.assertRaises(ConfigError):
             parse_allowlist("*")
 
 
+class BudgetTests(unittest.TestCase):
+    def test_inflated_total_tokens_are_not_summed(self):
+        message = {"role": "assistant", "content": "ok"}
+        payload = {"usage": {"total_tokens": 180000}}
+        incremental, prior, context = account_turn(message, payload, 800, None)
+        self.assertLess(incremental, 1000)
+        self.assertIsNone(context)
+        self.assertEqual(prior, 180000)
+        incremental, prior, context = account_turn(
+            message, {"usage": {"total_tokens": 260000}}, 800, prior
+        )
+        self.assertLess(incremental, 1000)
+        self.assertIsNone(context)
+
+    def test_modest_total_still_acts_as_a_context_ceiling(self):
+        message = {"role": "assistant", "content": "ok"}
+        incremental, prior, context = account_turn(message, {"usage": {"total_tokens": 500}}, 400, None)
+        self.assertEqual(context, 500)
+        self.assertEqual(prior, 500)
+        self.assertLess(incremental, 500)
+
+    def test_plausible_completion_tokens_are_charged_once(self):
+        message = {"role": "assistant", "content": "nmap done"}
+        incremental, _prior, context = account_turn(
+            message,
+            {"usage": {"completion_tokens": 30, "total_tokens": 90000}},
+            800,
+            None,
+        )
+        self.assertEqual(incremental, 30)
+        self.assertIsNone(context)
+
+
+class SearchHtmlTests(unittest.TestCase):
+    def test_bing_result_cards_keep_title_url_and_snippet(self):
+        html = """
+        <li class="b_algo">
+          <h2><a href="https://example.com/doc">北京文档</a></h2>
+          <p>bing-marker 摘要</p>
+        </li>
+        """
+        rows = _results_from_html(html, 5)
+        self.assertEqual(rows[0]["title"], "北京文档")
+        self.assertEqual(rows[0]["url"], "https://example.com/doc")
+        self.assertIn("bing-marker", rows[0]["snippet"])
+
+
 class HubSourceTests(unittest.TestCase):
-    def test_client_does_not_call_the_task_board_or_one_to_one_relay(self):
+    def test_client_does_not_call_the_task_board(self):
         source = Path(hub_module.__file__).read_text(encoding="utf-8")
         self.assertNotIn("/tasks", source)
-        self.assertNotIn("relay/sessions", source)
         self.assertIn("relay/teams", source)
+        self.assertIn("/relay/join", source)
+        self.assertIn("relay/sessions", source)
 
     def test_install_scripts_parse(self):
         root = ROOT / "agents" / "linux-worker"
@@ -594,6 +685,141 @@ class WorkerFlowTests(unittest.TestCase):
         self.assertEqual(posted["auth"], "Bearer " + API_KEY)
         self.assertEqual(posted["body"]["query"], "hub contract")
         self.assertNotIn(API_KEY, json.dumps(posted["body"]))
+
+    def test_inflated_usage_still_finishes_a_short_shell(self):
+        self.script.responses = [
+            tool_response("run_shell", {"command": "echo hostname-marker"}, "call-host", tokens=250000),
+            tool_response("finish", {"text": "扫描结束"}, "call-done", tokens=250000),
+        ]
+        cfg = self.config(
+            TEAM_INVITE_CODE=self.worker_invite(),
+            MAX_TOKENS="80000",
+            MAX_STEPS="40",
+            AGENT_ALIAS="short-shell",
+        )
+        worker = Worker(cfg)
+        worker.ensure_identity()
+        worker.ensure_seat()
+        self.req(
+            "POST", f"/v1/relay/teams/{self.sid}/messages",
+            {"kind": "instruction", "text": "请执行 hostname", "request_id": "inst-short"},
+            self.mentor["token"],
+        )
+        worker.poll_once()
+        self.assertEqual(len(self.script.seen), 2)
+        results = [event["message"]["text"] for event in self.events(self.mentor["token"])
+                   if event.get("kind") == "message" and event["message"]["kind"] == "result"]
+        self.assertTrue(results)
+        self.assertIn("hostname-marker", results[0])
+        self.assertNotIn("令牌上限", results[0])
+        self.assertNotIn("步数上限", results[0])
+
+    def test_quota_error_uses_fallback_model_once(self):
+        self.script.responses = [
+            {
+                "_http_status": 403,
+                "error": {
+                    "message": "You exceeded your current quota",
+                    "type": "insufficient_quota",
+                    "code": "insufficient_user_quota",
+                },
+            },
+            tool_response("run_shell", {"command": "echo fallback-ok"}, "call-fb"),
+            tool_response("finish", {"text": "备用模型完成"}, "call-done"),
+        ]
+        cfg = self.config(
+            TEAM_INVITE_CODE=self.worker_invite(),
+            LLM_FALLBACK_MODEL="gpt-5.4-mini",
+            AGENT_ALIAS="fallback",
+        )
+        worker = Worker(cfg)
+        worker.ensure_identity()
+        worker.ensure_seat()
+        self.req(
+            "POST", f"/v1/relay/teams/{self.sid}/messages",
+            {"kind": "instruction", "text": "跑一条命令", "request_id": "inst-fb"},
+            self.mentor["token"],
+        )
+        worker.poll_once()
+        chat = [item for item in self.script.seen if item["path"] == "/v1/chat/completions"]
+        self.assertEqual(chat[0]["body"]["model"], "claude-sonnet-4-6")
+        self.assertEqual(chat[1]["body"]["model"], "gpt-5.4-mini")
+        self.assertNotIn(API_KEY, json.dumps(chat[0]["body"]))
+        texts = [event["message"]["text"] for event in self.events(self.mentor["token"])
+                 if event.get("kind") == "message"]
+        self.assertTrue(any("fallback-ok" in text for text in texts))
+        self.assertTrue(any("gpt-5.4-mini" in text for text in texts))
+
+    def test_quota_without_fallback_posts_a_clear_result(self):
+        self.script.responses = [
+            {
+                "_http_status": 403,
+                "error": {"message": "insufficient_user_quota", "code": "insufficient_user_quota"},
+            },
+            tool_response("finish", {"text": "不应该执行"}, "call-nope"),
+        ]
+        cfg = self.config(TEAM_INVITE_CODE=self.worker_invite(), AGENT_ALIAS="no-fallback")
+        worker = Worker(cfg)
+        worker.ensure_identity()
+        worker.ensure_seat()
+        self.req(
+            "POST", f"/v1/relay/teams/{self.sid}/messages",
+            {"kind": "instruction", "text": "不要空转", "request_id": "inst-quota"},
+            self.mentor["token"],
+        )
+        worker.poll_once()
+        self.assertEqual(len(self.script.seen), 1)
+        results = [event["message"]["text"] for event in self.events(self.mentor["token"])
+                   if event.get("kind") == "message" and event["message"]["kind"] == "result"]
+        self.assertTrue(any("额度不足" in text for text in results))
+        self.assertTrue(any("LLM_FALLBACK_MODEL" in text for text in results))
+
+    def test_topic_instruction_runs_shell_and_posts_result(self):
+        status, created = self.req(
+            "POST", "/v1/relay/sessions",
+            {"title": "一对一", "goal": "看主机名"},
+            self.owner["token"],
+        )
+        self.assertEqual(status, 201, created)
+        topic_sid = created["session"]["id"]
+        self.script.responses = [
+            tool_response("run_shell", {"command": "echo topic-marker"}, "call-topic"),
+            tool_response("finish", {"text": "好了"}, "call-done"),
+        ]
+        cfg = self.config(
+            TEAM_INVITE_CODE="",
+            TOPIC_INVITE_CODE=created["topic_code"],
+            AGENT_ALIAS="topic-worker",
+            STATE_FILE=str(self.root / "topic-state.json"),
+            WORKSPACE_DIR=str(self.root / "topic-workspace"),
+        )
+        worker = Worker(cfg)
+        worker.ensure_identity()
+        worker.ensure_channels()
+        self.assertFalse(worker.state.session_id)
+        self.assertEqual(worker.state.topic_session_id, topic_sid)
+        sent = self.req(
+            "POST", f"/v1/relay/sessions/{topic_sid}/messages",
+            {"kind": "instruction", "text": "请输出标记", "request_id": "inst-topic"},
+            self.owner["token"],
+        )
+        self.assertEqual(sent[0], 200, sent[1])
+        self.assertFalse(worker.poll_topic_once())
+        status, data = self.req(
+            "GET", f"/v1/relay/sessions/{topic_sid}/events?after=0&wait=0",
+            token=self.owner["token"],
+        )
+        self.assertEqual(status, 200, data)
+        messages = [event["message"] for event in data["events"] if event.get("kind") == "message"]
+        result = next(item for item in messages if item["kind"] == "result")
+        self.assertIn("topic-marker", result["text"])
+        self.assertIn("好了", result["text"])
+        self.assertEqual(result["reply_to"], sent[1]["event"]["seq"])
+        note = next(item for item in messages if item["kind"] == "note")
+        self.assertIn("claude-sonnet-4-6", note["text"])
+        saved = json.loads((self.root / "topic-state.json").read_text(encoding="utf-8"))
+        self.assertNotIn(created["topic_code"], json.dumps(saved))
+        self.assertEqual(saved["topic_session_id"], topic_sid)
 
 
 if __name__ == "__main__":

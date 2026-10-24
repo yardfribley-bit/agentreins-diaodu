@@ -58,11 +58,33 @@ if [[ ! -f "$ENV_FILE" ]]; then
   chown root:root "$ENV_FILE"
   chmod 0600 "$ENV_FILE"
   echo "已写入 ${ENV_FILE}"
-  echo "请编辑其中的 LLM_API_KEY、LLM_MODEL、TEAM_INVITE_CODE 和 TARGET_ALLOWLIST。"
+  echo "请编辑其中的 LLM_API_KEY、LLM_MODEL、TEAM_INVITE_CODE 或 TOPIC_INVITE_CODE，以及 TARGET_ALLOWLIST。"
 else
   chmod 0600 "$ENV_FILE"
   echo "保留已有配置 ${ENV_FILE}"
 fi
+
+# The cn-bj2 test failed on the original example values. Rewrite only those
+# exact lines so an existing VM picks up the new defaults on reinstall.
+ENV_FILE="$ENV_FILE" python3 - <<'PY'
+import os
+from pathlib import Path
+path = Path(os.environ["ENV_FILE"])
+text = path.read_text(encoding="utf-8")
+old_search = "SEARCH_URL=https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1"
+new_search = "SEARCH_URL=https://cn.bing.com/search?q={query}"
+updated = text.replace(old_search, new_search)
+lines = []
+for line in updated.splitlines(keepends=True):
+    if line.strip() == "MAX_STEPS=16":
+        line = "MAX_STEPS=40" + ("\n" if line.endswith("\n") else "")
+    lines.append(line)
+new = "".join(lines)
+if new != text:
+    path.write_text(new, encoding="utf-8")
+    os.chmod(path, 0o600)
+    print("已把旧的 DuckDuckGo 搜索地址或 MAX_STEPS=16 更新为当前默认值")
+PY
 
 sed -e "s|__USER__|${USER_NAME}|g" -e "s|__HOME__|${HOME_DIR}|g" -e "s|__ENV__|${ENV_FILE}|g" \
   "${SRC}/linux-worker.service.in" > "/etc/systemd/system/${UNIT}"
@@ -75,9 +97,15 @@ fi
 systemctl daemon-reload
 systemctl enable "$UNIT"
 
-if grep -Eq '^LLM_API_KEY=.+' "$ENV_FILE" && grep -Eq '^TEAM_INVITE_CODE=.+' "$ENV_FILE"; then
+key_set=0
+team_set=0
+topic_set=0
+if grep -Eq '^LLM_API_KEY=.+' "$ENV_FILE"; then key_set=1; fi
+if grep -Eq '^TEAM_INVITE_CODE=.+' "$ENV_FILE"; then team_set=1; fi
+if grep -Eq '^TOPIC_INVITE_CODE=.+' "$ENV_FILE"; then topic_set=1; fi
+if [[ "$key_set" -eq 1 && ( "$team_set" -eq 1 || "$topic_set" -eq 1 ) ]]; then
   systemctl restart "$UNIT"
   echo "已启动 ${UNIT}"
 else
-  echo "服务已安装但未启动：${ENV_FILE} 里的 LLM_API_KEY 或 TEAM_INVITE_CODE 仍为空。"
+  echo "服务已安装但未启动：${ENV_FILE} 里的 LLM_API_KEY 仍为空，或团队邀请与 Topic 码都为空。"
 fi

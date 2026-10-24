@@ -103,7 +103,7 @@ class Tools:
         return [
             _schema(
                 "run_shell",
-                "在工作区执行一条 shell 命令。网络目标必须落在操作者配置的允许范围内。命令有超时，输出会被截断。",
+                "在工作区执行一条 shell 命令。网络目标必须落在操作者配置的允许范围内。命令有超时，输出会被截断。返回的 stdout/stderr 要写进 finish。",
                 {
                     "command": {"type": "string"},
                     "timeout": {"type": "integer", "description": "秒，不超过配置上限"},
@@ -133,7 +133,7 @@ class Tools:
             ),
             _schema(
                 "web_search",
-                "用已配置的搜索后端查询公开网页，返回标题、链接和摘要。",
+                "用已配置的搜索后端查询公开网页，返回标题、链接和摘要。finish 时要带上这些字段，不要只说搜过了。",
                 {"query": {"type": "string"}},
                 ["query"],
             ),
@@ -151,7 +151,7 @@ class Tools:
             ),
             _schema(
                 "finish",
-                "结束本条指令，把最终结果和可选的工作区附件交给导师。",
+                "结束本条指令。text 必须包含具体结果：命令、退出码、stdout/stderr 的关键原文，或搜索结果的标题、链接和摘要。不要只写「完成」。可选附件是工作区相对路径。",
                 {
                     "text": {"type": "string"},
                     "attachments": {"type": "array", "items": {"type": "string"}},
@@ -241,6 +241,7 @@ class Tools:
             return json.dumps(
                 {
                     "ok": False,
+                    "command": redact(command, self.secrets)[:500],
                     "error": "命令超时",
                     "stdout": stdout,
                     "stderr": stderr,
@@ -253,6 +254,7 @@ class Tools:
         return json.dumps(
             {
                 "ok": proc.returncode == 0,
+                "command": redact(command, self.secrets)[:500],
                 "exit_code": proc.returncode,
                 "stdout": stdout,
                 "stderr": stderr,
@@ -332,11 +334,10 @@ class Tools:
         if not host:
             return "URL 缺少主机"
         hub = urlsplit(self.config.hub_base)
-        if (
-            host == hub.hostname
-            and "/relay/teams/" in parsed.path
-            and "/files/" in parsed.path
-        ):
+        relay_file = "/files/" in parsed.path and (
+            "/relay/teams/" in parsed.path or "/relay/sessions/" in parsed.path
+        )
+        if host == hub.hostname and relay_file:
             return None
         if not self.policy.allows(host):
             return f"目标不在允许范围内：{host}"

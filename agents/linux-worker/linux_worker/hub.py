@@ -1,4 +1,7 @@
-"""Small Hub client for connect plus the team relay. No task-board calls."""
+"""Small Hub client for connect, team relay, and optional 1:1 Topic relay.
+
+No task-board calls.
+"""
 
 from __future__ import annotations
 
@@ -97,8 +100,65 @@ class HubClient:
         )
 
     def team_upload(self, sid: str, name: str, content: bytes) -> dict:
-        path = "/relay/teams/" + quote(sid, safe="") + "/files?name=" + quote(name)
+        return self._upload("/relay/teams/", sid, name, content)
+
+    def join_topic(self, code: str, environment: dict) -> dict:
+        return self.request(
+            "/relay/join",
+            {"code": code, "role": "worker", "environment": environment},
+            idempotent=False,
+        )
+
+    def topic_get(self, sid: str) -> dict:
+        return self.request(self._topic(sid))
+
+    def topic_events(self, sid: str, after: int, wait: int) -> dict:
+        query = urlencode({"after": after, "wait": wait})
+        return self.request(self._topic(sid) + "/events?" + query, timeout=max(10, wait + 10))
+
+    def topic_send(
+        self,
+        sid: str,
+        kind: str,
+        text: str,
+        request_id: str,
+        reply_to: int | None = None,
+        attachments: list[str] | None = None,
+    ) -> dict:
+        return self._send(self._topic(sid) + "/messages", kind, text, request_id, reply_to, attachments)
+
+    def topic_ack(self, sid: str, seq: int) -> dict:
+        return self.request(self._topic(sid) + "/ack", {"seq": seq})
+
+    def topic_heartbeat(self, sid: str, environment: dict) -> dict:
+        return self.request(self._topic(sid) + "/heartbeat", {"environment": environment})
+
+    def topic_upload(self, sid: str, name: str, content: bytes) -> dict:
+        return self._upload("/relay/sessions/", sid, name, content)
+
+    @staticmethod
+    def _topic(sid: str) -> str:
+        return "/relay/sessions/" + quote(sid, safe="")
+
+    def _upload(self, prefix: str, sid: str, name: str, content: bytes) -> dict:
+        path = prefix + quote(sid, safe="") + "/files?name=" + quote(name)
         return self.request(path, raw=content, idempotent=False)
+
+    def _send(
+        self,
+        path: str,
+        kind: str,
+        text: str,
+        request_id: str,
+        reply_to: int | None,
+        attachments: list[str] | None,
+    ) -> dict:
+        body: dict = {"kind": kind, "text": text, "request_id": request_id}
+        if reply_to is not None:
+            body["reply_to"] = reply_to
+        if attachments:
+            body["attachments"] = attachments
+        return self.request(path, body)
 
     def request(self, path: str, body=None, raw: bytes | None = None, timeout: int = 30, idempotent: bool = True):
         if not path.startswith("/") or path.startswith("//"):

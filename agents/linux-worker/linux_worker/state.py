@@ -22,6 +22,9 @@ class State:
         self.cursor = 0
         self.handled: dict[str, str] = {}
         self.announced = False
+        self.topic_session_id = ""
+        self.topic_cursor = 0
+        self.topic_announced = False
         self.progress_n = 0
 
     def load(self) -> "State":
@@ -46,6 +49,12 @@ class State:
         handled = data.get("handled") or {}
         self.handled = {str(key): str(value) for key, value in handled.items()} if isinstance(handled, dict) else {}
         self.announced = bool(data.get("announced"))
+        self.topic_session_id = str(data.get("topic_session_id") or "")
+        topic_cursor = data.get("topic_cursor", 0)
+        self.topic_cursor = (
+            topic_cursor if isinstance(topic_cursor, int) and not isinstance(topic_cursor, bool) and topic_cursor >= 0 else 0
+        )
+        self.topic_announced = bool(data.get("topic_announced"))
         progress_n = data.get("progress_n", 0)
         self.progress_n = progress_n if isinstance(progress_n, int) and progress_n >= 0 else 0
         return self
@@ -68,6 +77,9 @@ class State:
             "cursor": self.cursor,
             "handled": self.handled,
             "announced": self.announced,
+            "topic_session_id": self.topic_session_id,
+            "topic_cursor": self.topic_cursor,
+            "topic_announced": self.topic_announced,
             "progress_n": self.progress_n,
         }
         fd, name = tempfile.mkstemp(prefix=".state-", dir=str(path.parent))

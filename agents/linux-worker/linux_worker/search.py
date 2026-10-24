@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from html import unescape
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -17,6 +19,17 @@ class SearchError(Exception):
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, newurl):
         return None
+
+
+# Bing serves a results page to a browser UA and a challenge to a short one.
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_TAG = re.compile(r"<[^>]+>")
+_BING_ALGO = re.compile(r'<li[^>]*class="[^"]*\bb_algo\b[^"]*"[^>]*>(.*?)</li>', re.I | re.S)
+_BING_LINK = re.compile(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.I | re.S)
+_BING_SNIP = re.compile(r"<p[^>]*>(.*?)</p>", re.I | re.S)
 
 
 def _clip(text: str, limit: int = 400) -> str:
@@ -96,6 +109,36 @@ def _results_from_json(payload: dict, limit: int) -> list[dict]:
     return []
 
 
+def _strip_tags(html: str) -> str:
+    text = _TAG.sub(" ", html or "")
+    return _clip(unescape(text), 400)
+
+
+def _results_from_html(body: str, limit: int) -> list[dict]:
+    """Pull Bing result cards out of HTML. Other pages fall back to visible text."""
+    found = []
+    for block in _BING_ALGO.findall(body or ""):
+        link = _BING_LINK.search(block)
+        if not link:
+            continue
+        snippet = ""
+        para = _BING_SNIP.search(block)
+        if para:
+            snippet = _strip_tags(para.group(1))
+        found.append(
+            {
+                "title": _strip_tags(link.group(2)),
+                "url": unescape(link.group(1)),
+                "snippet": snippet,
+            }
+        )
+        if len(found) >= limit:
+            break
+    if found:
+        return found
+    return _html_snippet(body)[:limit]
+
+
 def _html_snippet(body: str) -> list[dict]:
     text = []
     skip = False
@@ -135,7 +178,11 @@ class SearchClient:
     def _http(self, query: str, limit: int) -> list[dict]:
         url = self.config.search_url.replace("{query}", quote(query))
         self._check_url(url)
-        headers = {"Accept": "application/json, text/html;q=0.5", "User-Agent": "linux-worker/0.1"}
+        headers = {
+            "Accept": "text/html,application/json;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
+            "User-Agent": _BROWSER_UA,
+        }
         if self.config.search_api_key:
             headers["Authorization"] = "Bearer " + self.config.search_api_key
         request = Request(url, headers=headers)
@@ -149,7 +196,7 @@ class SearchClient:
                 return _results_from_json(parsed, limit)
             if isinstance(parsed, list):
                 return _results_from_json({"results": parsed}, limit)
-        return _html_snippet(payload.decode(errors="replace"))[:limit]
+        return _results_from_html(payload.decode(errors="replace"), limit)
 
     def _openai(self, query: str, limit: int) -> list[dict]:
         base = self.config.search_base.rstrip("/")

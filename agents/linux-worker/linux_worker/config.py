@@ -15,6 +15,17 @@ class ConfigError(Exception):
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
+# cn.bing.com answers from Beijing without an API key. DuckDuckGo's instant-answer
+# host did not. Operators can still override SEARCH_URL.
+DEFAULT_SEARCH_URL = "https://cn.bing.com/search?q={query}"
+# First cut of the example. Unreachable from Beijing; still accepted if an
+# operator writes any other URL, but this exact value follows the new default.
+_LEGACY_SEARCH_URL = "https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1"
+DEFAULT_MAX_STEPS = 40
+# Ceiling on new text (model output plus tool results), not the sum of each
+# response's total_tokens. See loop.account_turn.
+DEFAULT_MAX_TOKENS = 200_000
+
 
 def _remote_https(url: str, label: str) -> str:
     parsed = urlsplit(url)
@@ -135,12 +146,14 @@ class Config:
             raise ConfigError("工作区不能是 /")
         self.state_file = Path(pick("STATE_FILE", str(self.workspace.parent / "state.json"))).expanduser()
         self.invite = pick("TEAM_INVITE_CODE", "")
+        self.topic_invite = pick("TOPIC_INVITE_CODE", "")
         self.allowlist = parse_allowlist(pick("TARGET_ALLOWLIST", ""))
         self.search_backend = pick("SEARCH_BACKEND", "http").strip().lower()
         if self.search_backend not in ("http", "openai"):
             raise ConfigError("SEARCH_BACKEND 只能是 http 或 openai")
-        default_search = "https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1"
-        self.search_url = pick("SEARCH_URL", default_search)
+        self.search_url = pick("SEARCH_URL", DEFAULT_SEARCH_URL)
+        if self.search_url == _LEGACY_SEARCH_URL:
+            self.search_url = DEFAULT_SEARCH_URL
         if self.search_backend == "http" and "{query}" not in self.search_url:
             raise ConfigError("SEARCH_URL 必须包含 {query}")
         self.search_base = pick("SEARCH_BASE_URL", "")
@@ -150,8 +163,11 @@ class Config:
             self.search_base = _remote_https(self.search_base, "SEARCH_BASE_URL")
         self.search_api_key = pick("SEARCH_API_KEY", "")
         self.search_model = pick("SEARCH_MODEL", self.model)
-        self.max_steps = _int(pick("MAX_STEPS", "16"), "MAX_STEPS", 1, 100)
-        self.max_tokens = _int(pick("MAX_TOKENS", "80000"), "MAX_TOKENS", 100, 2_000_000)
+        self.fallback_model = pick("LLM_FALLBACK_MODEL", "").strip()
+        if self.fallback_model and (len(self.fallback_model) > 120 or any(ch.isspace() for ch in self.fallback_model)):
+            raise ConfigError("LLM_FALLBACK_MODEL 必须是 1 到 120 字符，且不能含空白")
+        self.max_steps = _int(pick("MAX_STEPS", str(DEFAULT_MAX_STEPS)), "MAX_STEPS", 1, 100)
+        self.max_tokens = _int(pick("MAX_TOKENS", str(DEFAULT_MAX_TOKENS)), "MAX_TOKENS", 100, 2_000_000)
         self.shell_timeout = _int(pick("SHELL_TIMEOUT", "120"), "SHELL_TIMEOUT", 1, 300)
         self.shell_output_limit = _int(pick("SHELL_OUTPUT_LIMIT", "16000"), "SHELL_OUTPUT_LIMIT", 200, 100_000)
         self.relay_wait = _int(pick("RELAY_WAIT", "20"), "RELAY_WAIT", 0, 20)

@@ -26,15 +26,18 @@ def configure_logging(secrets: list[str]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="AgentReins Linux 执行端（只加入团队席位）")
+    parser = argparse.ArgumentParser(description="AgentReins Linux 执行端（团队席位或一对一 Topic）")
     parser.add_argument("--config", type=Path, help="KEY=VALUE 配置文件，权限须为 0600")
     parser.add_argument("--once", action="store_true", help="处理当前已到达的事件后退出")
     parser.add_argument("--invite", help="团队邀请码，只在本次进程使用，不写入日志")
+    parser.add_argument("--topic-invite", help="一对一 Topic 码，只在本次进程使用，不写入日志")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
         if args.invite:
             config.invite = args.invite.strip()
+        if args.topic_invite:
+            config.topic_invite = args.topic_invite.strip()
         configure_logging(config.secret_values())
         worker = Worker(config)
         if args.once:

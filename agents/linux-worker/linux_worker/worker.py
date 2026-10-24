@@ -1,4 +1,4 @@
-"""Connect once, join one team seat, and answer mentor instructions."""
+"""Connect once, then answer instructions on a team seat and/or a 1:1 Topic."""
 
 from __future__ import annotations
 
@@ -44,8 +44,11 @@ class Worker:
             config.model,
             config.llm_max_output,
             secrets,
+            config.fallback_model,
         )
         self.tools = Tools(config, secrets)
+        self._team_closed = False
+        self._topic_closed = False
         config.workspace.mkdir(parents=True, exist_ok=True)
 
     def ensure_identity(self) -> dict:
@@ -75,6 +78,14 @@ class Worker:
         logger.info("已接入 %s model=%s", self.state.agent_id, self.config.model)
         return created
 
+    def ensure_channels(self) -> None:
+        if self.state.session_id or self.config.invite:
+            self.ensure_seat()
+        if self.state.topic_session_id or self.config.topic_invite:
+            self.ensure_topic()
+        if not self.state.session_id and not self.state.topic_session_id:
+            raise ConfigError("缺少 TEAM_INVITE_CODE 或 TOPIC_INVITE_CODE，无法加入席位")
+
     def ensure_seat(self) -> dict:
         if self.state.session_id:
             try:
@@ -103,30 +114,81 @@ class Worker:
         self.state.cursor = 0
         self.state.save()
         self.config.invite = ""
-        self._announce()
+        self._announce("team")
         logger.info("已加入团队席位 %s", self.state.seat)
         return session
 
-    def _announce(self) -> None:
-        if self.state.announced:
+    def ensure_topic(self) -> dict:
+        if self.state.topic_session_id:
+            try:
+                view = self.hub.topic_get(self.state.topic_session_id)
+            except HubError as exc:
+                if exc.status in (401, 404):
+                    raise CredentialsError(
+                        "一对一会话已失效或凭证无效，需要操作者处理。代理不会自动换身份重新加入。"
+                    ) from None
+                raise
+            session = view["session"]
+            if session.get("role") != "worker":
+                raise ConfigError("当前一对一席位不是执行端")
+            self.state.save()
+            return session
+        if not self.config.topic_invite:
+            raise ConfigError("缺少 TOPIC_INVITE_CODE，无法加入一对一 Topic")
+        joined = self.hub.join_topic(self.config.topic_invite, host_environment())
+        session = joined["session"]
+        if session.get("role") != "worker":
+            raise ConfigError("这份 Topic 码加入的不是执行端席位")
+        self.state.topic_session_id = str(session["id"])
+        self.state.topic_cursor = 0
+        self.state.save()
+        self.config.topic_invite = ""
+        self._announce("topic")
+        logger.info("已加入一对一 Topic %s", self.state.topic_session_id)
+        return session
+
+    def _announce(self, channel: str) -> None:
+        if channel == "team" and self.state.announced:
+            return
+        if channel == "topic" and self.state.topic_announced:
             return
         text = outbound(f"linux-worker 已上线。model={self.config.model}", self.secrets)
         try:
-            self.hub.team_send(self.state.session_id, "note", text, "note-online")
+            self._send(channel, "note", text, "note-online")
         except HubError as exc:
             if exc.status != 409:
                 raise
-        self.state.announced = True
+        if channel == "team":
+            self.state.announced = True
+        else:
+            self.state.topic_announced = True
         self.state.save()
 
     def run_forever(self) -> None:
         self.ensure_identity()
-        self.ensure_seat()
+        self.ensure_channels()
+        primary = "team" if self.state.session_id else "topic"
         while True:
             try:
-                if self.poll_once():
-                    logger.info("团队会话已结束，退出")
+                team_alive = bool(self.state.session_id) and not self._team_closed
+                topic_alive = bool(self.state.topic_session_id) and not self._topic_closed
+                if not team_alive and not topic_alive:
+                    logger.info("会话已结束，退出")
                     return
+                if primary == "team" and not team_alive:
+                    primary = "topic"
+                elif primary == "topic" and not topic_alive:
+                    primary = "team"
+                wait_team = self.config.relay_wait if primary == "team" else 0
+                wait_topic = self.config.relay_wait if primary == "topic" else 0
+                if team_alive:
+                    if self.poll_once(wait_team):
+                        self._team_closed = True
+                if topic_alive:
+                    if self.poll_topic_once(wait_topic):
+                        self._topic_closed = True
+                if team_alive and topic_alive and not self._team_closed and not self._topic_closed:
+                    primary = "topic" if primary == "team" else "team"
             except CredentialsError:
                 raise
             except HubError as exc:
@@ -142,35 +204,63 @@ class Worker:
 
     def run_once(self) -> None:
         self.ensure_identity()
-        self.ensure_seat()
-        self.poll_once()
+        self.ensure_channels()
+        if self.state.session_id:
+            self.poll_once(0)
+        if self.state.topic_session_id:
+            self.poll_topic_once(0)
 
-    def poll_once(self) -> bool:
+    def poll_once(self, wait: int | None = None) -> bool:
         """Read one burst of team events. Returns True when the session is closed."""
         if not self.state.session_id:
             raise ConfigError("尚未加入团队席位")
-        self.hub.team_heartbeat(self.state.session_id, host_environment())
-        wait = self.config.relay_wait
+        return self._poll("team", wait)
+
+    def poll_topic_once(self, wait: int | None = None) -> bool:
+        """Read one burst of 1:1 Topic events. Returns True when the session is closed."""
+        if not self.state.topic_session_id:
+            raise ConfigError("尚未加入一对一 Topic")
+        return self._poll("topic", wait)
+
+    def _poll(self, channel: str, wait: int | None) -> bool:
+        team = channel == "team"
+        sid = self.state.session_id if team else self.state.topic_session_id
+        if team:
+            self.hub.team_heartbeat(sid, host_environment())
+        else:
+            self.hub.topic_heartbeat(sid, host_environment())
+        cursor = self.state.cursor if team else self.state.topic_cursor
+        wait = self.config.relay_wait if wait is None else wait
         while True:
-            previous = self.state.cursor
-            batch = self.hub.team_events(self.state.session_id, previous, wait)
+            previous = cursor
+            if team:
+                batch = self.hub.team_events(sid, previous, wait)
+            else:
+                batch = self.hub.topic_events(sid, previous, wait)
             wait = 0
             session = batch.get("session") or {}
             status = session.get("status") or "active"
             events = batch.get("events") or []
             next_cursor = batch.get("next_cursor", previous)
             if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or next_cursor < previous:
-                raise HubError(0, "团队事件游标没有前进")
+                raise HubError(0, "事件游标没有前进")
             for event in events:
                 if status == "closed":
                     break
-                self._handle(event, status)
-            self.state.cursor = next_cursor
+                self._handle(event, status, channel)
+            cursor = next_cursor
+            if team:
+                self.state.cursor = next_cursor
+            else:
+                self.state.topic_cursor = next_cursor
             self.state.save()
             seqs = [event.get("seq") for event in events if isinstance(event.get("seq"), int)]
             if seqs:
                 try:
-                    self.hub.team_ack(self.state.session_id, max(seqs))
+                    if team:
+                        self.hub.team_ack(sid, max(seqs))
+                    else:
+                        self.hub.topic_ack(sid, max(seqs))
                 except HubError as exc:
                     logger.warning("确认游标失败：%s", exc)
             if status == "closed":
@@ -178,7 +268,16 @@ class Worker:
             if not batch.get("has_more") or next_cursor == previous:
                 return False
 
-    def _handle(self, event: dict, status: str) -> None:
+    def _handled(self, channel: str, seq: int) -> str | None:
+        if channel == "topic":
+            return self.state.handled.get(f"topic:{seq}")
+        return self.state.handled.get(str(seq))
+
+    def _mark(self, channel: str, seq: int, value: str) -> None:
+        key = f"topic:{seq}" if channel == "topic" else str(seq)
+        self.state.handled[key] = value
+
+    def _handle(self, event: dict, status: str, channel: str) -> None:
         if event.get("kind") != "message":
             return
         message = event.get("message") or {}
@@ -187,69 +286,74 @@ class Worker:
         seq = event.get("seq")
         if not isinstance(seq, int):
             return
-        key = str(seq)
-        previous = self.state.handled.get(key)
+        previous = self._handled(channel, seq)
         if previous == "done":
             return
         if previous == "started":
-            self._result(seq, "上次执行在完成前中断，已停止以免重复执行。请重新下达一条新指令。", [])
-            self.state.handled[key] = "done"
+            self._result(channel, seq, "上次执行在完成前中断，已停止以免重复执行。请重新下达一条新指令。", [])
+            self._mark(channel, seq, "done")
             self.state.save()
             return
         if status != "active":
             if status == "paused":
-                self._question(seq, f"会话已暂停，未执行指令 #{seq}。")
-            self.state.handled[key] = "done"
+                self._question(channel, seq, f"会话已暂停，未执行指令 #{seq}。")
+            self._mark(channel, seq, "done")
             self.state.save()
             return
-        self.state.handled[key] = "started"
+        self._mark(channel, seq, "started")
         self.state.save()
         title = ""
+        goal = ""
         try:
-            view = self.hub.team_get(self.state.session_id)["session"]
+            sid = self.state.session_id if channel == "team" else self.state.topic_session_id
+            view = (self.hub.team_get if channel == "team" else self.hub.topic_get)(sid)["session"]
             title = str(view.get("title") or "")
             goal = str(view.get("goal") or "")
         except HubError:
-            goal = ""
-        instruction = f"团队：{title}\n目标：{goal}\n\n指令 #{seq}：\n{message.get('text') or ''}"
+            pass
+        label = "团队" if channel == "team" else "一对一"
+        instruction = f"{label}：{title}\n目标：{goal}\n\n指令 #{seq}：\n{message.get('text') or ''}"
         episode = Episode(self.config, self.llm, self.tools, self.secrets)
+        seat = self.state.seat if channel == "team" else None
 
-        def progress(text: str, seq=seq) -> None:
-            self._progress(seq, text)
+        def progress(text: str, seq=seq, channel=channel) -> None:
+            self._progress(channel, seq, text)
 
-        def question(text: str, seq=seq) -> None:
-            self._question(seq, text)
+        def question(text: str, seq=seq, channel=channel) -> None:
+            self._question(channel, seq, text)
 
         try:
-            outcome = episode.run(instruction, self.state.seat, progress, question)
+            outcome = episode.run(instruction, seat, progress, question)
             if outcome.send_result:
-                self._result(seq, outcome.text, outcome.attachments)
-            self.state.handled[key] = "done"
+                self._result(channel, seq, outcome.text, outcome.attachments)
+            self._mark(channel, seq, "done")
             self.state.save()
         except Exception:
             logger.exception("指令 %s 执行失败", seq)
             try:
-                self._result(seq, "执行中断，已停止以免重复执行。请重新下达一条新指令。", [])
+                self._result(channel, seq, "执行中断，已停止以免重复执行。请重新下达一条新指令。", [])
             except HubError:
                 logger.warning("未能回传中断说明")
-            self.state.handled[key] = "done"
+            self._mark(channel, seq, "done")
             self.state.save()
 
-    def _progress(self, seq: int, text: str) -> None:
+    def _progress(self, channel: str, seq: int, text: str) -> None:
         self.state.progress_n += 1
         request_id = f"p-{seq}-{self.state.progress_n}"
         self.state.save()
-        self._send("progress", outbound(text, self.secrets), request_id, seq)
+        self._send(channel, "progress", outbound(text, self.secrets), request_id, seq)
 
-    def _question(self, seq: int, text: str) -> None:
+    def _question(self, channel: str, seq: int, text: str) -> None:
         self.state.progress_n += 1
         request_id = f"q-{seq}-{self.state.progress_n}"
         self.state.save()
-        self._send("question", outbound(text, self.secrets), request_id, seq)
+        self._send(channel, "question", outbound(text, self.secrets), request_id, seq)
 
-    def _result(self, seq: int, text: str, paths: list[str]) -> None:
+    def _result(self, channel: str, seq: int, text: str, paths: list[str]) -> None:
         notes: list[str] = []
         uploaded: list[str] = []
+        sid = self.state.session_id if channel == "team" else self.state.topic_session_id
+        upload = self.hub.team_upload if channel == "team" else self.hub.topic_upload
         for raw in paths[:20]:
             try:
                 path = resolve_inside(self.config.workspace, raw)
@@ -266,25 +370,28 @@ class Worker:
             if len(data) > _UPLOAD_LIMIT:
                 notes.append(path.name + " 超过 8MB，未上传")
                 continue
-            meta = self.hub.team_upload(self.state.session_id, path.name, data)
+            meta = upload(sid, path.name, data)
             file_id = str(meta.get("id") or "")
             if file_id:
                 uploaded.append(file_id)
         body = text
         if notes:
             body = text + "\n" + "\n".join(notes)
-        self._send("result", outbound(body, self.secrets), f"result-{seq}", seq, uploaded)
+        self._send(channel, "result", outbound(body, self.secrets), f"result-{seq}", seq, uploaded)
 
-    def _send(self, kind: str, text: str, request_id: str, seq: int, attachments: list[str] | None = None) -> None:
+    def _send(
+        self,
+        channel: str,
+        kind: str,
+        text: str,
+        request_id: str,
+        seq: int | None = None,
+        attachments: list[str] | None = None,
+    ) -> None:
+        sid = self.state.session_id if channel == "team" else self.state.topic_session_id
+        sender = self.hub.team_send if channel == "team" else self.hub.topic_send
         try:
-            self.hub.team_send(
-                self.state.session_id,
-                kind,
-                text,
-                request_id,
-                reply_to=seq,
-                attachments=attachments or None,
-            )
+            sender(sid, kind, text, request_id, reply_to=seq, attachments=attachments or None)
         except HubError as exc:
             if exc.status == 409:
                 return
