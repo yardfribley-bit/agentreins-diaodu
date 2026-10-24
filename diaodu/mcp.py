@@ -31,7 +31,7 @@ TOOLS.extend(RELAY_TOOLS)
 from diaodu.relay_teams_mcp import TOOLS as TEAM_TOOLS
 TOOLS.extend(TEAM_TOOLS)
 
-def handle(request,session_id,actor,identity,library,base_url,throttle):
+def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip=None):
  method=request.get('method');rid=request.get('id');params=request.get('params') or {}
  if request.get('jsonrpc')!='2.0' or not isinstance(method,str):return {'jsonrpc':'2.0','id':rid,'error':{'code':-32600,'message':'Invalid Request'}},None
  if method.startswith('notifications/') :return None,None
@@ -85,7 +85,7 @@ def handle(request,session_id,actor,identity,library,base_url,throttle):
     payload=dict(payload,credential_storage='当前MCP会话；重启后重新连接，长期复用请用REST获取Bearer并安全配置到客户端')
    elif name.startswith('relay_team_'):
     from diaodu.relay_teams_mcp import call as team_call
-    payload=team_call(name,args,actor,library.teams,identity)
+    payload=team_call(name,args,actor,library.teams,identity,client_ip=client_ip)
    elif name.startswith('relay_'):
     from diaodu.relay_mcp import call
     # A peer that only configured the MCP URL has no Bearer: fall back to the identity

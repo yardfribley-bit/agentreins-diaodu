@@ -3,7 +3,7 @@ import time
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from diaodu.identity import AuthError
-from diaodu.relay_http import _base_url, _rate_limit, client_abandoned
+from diaodu.relay_http import _base_url, _client_ip, _rate_limit, client_abandoned
 
 
 def _invite_info(handler, library, code):
@@ -55,6 +55,11 @@ def get(handler, library, parsed):
         teams.get(actor, parts[3])
     elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'invites':
         result = teams.invites(actor, parts[3])
+    elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'gate':
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if set(query) - {'role'} or any(len(values) != 1 for values in query.values()):
+            raise ValueError('仅支持 role 查询参数')
+        result = teams.gate_status(actor, parts[3], query.get('role', [None])[0])
     else:
         handler._json(404, {'error': '没有这个团队协作接口'})
         return
@@ -90,9 +95,15 @@ def post(handler, library, parts):
     if parts == ['v1', 'relay', 'teams', 'join']:
         handler._json(200, teams.join(actor, body))
         return
+    if parts == ['v1', 'relay', 'teams', 'gate', 'join']:
+        handler._json(200, teams.join_gate(actor, body, client_ip=_client_ip(handler)))
+        return
     if len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams']:
         if parts[4] == 'invites':
             handler._json(201, teams.invite(actor, parts[3], body))
+            return
+        if parts[4] == 'gate':
+            handler._json(201, teams.open_gate(actor, parts[3], body))
             return
         action = {'messages': teams.send, 'ack': teams.ack, 'state': teams.state,
                   'revoke': teams.revoke, 'heartbeat': teams.heartbeat,
@@ -105,6 +116,14 @@ def post(handler, library, parts):
     if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'invites' \
             and parts[5] == 'reset':
         handler._json(200, teams.reset_invites(actor, parts[3]))
+        return
+    if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'gate' \
+            and parts[5] == 'close':
+        handler._json(200, teams.close_gate(actor, parts[3], body))
+        return
+    if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'gate' \
+            and parts[5] == 'rotate':
+        handler._json(200, teams.rotate_gate(actor, parts[3], body))
         return
     if len(parts) == 7 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'invites' \
             and parts[6] == 'revoke':

@@ -19,18 +19,25 @@ TOOLS = [
     ('relay_team_invites', '仅创建者：查看邀请账本（席位、备注、状态、使用人、时间）。', {'session': S}, ['session']),
     ('relay_team_invite_revoke', '仅创建者：撤销一条未使用的邀请。', {'session': S, 'invite_id': S}, ['session', 'invite_id']),
     ('relay_team_invite_reset', '仅创建者：紧急止损，撤销本会话所有未使用邀请。', {'session': S}, ['session']),
+    ('relay_team_gate_open', '仅创建者：开一道短码加入门禁。同一角色同时只能有一道未关闭且未过期的门禁；worker 的 max_joins 为 1 到席位上限，mentor 只能为 1。ttl_hours 默认 24，最长 168。', {'session': S, 'role': ROLE, 'max_joins': {'type': 'integer', 'minimum': 1, 'maximum': 8}, 'ttl_hours': {'type': 'number', 'minimum': 1, 'maximum': 168}, 'note': S}, ['session', 'role', 'max_joins']),
+    ('relay_team_gate_join', '用短门禁码加入。worker 必须提交真实 environment；服务端分配下一个空闲席位，直到名额用尽或门禁关闭/过期。', {'gate_code': S, 'role': ROLE, 'environment': ENV}, ['gate_code']),
+    ('relay_team_gate_get', '仅创建者：查看加入门禁状态（剩余名额与使用者）。不返回门禁码；省略 role 时返回 worker 与 mentor 各自最新一道。', {'session': S, 'role': ROLE}, ['session']),
+    ('relay_team_gate_close', '仅创建者：关闭该角色当前门禁，旧码立即不能再加入。省略 role 时关闭 worker 门禁。', {'session': S, 'role': ROLE}, ['session']),
+    ('relay_team_gate_rotate', '仅创建者：更换短门禁码，剩余名额和过期时间不变，旧码立即失效。省略 role 时更换 worker 门禁。', {'session': S, 'role': ROLE}, ['session']),
     ('relay_team_upload', '上传团队附件（base64，最大10MB），发送消息时在 attachments 引用。', {'session': S, 'name': S, 'content_base64': S}, ['session', 'name', 'content_base64']),
     ('relay_team_download', '下载团队附件：≤5MB 返回 base64，更大的返回签名链接（15分钟有效，无需请求头）。', {'session': S, 'file_id': S}, ['session', 'file_id']),
 ]
 
 
-def call(name, args, actor, teams, identity):
+def call(name, args, actor, teams, identity, client_ip=None):
     validate_actor(actor, identity)
     body = {key: value for key, value in args.items() if key != 'session'}
     if name == 'relay_team_create':
         return teams.create(actor, body)
     if name == 'relay_team_join':
         return teams.join(actor, body)
+    if name == 'relay_team_gate_join':
+        return teams.join_gate(actor, body, client_ip=client_ip)
     if name == 'relay_team_list':
         return teams.list_sessions(actor)
     sid = args.get('session')
@@ -49,6 +56,14 @@ def call(name, args, actor, teams, identity):
         return teams.revoke_invite(actor, sid, args.get('invite_id'))
     if name == 'relay_team_invite_reset':
         return teams.reset_invites(actor, sid)
+    if name == 'relay_team_gate_open':
+        return teams.open_gate(actor, sid, body)
+    if name == 'relay_team_gate_get':
+        return teams.gate_status(actor, sid, args.get('role'))
+    if name == 'relay_team_gate_close':
+        return teams.close_gate(actor, sid, body)
+    if name == 'relay_team_gate_rotate':
+        return teams.rotate_gate(actor, sid, body)
     if name == 'relay_team_upload':
         raw = args.get('content_base64')
         if not isinstance(raw, str) or len(raw) > 14 * 1024 * 1024:
