@@ -330,6 +330,8 @@ class TeamsTest(unittest.TestCase):
             team_tables = {row[0] for row in db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertIn("team_members", team_tables)
+        self.assertIn("team_gates", team_tables)
+        self.assertIn("team_gate_uses", team_tables)
         self.assertNotIn("members", team_tables)
         relay = Relay(self.root)
         with relay._read() as db:
@@ -337,6 +339,296 @@ class TeamsTest(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertNotIn("team_members", relay_tables)
         self.assertNotIn("team_events", relay_tables)
+        self.assertNotIn("team_gates", relay_tables)
+
+
+class GateTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.teams = RelayTeams(self.root, max_workers=8)
+        self.owner = self.agent("owner")
+        self.mentor = self.agent("mentor")
+        created = self.teams.create(self.owner, {"title": "门禁任务", "goal": "一次配对多名执行端"})
+        self.sid = created["session"]["id"]
+        self.public_id = created["session"]["public_id"]
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def agent(self, name):
+        return {"kind": "agent", "agent_id": "ag_" + name, "user_id": "person",
+                "agent_name": name, "token": "never-store-" + name}
+
+    def open(self, role="worker", max_joins=2, ttl_hours=None, note="", actor=None):
+        body = {"role": role, "max_joins": max_joins, "note": note}
+        if ttl_hours is not None:
+            body["ttl_hours"] = ttl_hours
+        return self.teams.open_gate(actor or self.owner, self.sid, body)["gate"]
+
+    def enter(self, actor, code, environment=True, role=None, client_ip=None):
+        body = {"gate_code": code}
+        if role is not None:
+            body["role"] = role
+        if environment:
+            body["environment"] = dict(ENVIRONMENT)
+        return self.teams.join_gate(actor, body, client_ip=client_ip)["session"]
+
+    def test_short_code_alphabet_and_one_line_hint(self):
+        gate = self.open(max_joins=5, note="周五一批")
+        code = gate["code"]
+        self.assertEqual(len(code), RelayTeams.GATE_CODE_LENGTH)
+        self.assertEqual(RelayTeams.GATE_CODE_LENGTH, 6)
+        self.assertTrue(set(code) <= set(RelayTeams.GATE_CODE_ALPHABET))
+        self.assertTrue(set("01ILlOo").isdisjoint(RelayTeams.GATE_CODE_ALPHABET))
+        self.assertEqual(gate["remaining"], 5)
+        self.assertEqual(gate["max_joins"], 5)
+        self.assertEqual(gate["role"], "worker")
+        self.assertEqual(gate["status"], "open")
+        self.assertEqual(gate["session_id"], self.sid)
+        self.assertEqual(gate["public_id"], self.public_id)
+        self.assertNotIn("\n", gate["join_hint"])
+        self.assertEqual(
+            gate["join_hint"],
+            "diaodu_relay_team_gate_join gate_code=%s environment={os_name,os_version,architecture}" % code)
+        self.assertNotIn("```", gate["join_hint"])
+
+    def test_code_is_hashed_at_rest_and_absent_from_events(self):
+        gate = self.open()
+        code = gate["code"]
+        self.enter(self.agent("w1"), code)
+        with sqlite3.connect(self.teams.path) as db:
+            columns = [row[1] for row in db.execute("PRAGMA table_info(team_gates)")]
+            self.assertNotIn("code", columns)
+            stored = db.execute("SELECT code_hash, note FROM team_gates").fetchone()
+            self.assertEqual(stored[0], hashlib.sha256(code.encode()).hexdigest())
+            self.assertNotEqual(stored[0], code)
+            self.assertNotIn(code, stored[1])
+            payloads = [row[0] for row in db.execute("SELECT payload FROM team_events")]
+        self.assertTrue(payloads)
+        self.assertTrue(all(code not in payload for payload in payloads))
+        view = self.teams.get(self.owner, self.sid)["session"]
+        self.assertNotIn(code, json.dumps(view))
+
+    def test_n_joins_then_the_next_fails(self):
+        gate = self.open(max_joins=5)
+        seats = []
+        for index in range(1, 6):
+            code = "  " + gate["code"].lower() + " " if index == 1 else gate["code"]
+            seats.append(self.enter(self.agent("w%d" % index), code)["seat"])
+        self.assertEqual(seats, [1, 2, 3, 4, 5])
+        with self.assertRaises(AuthError) as full:
+            self.enter(self.agent("w6"), gate["code"])
+        self.assertEqual(full.exception.status, 403)
+        self.assertIn("名额已用完", str(full.exception))
+        status = self.teams.gate_status(self.owner, self.sid, "worker")["gate"]
+        self.assertEqual(status["status"], "exhausted")
+        self.assertEqual(status["remaining"], 0)
+        self.assertEqual(status["used"], 5)
+        self.assertEqual([item["name"] for item in status["used_by"]],
+                         ["w1", "w2", "w3", "w4", "w5"])
+        self.assertEqual([item["seat"] for item in status["used_by"]], [1, 2, 3, 4, 5])
+        self.assertNotIn("code", status)
+        self.assertNotIn("join_hint", status)
+        self.assertNotIn("actor_key", json.dumps(status))
+        self.assertNotIn(gate["code"], json.dumps(status))
+
+    def test_close_and_expiry_stop_joins(self):
+        gate = self.open(max_joins=3)
+        self.teams.close_gate(self.owner, self.sid, {})
+        with self.assertRaises(AuthError) as closed:
+            self.enter(self.agent("w1"), gate["code"])
+        self.assertEqual(closed.exception.status, 403)
+        self.assertIn("已关闭", str(closed.exception))
+        again = self.teams.close_gate(self.owner, self.sid, {"role": "worker"})
+        self.assertTrue(again["closed"])
+        self.assertEqual(again["gate"]["status"], "closed")
+        self.assertNotIn("code", again["gate"])
+
+        fresh = self.open(max_joins=2)
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("UPDATE team_gates SET expires=0 WHERE id=?", (fresh["id"],))
+        with self.assertRaises(AuthError) as expired:
+            self.enter(self.agent("w2"), fresh["code"])
+        self.assertEqual(expired.exception.status, 403)
+        self.assertIn("已过期", str(expired.exception))
+        self.assertEqual(self.teams.gate_status(self.owner, self.sid, "worker")["gate"]["status"],
+                         "expired")
+
+    def test_rotate_keeps_remaining_and_retires_the_old_code(self):
+        gate = self.open(max_joins=3)
+        self.enter(self.agent("w1"), gate["code"])
+        rotated = self.teams.rotate_gate(self.owner, self.sid, {"role": "worker"})["gate"]
+        self.assertNotEqual(rotated["code"], gate["code"])
+        self.assertEqual(rotated["remaining"], 2)
+        self.assertEqual(rotated["id"], gate["id"])
+        self.assertEqual(rotated["expires_at"], gate["expires_at"])
+        self.assertNotIn("\n", rotated["join_hint"])
+        with self.assertRaises(AuthError) as retired:
+            self.enter(self.agent("w2"), gate["code"])
+        self.assertEqual(retired.exception.status, 403)
+        self.assertIn("无效", str(retired.exception))
+        self.assertEqual(self.enter(self.agent("w3"), rotated["code"])["seat"], 2)
+        with sqlite3.connect(self.teams.path) as db:
+            stored = db.execute("SELECT code_hash FROM team_gates WHERE id=?", (gate["id"],)).fetchone()[0]
+        self.assertEqual(stored, hashlib.sha256(rotated["code"].encode()).hexdigest())
+
+    def test_only_owner_can_open_close_rotate_or_read_status(self):
+        gate = self.open()
+        joined = self.enter(self.agent("w1"), gate["code"])
+        worker = self.agent("w1")
+        for action in (
+            lambda actor: self.teams.open_gate(actor, self.sid, {"role": "worker", "max_joins": 1}),
+            lambda actor: self.teams.gate_status(actor, self.sid, "worker"),
+            lambda actor: self.teams.close_gate(actor, self.sid, {}),
+            lambda actor: self.teams.rotate_gate(actor, self.sid, {}),
+        ):
+            with self.assertRaises(AuthError) as denied:
+                action(worker)
+            self.assertEqual(denied.exception.status, 403)
+        stranger = self.agent("stranger")
+        with self.assertRaises(AuthError) as missing:
+            self.teams.gate_status(stranger, self.sid)
+        self.assertEqual(missing.exception.status, 404)
+        listed = self.teams.gate_status(self.owner, self.sid)["gates"]
+        self.assertEqual(listed[0]["id"], gate["id"])
+        self.assertNotIn("code", listed[0])
+        self.assertEqual(joined["role"], "worker")
+        self.assertNotIn(gate["code"], json.dumps(
+            self.teams.gate_status(self.owner, self.sid, "worker")))
+
+    def test_one_active_gate_per_role_and_mentor_gate_is_single_join(self):
+        self.open(max_joins=2)
+        with self.assertRaises(AuthError) as active:
+            self.open(max_joins=1)
+        self.assertEqual(active.exception.status, 409)
+        mentor_gate = self.open(role="mentor", max_joins=1)
+        self.assertEqual(
+            mentor_gate["join_hint"],
+            "diaodu_relay_team_gate_join gate_code=%s role=mentor" % mentor_gate["code"])
+        with self.assertRaises(ValueError):
+            self.teams.open_gate(self.owner, self.sid, {"role": "mentor", "max_joins": 2})
+        with self.assertRaises(AuthError) as environment:
+            self.enter(self.agent("env-mentor"), mentor_gate["code"], environment=True)
+        self.assertEqual(environment.exception.status, 403)
+        self.assertIn("系统环境", str(environment.exception))
+        self.assertEqual(self.enter(self.mentor, mentor_gate["code"], environment=False)["seat"], 0)
+        with self.assertRaises(AuthError) as spent:
+            self.enter(self.agent("other-mentor"), mentor_gate["code"], environment=False)
+        self.assertEqual(spent.exception.status, 403)
+        self.assertIn("名额已用完", str(spent.exception))
+        with self.assertRaises(AuthError):
+            self.enter(self.agent("env-mentor"), mentor_gate["code"], environment=True)
+        self.teams.close_gate(self.owner, self.sid, {"role": "worker"})
+        self.open(max_joins=1)
+
+    def test_worker_must_send_environment_and_single_use_invite_still_works(self):
+        gate = self.open(max_joins=2)
+        with self.assertRaises(ValueError) as missing:
+            self.teams.join_gate(self.agent("bare"), {"gate_code": gate["code"]})
+        self.assertIn("environment", str(missing.exception))
+        invite = self.teams.invite(self.owner, self.sid, {"role": "worker", "seat": 3})["invite"]
+        self.assertGreater(len(invite["code"]), 20)
+        seated = self.teams.join(self.agent("pinned"), {
+            "code": invite["code"], "environment": dict(ENVIRONMENT)})["session"]
+        self.assertEqual(seated["seat"], 3)
+        with self.assertRaises(AuthError) as reused:
+            self.teams.join(self.agent("again"), {
+                "code": invite["code"], "environment": dict(ENVIRONMENT)})
+        self.assertEqual(reused.exception.status, 403)
+        self.assertIn("已被使用", str(reused.exception))
+        with self.assertRaises(AuthError):
+            self.enter(self.agent("not-invite"), invite["code"])
+        with self.assertRaises(AuthError) as not_gate:
+            self.teams.join(self.agent("not-gate"), {
+                "code": gate["code"], "environment": dict(ENVIRONMENT)})
+        self.assertEqual(not_gate.exception.status, 403)
+        self.assertEqual(self.enter(self.agent("via-gate"), gate["code"])["seat"], 1)
+        self.assertEqual(self.teams.gate_status(self.owner, self.sid, "worker")["gate"]["remaining"], 1)
+
+    def test_invalid_arguments_and_revoked_identity_do_not_consume_a_seat(self):
+        with self.assertRaises(ValueError):
+            self.open(max_joins=0)
+        with self.assertRaises(ValueError):
+            self.open(max_joins=True)
+        with self.assertRaises(ValueError):
+            self.open(ttl_hours=0)
+        with self.assertRaises(ValueError):
+            self.open(ttl_hours=169)
+        gate = self.open(max_joins=2, ttl_hours=1)
+        self.enter(self.agent("w1"), gate["code"])
+        self.teams.revoke(self.owner, self.sid, {"role": "worker", "seat": 1})
+        with self.assertRaises(AuthError) as blocked:
+            self.enter(self.agent("w1"), gate["code"])
+        self.assertEqual(blocked.exception.status, 403)
+        self.assertIn("撤销", str(blocked.exception))
+        self.assertEqual(self.teams.gate_status(self.owner, self.sid, "worker")["gate"]["remaining"], 1)
+        self.assertEqual(self.enter(self.agent("w2"), gate["code"])["seat"], 1)
+        with self.assertRaises(AuthError):
+            self.enter(self.agent("w3"), "OOOOOO")
+
+    def test_join_attempts_are_rate_limited_by_actor_code_and_ip(self):
+        gate = self.open(max_joins=3)
+        self.teams.GATE_JOIN_ACTOR_LIMIT = 3
+        actor = self.agent("scanner")
+        for _ in range(3):
+            with self.assertRaises(AuthError) as invalid:
+                self.enter(actor, "AAAAAA")
+            self.assertEqual(invalid.exception.status, 403)
+        with self.assertRaises(AuthError) as limited:
+            self.enter(actor, "AAAAAA")
+        self.assertEqual(limited.exception.status, 429)
+        self.assertNotIn("AAAAAA", str(limited.exception))
+
+        self.teams.GATE_JOIN_ACTOR_LIMIT = 12
+        self.teams.GATE_JOIN_IP_LIMIT = 2
+        for index in range(2):
+            with self.assertRaises(AuthError) as invalid:
+                self.enter(self.agent("ip%d" % index), "BBBBBB", client_ip="203.0.113.9")
+            self.assertEqual(invalid.exception.status, 403)
+        with self.assertRaises(AuthError) as limited_ip:
+            self.enter(self.agent("ip2"), "BBBBBB", client_ip="203.0.113.9")
+        self.assertEqual(limited_ip.exception.status, 429)
+        self.assertEqual(self.enter(self.agent("other-net"), gate["code"], client_ip="203.0.113.10")["seat"], 1)
+
+        self.teams.GATE_JOIN_IP_LIMIT = 30
+        self.teams.GATE_JOIN_CODE_LIMIT = 2
+        self.enter(self.agent("c1"), gate["code"], client_ip="198.51.100.2")
+        with self.assertRaises(AuthError) as limited_code:
+            self.enter(self.agent("c2"), gate["code"], client_ip="198.51.100.3")
+        self.assertEqual(limited_code.exception.status, 429)
+        self.assertNotIn(gate["code"], str(limited_code.exception))
+
+    def test_concurrent_gate_joins_do_not_pass_max_joins(self):
+        gate = self.open(max_joins=2)
+        agents = [self.agent("racer%d" % index) for index in range(5)]
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(5) as pool:
+            futures = [pool.submit(self.enter, agent, gate["code"]) for agent in agents]
+            for future in futures:
+                try:
+                    results.append(future.result()["seat"])
+                except AuthError as error:
+                    results.append(error.status)
+        seats = sorted(item for item in results if item != 403 and item != 429)
+        self.assertEqual(seats, [1, 2])
+        self.assertEqual(results.count(403), 3)
+        status = self.teams.gate_status(self.owner, self.sid, "worker")["gate"]
+        self.assertEqual(status["remaining"], 0)
+        self.assertEqual(len(status["used_by"]), 2)
+
+    def test_existing_database_gains_gate_tables(self):
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("DROP TABLE team_gates")
+            db.execute("DROP TABLE team_gate_uses")
+        reloaded = RelayTeams(self.root, max_workers=8)
+        gate = reloaded.open_gate(self.owner, self.sid, {"role": "worker", "max_joins": 1})["gate"]
+        self.assertEqual(len(gate["code"]), 6)
+        self.assertEqual(self.enter_on(reloaded, gate["code"])["seat"], 1)
+
+    def enter_on(self, teams, code):
+        return teams.join_gate(self.agent("migrated"), {
+            "gate_code": code, "environment": dict(ENVIRONMENT)})["session"]
 
 
 class McpTeamToolSchema(unittest.TestCase):
@@ -349,7 +641,7 @@ class McpTeamToolSchema(unittest.TestCase):
     session-less group.
     """
 
-    SESSIONLESS = {"relay_team_create", "relay_team_join", "relay_team_list"}
+    SESSIONLESS = {"relay_team_create", "relay_team_join", "relay_team_gate_join", "relay_team_list"}
 
     def test_tools_that_need_a_session_declare_it(self):
         self.assertTrue(relay_teams_mcp.TOOLS)

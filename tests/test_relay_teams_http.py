@@ -422,6 +422,171 @@ class TeamsHTTP(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(hashlib.sha256(data).hexdigest(), uploaded['sha256'])
 
+    def test_gate_rest_joins_until_full_and_stays_off_public_pages(self):
+        status, created = self.req('POST', '/v1/relay/teams',
+                                   {'title': '门禁团队', 'goal': '一个短码加入多名执行端'}, 'owner')
+        self.assertEqual(status, 201)
+        sid = created['session']['id']
+        public_id = created['session']['public_id']
+        status, opened = self.req('POST', f'/v1/relay/teams/{sid}/gate',
+                                  {'role': 'worker', 'max_joins': 2, 'note': '一批执行端',
+                                   'ttl_hours': 24}, 'owner')
+        self.assertEqual(status, 201)
+        gate = opened['gate']
+        code = gate['code']
+        self.assertEqual(len(code), 6)
+        self.assertNotIn('\n', gate['join_hint'])
+        self.assertIn('diaodu_relay_team_gate_join', gate['join_hint'])
+        self.assertEqual(gate['remaining'], 2)
+        self.assertEqual(gate['public_id'], public_id)
+        self.assertEqual(gate['session_id'], sid)
+
+        status, missing = self.req('POST', f'/v1/relay/teams/{sid}/gate',
+                                   {'role': 'worker', 'max_joins': 1}, 'outsider')
+        self.assertEqual(status, 404)
+        self.assertNotIn(code, json.dumps(missing))
+
+        status, joined = self.req('POST', '/v1/relay/teams/gate/join',
+                                  {'gate_code': code.lower(), 'environment': dict(ENVIRONMENT)},
+                                  'outsider')
+        self.assertEqual(status, 200)
+        self.assertEqual(joined['session']['seat'], 1)
+        self.assertNotIn(code, json.dumps(joined))
+        status, denied = self.req('GET', f'/v1/relay/teams/{sid}/gate', role='outsider')
+        self.assertEqual(status, 403)
+        self.assertNotIn(code, json.dumps(denied))
+        self.assertEqual(self.req('POST', f'/v1/relay/teams/{sid}/gate/close', {}, 'outsider')[0], 403)
+        self.assertEqual(self.req('POST', f'/v1/relay/teams/{sid}/gate/rotate', {}, 'outsider')[0], 403)
+
+        status, second = self.req('POST', '/v1/relay/teams/gate/join',
+                                  {'gate_code': ' ' + code + ' ', 'environment': dict(ENVIRONMENT)},
+                                  'w1')
+        self.assertEqual(status, 200)
+        self.assertEqual(second['session']['seat'], 2)
+        status, full = self.req('POST', '/v1/relay/teams/gate/join',
+                                {'gate_code': code, 'environment': dict(ENVIRONMENT)}, 'w2')
+        self.assertEqual(status, 403)
+        self.assertIn('名额已用完', full['error'])
+        self.assertNotIn(code, json.dumps(full))
+
+        status, view = self.req('GET', f'/v1/relay/teams/{sid}/gate?role=worker', role='owner')
+        self.assertEqual(status, 200)
+        self.assertEqual(view['gate']['remaining'], 0)
+        self.assertEqual(view['gate']['status'], 'exhausted')
+        self.assertNotIn('code', view['gate'])
+        self.assertNotIn('join_hint', view['gate'])
+        self.assertEqual([item['name'] for item in view['gate']['used_by']], ['outsider', 'w1'])
+
+        status, events = self.anon(f'/v1/relay/public/conversations/{public_id}/events?wait=0')
+        self.assertEqual(status, 200)
+        serialized = json.dumps(events)
+        self.assertNotIn(code, serialized)
+        self.assertNotIn('join_hint', serialized)
+        self.assertNotIn('gate_code', serialized)
+        for leak in ('environment', 'os_name', 'macOS', 'arm64', 'actor_key', 'code_hash'):
+            self.assertNotIn(leak, serialized)
+        self.assertEqual(self.anon('/v1/relay/teams/invites/' + code)[0], 404)
+        self.assertEqual(self.raw_get(self.base + '/relay/join/' + code)[0], 404)
+
+        status, rotated = self.req('POST', f'/v1/relay/teams/{sid}/gate/rotate',
+                                   {'role': 'worker'}, 'owner')
+        self.assertEqual(status, 200)
+        self.assertEqual(rotated['gate']['remaining'], 0)
+        self.assertNotEqual(rotated['gate']['code'], code)
+        self.assertNotIn('\n', rotated['gate']['join_hint'])
+        status, still_full = self.req('POST', '/v1/relay/teams/gate/join',
+                                      {'gate_code': rotated['gate']['code'],
+                                       'environment': dict(ENVIRONMENT)}, 'w3')
+        self.assertEqual(status, 403)
+        self.assertIn('名额已用完', still_full['error'])
+        status, retired = self.req('POST', '/v1/relay/teams/gate/join',
+                                   {'gate_code': code, 'environment': dict(ENVIRONMENT)}, 'mentor')
+        self.assertEqual(status, 403)
+        self.assertIn('无效', retired['error'])
+        public_after = json.dumps(self.anon(
+            f'/v1/relay/public/conversations/{public_id}/events?wait=0')[1])
+        self.assertNotIn(code, public_after)
+        self.assertNotIn(rotated['gate']['code'], public_after)
+
+        fresh_status, fresh_team = self.req('POST', '/v1/relay/teams',
+                                            {'title': '可关闭', 'goal': '提前收门'}, 'owner')
+        self.assertEqual(fresh_status, 201)
+        fresh_sid = fresh_team['session']['id']
+        opened = self.req('POST', f'/v1/relay/teams/{fresh_sid}/gate',
+                          {'role': 'worker', 'max_joins': 2}, 'owner')[1]['gate']
+        self.req('POST', f'/v1/relay/teams/{fresh_sid}/gate/close', {}, 'owner')
+        self.assertEqual(self.req('POST', f'/v1/relay/teams/{fresh_sid}/gate/rotate',
+                                  {'role': 'worker'}, 'owner')[0], 409)
+        status, blocked = self.req('POST', '/v1/relay/teams/gate/join',
+                                   {'gate_code': opened['code'], 'environment': dict(ENVIRONMENT)},
+                                   'w3')
+        self.assertEqual(status, 403)
+        self.assertIn('已关闭', blocked['error'])
+
+        invite = self.req('POST', f'/v1/relay/teams/{fresh_sid}/invites',
+                          {'role': 'worker'}, 'owner')[1]['invite']
+        self.assertGreater(len(invite['code']), 20)
+        self.assertNotEqual(invite['code'], opened['code'])
+        status, seated = self.req('POST', '/v1/relay/teams/join',
+                                  {'code': invite['code'], 'environment': dict(ENVIRONMENT)}, 'w2')
+        self.assertEqual(status, 200)
+        self.assertEqual(seated['session']['seat'], 1)
+        self.assertEqual(self.req('POST', '/v1/relay/teams/join',
+                                  {'code': invite['code'], 'environment': dict(ENVIRONMENT)},
+                                  'mentor')[0], 403)
+
+    def test_mcp_gate_tools_are_listed_and_callable(self):
+        _init, sid = self.mcp({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}})
+        listed, _ = self.mcp({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}, sid)
+        names = {tool['name'] for tool in listed['result']['tools']}
+        for name in ('diaodu_relay_team_gate_open', 'diaodu_relay_team_gate_join',
+                     'diaodu_relay_team_gate_get', 'diaodu_relay_team_gate_close',
+                     'diaodu_relay_team_gate_rotate', 'diaodu_relay_team_invite',
+                     'diaodu_relay_team_join'):
+            self.assertIn(name, names)
+        result, _connected = self.mcp_call('connect', {'alias': 'gate-owner', 'agent_type': 'Dev'}, sid)
+        self.assertFalse(result.get('isError'))
+        result, created = self.mcp_call('relay_team_create', {'title': 'MCP 门禁', 'goal': '短码'}, sid)
+        self.assertFalse(result.get('isError'))
+        team_sid = created['session']['id']
+        result, opened = self.mcp_call('relay_team_gate_open',
+                                       {'session': team_sid, 'role': 'worker', 'max_joins': 2,
+                                        'note': '两名执行端'}, sid)
+        self.assertFalse(result.get('isError'), opened)
+        code = opened['gate']['code']
+        self.assertNotIn('\n', opened['gate']['join_hint'])
+        workers = []
+        for alias in ('gate-w1', 'gate-w2'):
+            _init_w, worker_sid = self.mcp({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize',
+                                            'params': {}})
+            self.mcp_call('connect', {'alias': alias, 'agent_type': 'Dev'}, worker_sid)
+            workers.append(worker_sid)
+            result, joined = self.mcp_call('relay_team_gate_join',
+                                           {'gate_code': code, 'environment': dict(ENVIRONMENT)},
+                                           worker_sid)
+            self.assertFalse(result.get('isError'), joined)
+            self.assertNotIn(code, json.dumps(joined))
+        self.assertEqual(sorted(worker['session']['seat'] for worker in (
+            self.mcp_call('relay_team_get', {'session': team_sid}, workers[0])[1],
+            self.mcp_call('relay_team_get', {'session': team_sid}, workers[1])[1])), [1, 2])
+        _init_w, extra = self.mcp({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}})
+        self.mcp_call('connect', {'alias': 'gate-w3', 'agent_type': 'Dev'}, extra)
+        result, rejected = self.mcp_call('relay_team_gate_join',
+                                         {'gate_code': code, 'environment': dict(ENVIRONMENT)}, extra)
+        self.assertTrue(result.get('isError'))
+        self.assertIn('名额已用完', rejected['message'])
+        self.assertNotIn(code, rejected['message'])
+        result, status = self.mcp_call('relay_team_gate_get', {'session': team_sid}, sid)
+        self.assertFalse(result.get('isError'))
+        self.assertNotIn('code', json.dumps(status['gates']))
+        result, hidden = self.mcp_call('relay_team_gate_get', {'session': team_sid}, workers[0])
+        self.assertTrue(result.get('isError'))
+        self.assertNotIn(code, hidden['message'])
+        result, closed = self.mcp_call('relay_team_gate_close', {'session': team_sid}, sid)
+        self.assertFalse(result.get('isError'))
+        self.assertEqual(closed['gate']['status'], 'closed')
+        self.assertNotIn('code', closed['gate'])
+
     def test_mcp_argument_error_names_keys_without_echoing_values(self):
         _init, sid = self.mcp({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}})
         result, _connected = self.mcp_call('connect', {'alias': '参数校验', 'agent_type': 'Dev'}, sid)

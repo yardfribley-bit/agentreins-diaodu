@@ -40,6 +40,18 @@ class RelayTeams:
     TOUCH_SECONDS = 60
     SIGNED_SECONDS = relay_files.SIGNED_SECONDS
     INVITE_SECONDS = 24 * 3600
+    # Short join gates are weaker than 24-byte invite tokens. 6 chars from a
+    # 31-symbol alphabet (no 0/O/1/I/L) is the top of the requested 4–6 range.
+    # Plaintext codes are returned once to the owner and stored only as sha256.
+    GATE_SECONDS = 24 * 3600
+    GATE_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+    GATE_CODE_LENGTH = 6
+    GATE_TTL_MIN_HOURS = 1
+    GATE_TTL_MAX_HOURS = 168
+    GATE_JOIN_WINDOW = 60.0
+    GATE_JOIN_CODE_LIMIT = 30
+    GATE_JOIN_ACTOR_LIMIT = 12
+    GATE_JOIN_IP_LIMIT = 30
     MAX_FILE_BYTES = 100 * 1024 * 1024
     MAX_ATTACHMENTS = 20
 
@@ -63,6 +75,9 @@ class RelayTeams:
         os.chmod(self.path, 0o600)
         self._condition = threading.Condition(threading.RLock())
         self._waiters = set()
+        # In-memory join attempts, keyed by code hash / actor / IP. Never the code.
+        self._gate_hits = {}
+        self._gate_hits_lock = threading.Lock()
         self.MAX_WAITERS, self.MAX_SESSION_WAITERS = _resolve_waiter_limits()
         with self._write() as db:
             db.executescript("""
@@ -103,6 +118,17 @@ class RelayTeams:
                   revoked INTEGER NOT NULL DEFAULT 0, used_at REAL,
                   used_by_key TEXT, used_by_name TEXT);
                 CREATE INDEX IF NOT EXISTS team_invites_session ON team_invites(session_id,role,seat);
+                CREATE TABLE IF NOT EXISTS team_gates (
+                  id TEXT PRIMARY KEY, code_hash TEXT UNIQUE NOT NULL, session_id TEXT NOT NULL,
+                  role TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+                  max_joins INTEGER NOT NULL, created REAL NOT NULL, expires REAL NOT NULL,
+                  closed INTEGER NOT NULL DEFAULT 0, closed_at REAL);
+                CREATE INDEX IF NOT EXISTS team_gates_session ON team_gates(session_id, role, closed);
+                CREATE TABLE IF NOT EXISTS team_gate_uses (
+                  id TEXT PRIMARY KEY, gate_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                  seat INTEGER NOT NULL, actor_key TEXT NOT NULL, actor_name TEXT NOT NULL,
+                  joined_at REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS team_gate_uses_gate ON team_gate_uses(gate_id, joined_at);
             """)
             # Additive migration for databases created before public watch existed.
             columns = {row[1] for row in db.execute("PRAGMA table_info(team_sessions)")}
@@ -255,6 +281,56 @@ class RelayTeams:
                 db.execute("SELECT * FROM team_members WHERE session_id=? AND actor_key=?",
                            (sid, key)).fetchone())}
 
+    def _ensure_can_join(self, db, session, key):
+        if session is None or session["status"] == "closed":
+            raise AuthError("团队会话已结束，不能加入", 409)
+        if db.execute("SELECT 1 FROM team_revoked WHERE session_id=? AND actor_key=?",
+                      (session["id"], key)).fetchone():
+            raise AuthError("该身份已被撤销，不能重新加入团队会话", 403)
+        if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND actor_key=?",
+                      (session["id"], key)).fetchone():
+            raise AuthError("该身份已参与团队会话", 409)
+
+    def _prepare_join(self, db, session, key, role, body, preferred_seat):
+        """Validate the role payload and pick a seat. Does not insert."""
+        self._ensure_can_join(db, session, key)
+        if role == "mentor":
+            if "environment" in body:
+                raise AuthError("只有执行端可以上报系统环境", 403)
+            if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='mentor'",
+                          (session["id"],)).fetchone():
+                raise AuthError("指导端席位已被占用", 409)
+            return 0, None
+        if not body.get("environment"):
+            raise ValueError("执行端加入必须上报 environment"
+                             "（os_name、os_version、architecture）")
+        environment = _environment(body.get("environment"))
+        if preferred_seat is not None:
+            if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='worker' "
+                          "AND seat=?", (session["id"], preferred_seat)).fetchone():
+                raise AuthError("该席位已被占用", 409)
+            seat = preferred_seat
+        else:
+            used = {row[0] for row in db.execute(
+                "SELECT seat FROM team_members WHERE session_id=? AND role='worker'",
+                (session["id"],))}
+            seat = next((index for index in range(1, self.max_workers + 1)
+                         if index not in used), None)
+            if seat is None:
+                raise AuthError("执行端席位已满", 409)
+        return seat, environment
+
+    def _insert_member(self, db, session, role, seat, key, actor, environment):
+        now = time.time()
+        db.execute("INSERT INTO team_members VALUES (?,?,?,?,?,?,?,?)",
+                   (session["id"], role, seat, key, _name(actor), now, 0,
+                    json.dumps(environment, sort_keys=True, ensure_ascii=False)
+                    if environment else None))
+        member = db.execute("SELECT * FROM team_members WHERE session_id=? AND actor_key=?",
+                            (session["id"], key)).fetchone()
+        self._append(db, session["id"], member, "joined", {"role": role, "seat": seat})
+        return member, now
+
     def join(self, actor, body):
         key = _actor(actor)
         body = _body(body, {"code", "role", "environment"})
@@ -274,50 +350,12 @@ class RelayTeams:
                 raise ValueError("所选角色与此邀请码不一致")
             session = db.execute("SELECT * FROM team_sessions WHERE id=?",
                                  (invite["session_id"],)).fetchone()
-            if session is None or session["status"] == "closed":
-                raise AuthError("团队会话已结束，不能加入", 409)
-            if db.execute("SELECT 1 FROM team_revoked WHERE session_id=? AND actor_key=?",
-                          (session["id"], key)).fetchone():
-                raise AuthError("该身份已被撤销，不能重新加入团队会话", 403)
-            if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND actor_key=?",
-                          (session["id"], key)).fetchone():
-                raise AuthError("该身份已参与团队会话", 409)
-            if invite["role"] == "mentor":
-                if "environment" in body:
-                    raise AuthError("只有执行端可以上报系统环境", 403)
-                if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='mentor'",
-                              (session["id"],)).fetchone():
-                    raise AuthError("指导端席位已被占用", 409)
-                seat, environment = 0, None
-            else:
-                if not body.get("environment"):
-                    raise ValueError("执行端加入必须上报 environment"
-                                     "（os_name、os_version、architecture）")
-                environment = _environment(body.get("environment"))
-                if invite["seat"] is not None:
-                    if db.execute("SELECT 1 FROM team_members WHERE session_id=? AND role='worker' "
-                                  "AND seat=?", (session["id"], invite["seat"])).fetchone():
-                        raise AuthError("该席位已被占用", 409)
-                    seat = invite["seat"]
-                else:
-                    used = {row[0] for row in db.execute(
-                        "SELECT seat FROM team_members WHERE session_id=? AND role='worker'",
-                        (session["id"],))}
-                    seat = next((index for index in range(1, self.max_workers + 1)
-                                 if index not in used), None)
-                    if seat is None:
-                        raise AuthError("执行端席位已满", 409)
-            now = time.time()
-            db.execute("INSERT INTO team_members VALUES (?,?,?,?,?,?,?,?)",
-                       (session["id"], invite["role"], seat, key, _name(actor), now, 0,
-                        json.dumps(environment, sort_keys=True, ensure_ascii=False)
-                        if environment else None))
+            seat, environment = self._prepare_join(
+                db, session, key, invite["role"], body, invite["seat"])
+            member, now = self._insert_member(
+                db, session, invite["role"], seat, key, actor, environment)
             db.execute("UPDATE team_invites SET used_at=?, used_by_key=?, used_by_name=? WHERE id=?",
                        (now, key, _name(actor), invite["id"]))
-            member = db.execute("SELECT * FROM team_members WHERE session_id=? AND actor_key=?",
-                                (session["id"], key)).fetchone()
-            self._append(db, session["id"], member, "joined",
-                         {"role": invite["role"], "seat": seat})
             return {"session": self._session(db, db.execute(
                 "SELECT * FROM team_sessions WHERE id=?", (session["id"],)).fetchone(), member)}
 
@@ -1021,3 +1059,242 @@ class RelayTeams:
                 "mentor": self._public_peer(mentor),
                 "workers": [self._public_peer(row) for row in workers],
                 "max_workers": self.max_workers}
+
+    # -- multi-join gates ----------------------------------------------
+    # One active gate per (session, role). The plaintext code is handed back
+    # only from open/rotate. Status, events, and the public directory never
+    # include it. Join attempts are counted by code hash, actor, and IP.
+
+    def _owner_gate(self, db, actor, sid, denied):
+        session, member = self._access(db, actor, sid)
+        if member["role"] != "owner":
+            raise AuthError(denied, 403)
+        return session, member
+
+    def _gate_role(self, role, *, default=None, required=False):
+        if role is None:
+            role = default
+        if role is None:
+            if required:
+                raise ValueError("角色须为 mentor 或 worker")
+            return None
+        if role not in ("mentor", "worker"):
+            raise ValueError("角色须为 mentor 或 worker")
+        return role
+
+    def _gate_ttl(self, body):
+        ttl = body.get("ttl_hours", 24)
+        if (isinstance(ttl, bool) or not isinstance(ttl, (int, float))
+                or not math.isfinite(ttl)
+                or not self.GATE_TTL_MIN_HOURS <= ttl <= self.GATE_TTL_MAX_HOURS):
+            raise ValueError("ttl_hours 须为 1 到 168 的小时数")
+        return float(ttl) * 3600
+
+    def _normalize_gate_code(self, value):
+        if not isinstance(value, str) or not value.strip() or len(value) > 32 or "\x00" in value:
+            raise ValueError("门禁码不能为空或超过长度限制")
+        return value.strip().upper()
+
+    def _gate_code_ok(self, code):
+        return (len(code) == self.GATE_CODE_LENGTH
+                and all(character in self.GATE_CODE_ALPHABET for character in code))
+
+    def _mint_gate_code(self, db):
+        alphabet = self.GATE_CODE_ALPHABET
+        for _ in range(8):
+            code = "".join(secrets.choice(alphabet) for _ in range(self.GATE_CODE_LENGTH))
+            hashed = hashlib.sha256(code.encode()).hexdigest()
+            if db.execute("SELECT 1 FROM team_gates WHERE code_hash=?", (hashed,)).fetchone() is None:
+                return code, hashed
+        raise AuthError("暂时无法生成门禁码，请重试", 503)
+
+    def _limit_gate_join(self, code_hash, actor_key, client_ip):
+        """Count one join attempt. Keys are the code hash, the actor id, and the source IP."""
+        buckets = [
+            ("code:" + code_hash, self.GATE_JOIN_CODE_LIMIT),
+            ("actor:" + actor_key, self.GATE_JOIN_ACTOR_LIMIT),
+        ]
+        if isinstance(client_ip, str) and client_ip and len(client_ip) <= 80 and "\x00" not in client_ip:
+            buckets.append(("ip:" + client_ip, self.GATE_JOIN_IP_LIMIT))
+        now = time.monotonic()
+        window = self.GATE_JOIN_WINDOW
+        retry_after = 1
+        with self._gate_hits_lock:
+            snapshots = {}
+            blocked = False
+            for key, limit in buckets:
+                hits = [moment for moment in self._gate_hits.get(key, ()) if now - moment < window]
+                snapshots[key] = hits
+                if len(hits) >= limit:
+                    blocked = True
+                    retry_after = max(retry_after, int(math.ceil(window - (now - hits[0]))))
+            if blocked:
+                for key, hits in snapshots.items():
+                    self._gate_hits[key] = hits
+                raise AuthError(f"尝试过于频繁，请 {max(1, retry_after)} 秒后重试", 429,
+                                retry_after=max(1, retry_after))
+            for key, hits in snapshots.items():
+                hits.append(now)
+                self._gate_hits[key] = hits
+            if len(self._gate_hits) > 4000:
+                for key, hits in list(self._gate_hits.items()):
+                    if not hits or now - hits[-1] >= window:
+                        self._gate_hits.pop(key, None)
+
+    def _gate_used_rows(self, db, gate_id):
+        return db.execute("SELECT seat, actor_name, joined_at FROM team_gate_uses "
+                          "WHERE gate_id=? ORDER BY joined_at, id", (gate_id,)).fetchall()
+
+    def _gate_join_hint(self, code, role):
+        if role == "mentor":
+            return "diaodu_relay_team_gate_join gate_code=%s role=mentor" % code
+        return ("diaodu_relay_team_gate_join gate_code=%s "
+                "environment={os_name,os_version,architecture}" % code)
+
+    def _gate_json(self, db, row, *, code=None):
+        used_rows = self._gate_used_rows(db, row["id"])
+        used = len(used_rows)
+        remaining = max(0, row["max_joins"] - used)
+        now = time.time()
+        if row["closed"]:
+            status = "closed"
+        elif row["expires"] <= now:
+            status = "expired"
+        elif remaining <= 0:
+            status = "exhausted"
+        else:
+            status = "open"
+        session = db.execute("SELECT public_id FROM team_sessions WHERE id=?",
+                             (row["session_id"],)).fetchone()
+        item = {"id": row["id"], "role": row["role"], "note": row["note"], "status": status,
+                "max_joins": row["max_joins"], "used": used, "remaining": remaining,
+                "created_at": _iso(row["created"]), "expires_at": _iso(row["expires"]),
+                "session_id": row["session_id"],
+                "public_id": session["public_id"] if session else None,
+                "used_by": [{"name": used_row["actor_name"], "seat": used_row["seat"],
+                             "at": _iso(used_row["joined_at"])} for used_row in used_rows]}
+        if code is not None:
+            item["code"] = code
+            item["join_hint"] = self._gate_join_hint(code, row["role"])
+        return item
+
+    def _active_gate(self, db, sid, role, now=None):
+        now = time.time() if now is None else now
+        return db.execute("SELECT * FROM team_gates WHERE session_id=? AND role=? "
+                          "AND closed=0 AND expires>? ORDER BY created DESC LIMIT 1",
+                          (sid, role, now)).fetchone()
+
+    def _current_gate(self, db, sid, role):
+        active = self._active_gate(db, sid, role)
+        if active is not None:
+            return active
+        return db.execute("SELECT * FROM team_gates WHERE session_id=? AND role=? "
+                          "ORDER BY created DESC LIMIT 1", (sid, role)).fetchone()
+
+    def open_gate(self, actor, sid, body):
+        body = _body(body, {"role", "max_joins", "ttl_hours", "note"})
+        role = self._gate_role(body.get("role"), required=True)
+        max_joins = body.get("max_joins")
+        if isinstance(max_joins, bool) or not isinstance(max_joins, int) or not 1 <= max_joins <= self.max_workers:
+            raise ValueError("max_joins 须为 1 到 %d" % self.max_workers)
+        if role == "mentor" and max_joins != 1:
+            raise ValueError("指导端门禁只能加入 1 次")
+        note = body.get("note", "")
+        if not isinstance(note, str) or len(note) > 160:
+            raise ValueError("门禁备注最多160字符")
+        ttl = self._gate_ttl(body)
+        with self._write() as db:
+            session, _member = self._owner_gate(db, actor, sid, "只有团队创建者可以开加入门禁")
+            if session["status"] == "closed":
+                raise AuthError("团队会话已结束", 409)
+            if self._active_gate(db, sid, role) is not None:
+                raise AuthError("本会话该角色已有未关闭的加入门禁，请先关闭或等待过期", 409)
+            if role == "mentor" and db.execute(
+                    "SELECT 1 FROM team_members WHERE session_id=? AND role='mentor'", (sid,)).fetchone():
+                raise AuthError("指导端席位已被占用", 409)
+            code, hashed = self._mint_gate_code(db)
+            now = time.time()
+            gate_id = "tg_" + secrets.token_hex(8)
+            db.execute("INSERT INTO team_gates VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (gate_id, hashed, sid, role, note.strip(), max_joins, now, now + ttl, 0, None))
+            row = db.execute("SELECT * FROM team_gates WHERE id=?", (gate_id,)).fetchone()
+            return {"gate": self._gate_json(db, row, code=code)}
+
+    def gate_status(self, actor, sid, role=None):
+        role = self._gate_role(role, default=None)
+        with self._read() as db:
+            self._owner_gate(db, actor, sid, "只有团队创建者可以查看加入门禁")
+            if role is None:
+                gates = []
+                for item_role in ("worker", "mentor"):
+                    row = self._current_gate(db, sid, item_role)
+                    if row is not None:
+                        gates.append(self._gate_json(db, row))
+                return {"gates": gates}
+            row = self._current_gate(db, sid, role)
+            if row is None:
+                raise AuthError("没有这个加入门禁", 404)
+            return {"gate": self._gate_json(db, row)}
+
+    def close_gate(self, actor, sid, body):
+        body = _body({} if body is None else body, {"role"})
+        role = self._gate_role(body.get("role"), default="worker")
+        with self._write() as db:
+            self._owner_gate(db, actor, sid, "只有团队创建者可以关闭加入门禁")
+            row = self._current_gate(db, sid, role)
+            if row is None:
+                raise AuthError("没有这个加入门禁", 404)
+            if not row["closed"]:
+                db.execute("UPDATE team_gates SET closed=1, closed_at=? WHERE id=?",
+                           (time.time(), row["id"]))
+                row = db.execute("SELECT * FROM team_gates WHERE id=?", (row["id"],)).fetchone()
+            return {"closed": True, "gate": self._gate_json(db, row)}
+
+    def rotate_gate(self, actor, sid, body):
+        body = _body({} if body is None else body, {"role"})
+        role = self._gate_role(body.get("role"), default="worker")
+        with self._write() as db:
+            session, _member = self._owner_gate(db, actor, sid, "只有团队创建者可以更换门禁码")
+            if session["status"] == "closed":
+                raise AuthError("团队会话已结束", 409)
+            row = self._active_gate(db, sid, role)
+            if row is None:
+                raise AuthError("没有可更换的加入门禁", 409)
+            code, hashed = self._mint_gate_code(db)
+            db.execute("UPDATE team_gates SET code_hash=? WHERE id=?", (hashed, row["id"]))
+            row = db.execute("SELECT * FROM team_gates WHERE id=?", (row["id"],)).fetchone()
+            return {"gate": self._gate_json(db, row, code=code)}
+
+    def join_gate(self, actor, body, client_ip=None):
+        key = _actor(actor)
+        body = _body(body, {"gate_code", "role", "environment"})
+        code = self._normalize_gate_code(body.get("gate_code"))
+        hashed = hashlib.sha256(code.encode()).hexdigest()
+        self._limit_gate_join(hashed, key, client_ip)
+        if body.get("role") is not None and body.get("role") not in ("mentor", "worker"):
+            raise ValueError("角色须为 mentor 或 worker")
+        with self._write() as db:
+            if not self._gate_code_ok(code):
+                raise AuthError("门禁码无效", 403)
+            gate = db.execute("SELECT * FROM team_gates WHERE code_hash=?", (hashed,)).fetchone()
+            if gate is None:
+                raise AuthError("门禁码无效", 403)
+            if gate["closed"]:
+                raise AuthError("门禁已关闭", 403)
+            if gate["expires"] <= time.time():
+                raise AuthError("门禁码已过期", 403)
+            used = len(self._gate_used_rows(db, gate["id"]))
+            if used >= gate["max_joins"]:
+                raise AuthError("门禁加入名额已用完", 403)
+            if body.get("role") is not None and body.get("role") != gate["role"]:
+                raise ValueError("所选角色与此门禁不一致")
+            session = db.execute("SELECT * FROM team_sessions WHERE id=?",
+                                 (gate["session_id"],)).fetchone()
+            seat, environment = self._prepare_join(db, session, key, gate["role"], body, None)
+            member, now = self._insert_member(
+                db, session, gate["role"], seat, key, actor, environment)
+            db.execute("INSERT INTO team_gate_uses VALUES (?,?,?,?,?,?,?)",
+                       ("tu_" + secrets.token_hex(8), gate["id"], session["id"], seat, key,
+                        _name(actor), now))
+            return {"session": self._session(db, db.execute(
+                "SELECT * FROM team_sessions WHERE id=?", (session["id"],)).fetchone(), member)}
