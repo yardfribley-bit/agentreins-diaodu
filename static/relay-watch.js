@@ -44,6 +44,10 @@
       status.textContent = '团队协作 · ' + (session.mentor ? '1 位指挥' : '指挥席位空缺') +
                            ' · ' + workers.length + ' 位执行';
     }
+    if (session.leader && session.leader.name) {
+      status.textContent = (status.textContent ? status.textContent + ' · ' : '') +
+        '领导者 ' + text(session.leader.name);
+    }
   }
   function senderLabel(event) {
     const sender = event.sender || {};
@@ -82,6 +86,10 @@
                           ' 已加入', 'watch-system'));
     } else if (event.kind === 'state') {
       article.append(node('p', '会话状态：' + text(event.status), 'watch-system'));
+    } else if (event.kind === 'task') {
+      const task = event.task || {};
+      const taskState = {open:'待认领', in_progress:'进行中', done:'已完成'}[task.status] || text(task.status);
+      article.append(node('p', '任务「' + text(task.title) + '」' + taskState, 'watch-system'));
     } else if (event.kind === 'revoked') {
       const seat = Number(event.seat);
       article.append(node('p', '一个席位已被撤销' +

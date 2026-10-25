@@ -44,17 +44,27 @@ def get(handler, library, parsed):
         result = teams.get(actor, parts[3])
     elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'events':
         query = parse_qs(parsed.query, keep_blank_values=True)
-        if set(query) - {'after', 'wait'} or any(len(values) != 1 for values in query.values()):
-            raise ValueError('仅支持 after 与 wait 查询参数')
+        if set(query) - {'after', 'wait', 'stream'} or any(len(values) != 1 for values in query.values()):
+            raise ValueError('仅支持 after、wait 与 stream 查询参数')
         after = int(query.get('after', ['0'])[0])
         wait = 0 if getattr(handler, '_head_only', False) else int(query.get('wait', ['0'])[0])
         result = teams.events(actor, parts[3], after=after, wait=wait,
+                              stream=query.get('stream', ['work'])[0],
                               abandon=lambda: client_abandoned(handler))
         # Membership and credentials can be revoked during a long poll.
         actor = handler._actor()
         teams.get(actor, parts[3])
     elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'invites':
         result = teams.invites(actor, parts[3])
+    elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'leader':
+        result = teams.who_is_leader(actor, parts[3])
+    elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'online':
+        result = teams.list_online(actor, parts[3])
+    elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'tasks':
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if set(query) - {'status'} or any(len(values) != 1 for values in query.values()):
+            raise ValueError('仅支持 status 查询参数')
+        result = teams.list_tasks(actor, parts[3], query.get('status', [None])[0])
     elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'gate':
         query = parse_qs(parsed.query, keep_blank_values=True)
         if set(query) - {'role'} or any(len(values) != 1 for values in query.values()):
@@ -105,6 +115,12 @@ def post(handler, library, parts):
         if parts[4] == 'gate':
             handler._json(201, teams.open_gate(actor, parts[3], body))
             return
+        if parts[4] == 'tasks':
+            handler._json(201, teams.create_task(actor, parts[3], body))
+            return
+        if parts[4] == 'leader':
+            handler._json(200, teams.appoint(actor, parts[3], body))
+            return
         action = {'messages': teams.send, 'ack': teams.ack, 'state': teams.state,
                   'revoke': teams.revoke, 'heartbeat': teams.heartbeat,
                   'public': teams.set_public}.get(parts[4])
@@ -112,6 +128,31 @@ def post(handler, library, parts):
             handler._json(404, {'error': '没有这个团队协作动作'})
             return
         handler._json(200, action(actor, parts[3], body))
+        return
+    if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'election':
+        if parts[5] == 'campaign':
+            handler._json(200, teams.campaign(actor, parts[3]))
+            return
+        if parts[5] == 'heartbeat':
+            handler._json(200, teams.leader_heartbeat(actor, parts[3]))
+            return
+        if parts[5] == 'vote':
+            handler._json(200, teams.vote(actor, parts[3], body))
+            return
+        handler._json(404, {'error': '没有这个团队协作动作'})
+        return
+    if len(parts) == 7 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'tasks':
+        task_id = parts[5]
+        if parts[6] == 'claim':
+            handler._json(200, teams.claim_task(actor, parts[3], task_id))
+            return
+        if parts[6] == 'assign':
+            handler._json(200, teams.assign_task(actor, parts[3], task_id, body))
+            return
+        if parts[6] == 'update':
+            handler._json(200, teams.update_task(actor, parts[3], task_id, body))
+            return
+        handler._json(404, {'error': '没有这个团队协作动作'})
         return
     if len(parts) == 6 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'invites' \
             and parts[5] == 'reset':

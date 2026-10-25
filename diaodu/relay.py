@@ -85,6 +85,23 @@ FILE_ID_RE = re.compile(r"^fl_[0-9a-f]{24}$")
 PREVIEW_LIMIT = 140
 _DIRECTORY_MARK = {"sessions": "p", "team_sessions": "t"}
 _MESSAGE_KINDS = ("instruction", "progress", "result", "question", "note")
+# Thin workers used to elect a leader by posting these tokens as notes.
+# They are protocol, not work content. Callers skip them in previews and
+# the team work stream; the team store applies them on a side channel.
+_PROTOCOL_OPS = ("ELECT", "LEADER", "HB", "VOTE")
+
+
+def protocol_op(text):
+    """Return ELECT, LEADER, HB, or VOTE when text is a protocol note."""
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped or "\x00" in stripped:
+        return None
+    token = stripped.split(None, 1)[0]
+    if token in _PROTOCOL_OPS:
+        return token
+    return None
 
 
 def _preview(value, limit=PREVIEW_LIMIT):
@@ -171,16 +188,18 @@ def directory_rows(db, table, limit, cursor_updated, cursor_public_id, status):
 def _message_preview(db, session_id, table):
     if table not in ("events", "team_events"):
         raise RuntimeError("unknown event table")
-    row = db.execute(
+    rows = db.execute(
         f"SELECT created, payload FROM {table} WHERE session_id=? AND kind='message' "
-        "ORDER BY seq DESC LIMIT 1",
-        (session_id,)).fetchone()
-    if row is None:
-        return None
-    message = json.loads(row["payload"]).get("message") or {}
-    kind = message.get("kind") if message.get("kind") in _MESSAGE_KINDS else None
-    text = message.get("text") if isinstance(message.get("text"), str) else ""
-    return {"kind": kind, "created_at": _iso(row["created"]), "preview": _preview(text)}
+        "ORDER BY seq DESC LIMIT 40",
+        (session_id,)).fetchall()
+    for row in rows:
+        message = json.loads(row["payload"]).get("message") or {}
+        if protocol_op(message.get("text")):
+            continue
+        kind = message.get("kind") if message.get("kind") in _MESSAGE_KINDS else None
+        text = message.get("text") if isinstance(message.get("text"), str) else ""
+        return {"kind": kind, "created_at": _iso(row["created"]), "preview": _preview(text)}
+    return None
 
 
 # Long polls (wait up to 20s) used to share one process-wide set of 32 slots
@@ -507,6 +526,8 @@ class Relay:
                       "reply_to": message.get("reply_to")}
             if message.get("to") is not None:
                 public["to"] = message.get("to")
+            if isinstance(message.get("task_id"), str):
+                public["task_id"] = message.get("task_id")
             if attachments:
                 public["attachments"] = attachments
             return {"message": public}

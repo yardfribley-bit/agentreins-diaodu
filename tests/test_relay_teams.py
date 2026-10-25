@@ -155,45 +155,37 @@ class TeamsTest(unittest.TestCase):
         self.assertIn(sent_all["event"]["seq"],
                       [event["seq"] for event in self.drain(self.worker1)[0]])
 
-    def test_targeted_instruction_only_reaches_target_worker_and_staff(self):
+    def test_targeted_instruction_stays_visible_and_keeps_its_assignee(self):
         sent = self.send(self.mentor, "instruction", "只给二号", "inst-2", to=f"worker:{self.seat2}")
         seq = sent["event"]["seq"]
-        self.assertIn(seq, [event["seq"] for event in self.drain(self.worker2)[0]])
-        self.assertNotIn(seq, [event["seq"] for event in self.drain(self.worker1)[0]])
-        self.assertIn(seq, [event["seq"] for event in self.drain(self.mentor)[0]])
-        self.assertIn(seq, [event["seq"] for event in self.drain(self.owner)[0]])
+        for actor in (self.worker1, self.worker2, self.mentor, self.owner):
+            events = self.drain(actor)[0]
+            match = next(event for event in events if event["seq"] == seq)
+            self.assertEqual(match["message"]["to"], f"worker:{self.seat2}")
 
-    def test_worker_results_and_notes_are_private_unless_broadcast(self):
+    def test_worker_results_and_notes_are_visible_to_the_team(self):
         sent = self.send(self.worker1, "result", "一号结果", "r1")
         seq = sent["event"]["seq"]
-        self.assertIn(seq, [event["seq"] for event in self.drain(self.worker1)[0]])
-        self.assertIn(seq, [event["seq"] for event in self.drain(self.mentor)[0]])
-        self.assertIn(seq, [event["seq"] for event in self.drain(self.owner)[0]])
-        self.assertNotIn(seq, [event["seq"] for event in self.drain(self.worker2)[0]])
-        broadcast = self.send(self.worker1, "result", "公开结果", "r1-all", to="all")
-        self.assertIn(broadcast["event"]["seq"],
-                      [event["seq"] for event in self.drain(self.worker2)[0]])
-        note = self.send(self.worker2, "note", "私有备注", "n2")
-        self.assertNotIn(note["event"]["seq"], [event["seq"] for event in self.drain(self.worker1)[0]])
-        public_note = self.send(self.worker2, "note", "公开备注", "n2-all", to="all")
-        self.assertIn(public_note["event"]["seq"],
-                      [event["seq"] for event in self.drain(self.worker1)[0]])
+        for actor in (self.worker1, self.worker2, self.mentor, self.owner):
+            self.assertIn(seq, [event["seq"] for event in self.drain(actor)[0]])
+        note = self.send(self.worker2, "note", "工作备注", "n2")
+        self.assertIn(note["event"]["seq"], [event["seq"] for event in self.drain(self.worker1)[0]])
         with self.assertRaises(AuthError) as caught:
             self.send(self.worker1, "result", "跨席塞结果", "r-cross", to=f"worker:{self.seat2}")
         self.assertEqual(caught.exception.status, 403)
 
     def test_cursor_advances_over_invisible_events_without_stalling(self):
-        targeted = self.send(self.mentor, "instruction", "只给一号", "inst-1",
-                             to=f"worker:{self.seat1}")
         visible = self.send(self.mentor, "instruction", "广播", "inst-broadcast")
+        changed = dict(ENVIRONMENT, python_version="3.12.1")
+        self.teams.heartbeat(self.worker1, self.sid, {"environment": changed})
         events, cursor = self.drain(self.worker2)
-        sequences = [event["seq"] for event in events]
-        self.assertNotIn(targeted["event"]["seq"], sequences)
-        self.assertIn(visible["event"]["seq"], sequences)
+        self.assertNotIn("environment", [event["kind"] for event in events])
+        self.assertIn(visible["event"]["seq"], [event["seq"] for event in events])
         last_seq = self.teams.get(self.worker2, self.sid)["session"]["last_seq"]
         page = self.teams.events(self.worker2, self.sid, after=cursor, wait=0)
         self.assertEqual(page["events"], [])
         self.assertEqual(page["next_cursor"], last_seq)
+        self.assertGreater(last_seq, visible["event"]["seq"])
 
     def test_result_cannot_reply_to_another_seats_instruction(self):
         targeted = self.send(self.mentor, "instruction", "只给一号", "inst-target",

@@ -180,7 +180,7 @@ class BrowserRelayChat(unittest.TestCase):
         status, seen_by_one = self.req("GET", f"/v1/relay/teams/{sid}/events?after=0&wait=0", actor=self.other)
         texts = [event.get("message", {}).get("text") for event in seen_by_one["events"]]
         self.assertIn("全体检查自己的环境", texts)
-        self.assertNotIn("只给 2 号席：核对端口", texts)
+        self.assertIn("只给 2 号席：核对端口", texts)
         status, seen_by_two = self.req("GET", f"/v1/relay/teams/{sid}/events?after=0&wait=0", bearer=self.worker)
         texts = [event.get("message", {}).get("text") for event in seen_by_two["events"]]
         self.assertIn("全体检查自己的环境", texts)

@@ -47,10 +47,10 @@ MCP：`diaodu_relay_team_gate_open` / `gate_join` / `gate_get` / `gate_close` / 
 
 可见性（服务端过滤，游标仍用全局 seq，允许空洞）：
 
-- 广播 instruction（`to` 省略或 `"all"`）与系统事件（joined/environment/state/revoked）全体可见。
-- 定向 instruction（`to="worker:N"`）只有 mentor、owner、目标席、发送者可见；worker 不能发起定向，`to="worker:N"` 返回 403。
-- worker 的 result/progress/question/note 默认只有 mentor、owner、本人可见；显式 `to="all"` 才广播。
-- worker 的系统环境只返回给 owner、mentor 和该 worker 自己；其他 worker 的 `workers[]` 里没有 `environment` 字段。
+- 工作内容（instruction、progress、result、question、普通 note、任务板事件，以及 joined/state/revoked）对全体成员和公开目录可见。`to` 只表示派给谁做，不再隐藏正文。
+- 普通 worker 不能把消息定向到其他席位（403）。现任领导者、mentor、owner 可以 `to="worker:N"`。worker 不能替其他席位回报定向指令（403）。
+- `environment` 事件不进默认工作流，也不进公开目录。环境只出现在 owner、mentor 和该 worker 自己的 `workers[]`。
+- 以 `ELECT`、`LEADER`、`HB`、`VOTE` 开头的 note 不进工作流，由选举侧信道处理。详见 [relay-work.md](relay-work.md)。
 - 定向给已撤销席位：409；给不存在席位：400。
 
 ## 汇总
@@ -63,7 +63,7 @@ worker 的 result 用 `reply_to` 指回指令；mentor 按 `reply_to` 分组即�
 
 ## MCP 工具
 
-`diaodu_relay_team_create` / `join` / `list` / `get` / `read` / `send` / `ack` / `heartbeat` / `state` / `revoke` / `invite` / `invites` / `invite_revoke` / `invite_reset` / `gate_open` / `gate_join` / `gate_get` / `gate_close` / `gate_rotate` / `upload` / `download`。MCP 只需配置地址，`diaodu_connect` 后同一会话自动复用身份，无需 Bearer。多名执行端优先用门禁短码，不必逐个复制长邀请。
+`diaodu_relay_team_create` / `join` / `list` / `get` / `read` / `send` / `ack` / `heartbeat` / `state` / `revoke` / `invite` / `invites` / `invite_revoke` / `invite_reset` / `gate_open` / `gate_join` / `gate_get` / `gate_close` / `gate_rotate` / `upload` / `download`。工作面另有 `who_is_leader` / `list_online` / `elect` / `vote` / `leader_heartbeat` / `appoint` / `task_create` / `task_list` / `task_claim` / `task_assign` / `task_update`。MCP 只需配置地址，`diaodu_connect` 后同一会话自动复用身份，无需 Bearer。多名执行端优先用门禁短码，不必逐个复制长邀请。三种协作方式见 [relay-work.md](relay-work.md)。
 
 ## 在页面上加入团队
 
