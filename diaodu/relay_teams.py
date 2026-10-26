@@ -37,7 +37,11 @@ class RelayTeams:
     MAX_WAITERS = DEFAULT_MAX_WAITERS
     MAX_SESSION_WAITERS = DEFAULT_SESSION_WAITERS
     ONLINE_SECONDS = 60
-    TOUCH_SECONDS = 60
+    # Authenticated reads rewrite last_seen at this interval. It stays well
+    # under LEASE_SECONDS so a coordinator that only polls or long-polls does
+    # not fall out of the quorum between heartbeats. ONLINE_SECONDS is only
+    # the slower roster flag and is not used for elections or assignment.
+    PRESENCE_REFRESH = 5
     # Seat numbers are never recycled. max_workers caps how many workers sit
     # at once; the number space is larger so a revoked seat stays unambiguous
     # in to=worker:N history.
@@ -259,18 +263,24 @@ class RelayTeams:
         return session, member
 
     def _touch(self, sid, key):
+        """Count an authenticated read as presence, without waking long-pollers.
+
+        Writes are skipped while last_seen is already inside PRESENCE_REFRESH,
+        so a tight poll loop does not rewrite the row on every request.
+        """
         now = time.time()
         with self._write(notify=False) as db:
             row = db.execute("SELECT last_seen FROM team_members WHERE session_id=? AND actor_key=?",
                              (sid, key)).fetchone()
-            if row is not None and now - row["last_seen"] >= self.TOUCH_SECONDS:
+            if row is not None and now - row["last_seen"] >= self.PRESENCE_REFRESH:
                 db.execute("UPDATE team_members SET last_seen=? WHERE session_id=? AND actor_key=?",
                            (now, sid, key))
 
     def _peer(self, row, include_environment=True, session=None, now=None):
+        now = time.time() if now is None else now
         item = {"role": row["role"], "seat": row["seat"], "name": row["name"],
-                "online": self._member_online(row, session, now),
                 "last_seen": _iso(row["last_seen"]), "ack_seq": row["ack_seq"]}
+        item.update(self._presence_fields(row, session, now))
         if row["role"] == "worker" and include_environment:
             item["environment"] = json.loads(row["environment"]) if row["environment"] else None
         return item
@@ -303,6 +313,7 @@ class RelayTeams:
                 "leader": self._leader_public(db, session),
                 "members": roster,
                 "online": [item for item in roster if item["online"]],
+                "live": [item for item in roster if item["live"]],
                 "tasks": [self._task_json(row) for row in self._task_rows(db, session["id"])],
                 "mentor": self._peer(mentor, session=session) if mentor else None,
                 "workers": [self._peer(row, member["role"] != "worker"
@@ -467,6 +478,7 @@ class RelayTeams:
             return {"sessions": result}
 
     def get(self, actor, sid):
+        self._touch(sid, _actor(actor))
         with self._read() as db:
             session, member = self._access(db, actor, sid)
             return {"session": self._session(db, session, member)}
@@ -722,9 +734,12 @@ class RelayTeams:
         try:
             with self._condition:
                 while True:
+                    # Refresh before the read and on each wake, so a long poll
+                    # that blocks for the whole lease does not age out of quorum.
+                    # notify stays off: presence is not a work-stream event.
+                    self._touch(sid, key)
                     result = self._page(actor, sid, after, stream, include_view)
                     if _long_poll_ready(result, wait, deadline, abandon):
-                        self._touch(sid, key)
                         with self._read() as db:
                             result["session"] = (self._view(db, actor, sid) if include_view
                                                  else self._light_view(db, actor, sid))
@@ -1454,9 +1469,11 @@ class RelayTeams:
     # -- work surface: roster, election, tasks -------------------------
 
     def _roster_member(self, row, session=None, now=None):
-        return {"role": row["role"], "seat": row["seat"], "name": row["name"],
-                "online": self._member_online(row, session, now),
+        now = time.time() if now is None else now
+        item = {"role": row["role"], "seat": row["seat"], "name": row["name"],
                 "last_seen": _iso(row["last_seen"]), "ack_seq": row["ack_seq"]}
+        item.update(self._presence_fields(row, session, now))
+        return item
 
     def _load_session(self, db, sid):
         return db.execute("SELECT * FROM team_sessions WHERE id=?", (sid,)).fetchone()
@@ -1489,13 +1506,23 @@ class RelayTeams:
             return False
         return now - row["last_seen"] < self.ONLINE_SECONDS
 
+    def _member_live(self, row, session=None, now=None):
+        """Lease-window presence. This is the signal for quorum and assignment."""
+        now = time.time() if now is None else now
+        if session is not None and self._failed_leader(session, row, now):
+            return False
+        return now - row["last_seen"] < self.LEASE_SECONDS
+
+    def _presence_fields(self, row, session, now):
+        return {"online": self._member_online(row, session, now),
+                "live": self._member_live(row, session, now),
+                "last_seen_age_s": max(0, int(now - row["last_seen"]))}
+
     def _in_quorum(self, session, row, now):
         """Quorum presence uses the lease window, not the longer roster window."""
         if row["role"] not in ("mentor", "worker"):
             return False
-        if self._failed_leader(session, row, now):
-            return False
-        return now - row["last_seen"] < self.LEASE_SECONDS
+        return self._member_live(row, session, now)
 
     def _leader_public(self, db, session, now=None):
         now = time.time() if now is None else now
@@ -1505,10 +1532,11 @@ class RelayTeams:
                          (session["id"], session["leader_key"])).fetchone()
         if row is None:
             return None
-        return {"role": row["role"], "seat": row["seat"], "name": row["name"],
-                "online": self._member_online(row, session, now),
+        body = {"role": row["role"], "seat": row["seat"], "name": row["name"],
                 "term": int(session["leader_term"] or 0),
                 "lease_until": _iso(session["leader_lease"])}
+        body.update(self._presence_fields(row, session, now))
+        return body
 
     def _public_leader(self, db, session, now=None):
         leader = self._leader_public(db, session, now)
@@ -1554,6 +1582,35 @@ class RelayTeams:
         return [row for row in self._eligible_rows(db, session["id"])
                 if self._in_quorum(session, row, now)]
 
+    def _rows_from_roster(self, db, session):
+        rows = []
+        for piece in (session["election_roster"] or "").split(","):
+            if ":" not in piece:
+                continue
+            role, raw = piece.split(":", 1)
+            try:
+                seat = int(raw)
+            except ValueError:
+                continue
+            row = db.execute("SELECT * FROM team_members WHERE session_id=? AND role=? AND seat=?",
+                             (session["id"], role, seat)).fetchone()
+            if row is not None and row["role"] in ("mentor", "worker"):
+                rows.append(row)
+        return rows
+
+    def _term_electorate(self, db, session, now):
+        """Electorate for the open term.
+
+        The roster is snapshotted when the term opens. A reader whose
+        last_seen blips across the lease edge does not change `needed`
+        until the next term. Revoked seats drop out because the member row
+        is gone. Between terms the live roster is used, so a member who
+        has actually left does not inflate the next election.
+        """
+        if self._election_open(session, now) and (session["election_roster"] or ""):
+            return self._rows_from_roster(db, session)
+        return self._electorate(db, session, now)
+
     @staticmethod
     def _roster_token(rows):
         ordered = sorted(rows, key=lambda item: (item["role"], item["seat"]))
@@ -1580,7 +1637,7 @@ class RelayTeams:
                 if votes < needed:
                     needed = votes
         else:
-            electorate = self._electorate(db, session, now)
+            electorate = self._term_electorate(db, session, now)
             votes = db.execute("SELECT COUNT(*) FROM team_votes WHERE session_id=? AND term=?",
                                (session["id"], term)).fetchone()[0]
             needed = self._majority(len(electorate)) if electorate else 0
@@ -1681,7 +1738,7 @@ class RelayTeams:
 
     def _maybe_elect(self, db, sid, term, now):
         session = self._load_session(db, sid)
-        electorate = self._electorate(db, session, now)
+        electorate = self._term_electorate(db, session, now)
         allowed = {row["actor_key"] for row in electorate}
         needed = self._majority(len(electorate)) if electorate else 99
         rows = db.execute(
@@ -1739,7 +1796,8 @@ class RelayTeams:
         leader = payload.get("leader")
         candidate = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else None
         if isinstance(leader, dict):
-            leader = {key: leader.get(key) for key in ("role", "seat", "name", "online", "term", "lease_until")}
+            leader = {key: leader.get(key) for key in (
+                "role", "seat", "name", "online", "live", "last_seen_age_s", "term", "lease_until")}
         if candidate is not None:
             candidate = {key: candidate.get(key) for key in ("role", "seat", "name")}
         return {"seq": row["seq"], "kind": "protocol", "op": row["op"],
@@ -1793,6 +1851,7 @@ class RelayTeams:
                               (sid,)).fetchall()
             roster = [self._roster_member(row, session) for row in rows]
             return {"members": roster, "online": [item for item in roster if item["online"]],
+                    "live": [item for item in roster if item["live"]],
                     "leader": self._leader_public(db, session),
                     "role": member["role"], "seat": member["seat"]}
 
@@ -2242,7 +2301,10 @@ class RelayTeams:
             return {"task": task, "duplicate": False}
 
     def assign_task(self, actor, sid, task_id, body):
-        body = _body(body, {"role", "seat", "task_id"})
+        body = _body(body, {"role", "seat", "task_id", "allow_offline"})
+        allow_offline = body.get("allow_offline", False)
+        if not isinstance(allow_offline, bool):
+            raise ValueError("allow_offline须为布尔值")
         with self._write() as db:
             session, member = self._access(db, actor, sid)
             self._require_task_open_session(session)
@@ -2255,13 +2317,21 @@ class RelayTeams:
             if row["assignee_key"] == target["actor_key"] and row["status"] == "in_progress":
                 return {"task": self._task_json(row), "duplicate": True}
             now = time.time()
+            warning = None
+            if not self._member_live(target, session, now):
+                if not allow_offline:
+                    raise AuthError("目标席位已离开租约窗口。确认后可带 allow_offline=true 再指派", 409)
+                warning = "目标席位已离开租约窗口，仍已指派"
             db.execute("UPDATE team_tasks SET status='in_progress', assignee_role=?, assignee_seat=?, "
                        "assignee_name=?, assignee_key=?, updated=?, revision=revision+1 WHERE id=?",
                        (target["role"], target["seat"], target["name"], target["actor_key"], now, row["id"]))
             row = db.execute("SELECT * FROM team_tasks WHERE id=?", (row["id"],)).fetchone()
             task = self._task_json(row)
             self._append(db, sid, member, "task", {"action": "assigned", "task": task})
-            return {"task": task, "duplicate": False}
+            result = {"task": task, "duplicate": False}
+            if warning:
+                result["warning"] = warning
+            return result
 
     def update_task(self, actor, sid, task_id, body):
         body = _body(body, {"progress", "status", "detail", "task_id"})
