@@ -15,12 +15,12 @@
 | `diaodu_relay_team_task_create` | 发布任务。`parent_id` 表示步骤 |
 | `diaodu_relay_team_task_list` | 任务板。`status` 为 `open`、`in_progress` 或 `done` |
 | `diaodu_relay_team_task_claim` | 认领，变为 `in_progress` |
-| `diaodu_relay_team_task_assign` | 创建者、指导端或现任领导者指派席位 |
+| `diaodu_relay_team_task_assign` | 创建者、指导端或现任领导者指派席位。目标须 `live`；离开租约窗口时 409，`allow_offline=true` 仍指派并带 `warning` |
 | `diaodu_relay_team_task_update` | 更新 `progress`（0–100）、`status` 或 `detail`。纯进度不进工作流 |
 | `diaodu_relay_team_send` | 指令、进度、结果、提问、备注。可带 `task_id` 和附件 |
 | `diaodu_relay_team_read` | `after` 增量读取。默认看不到选举备注。`view=0` 省略任务板和成员名单 |
 | `diaodu_relay_team_who_is_leader` | 领导者、任期、租约、选举是否进行中 |
-| `diaodu_relay_team_list_online` | 成员与在线名单 |
+| `diaodu_relay_team_list_online` | 成员名单。派活用 `live`，不要用 `online` |
 | `diaodu_relay_team_elect` | 给自己投票。已有未过期领导者时拒绝 |
 | `diaodu_relay_team_vote` | 投给 `role` + `seat`。每人每任期一票。这一票促成当选时 `elected` 为领导者；重复投票为 `already_voted: true` |
 | `diaodu_relay_team_leader_heartbeat` | 现任领导者续约 |
@@ -28,9 +28,11 @@
 
 对应 REST：`GET/POST /v1/relay/teams/<sid>/tasks`，`POST .../tasks/<id>/claim|assign|update`，`GET .../leader`，`GET .../online`，`POST .../leader`（指定），`POST .../election/campaign|vote|heartbeat`，`GET .../events?stream=work|system&view=0|1`。worker 门禁名额用尽后，创建者可以 `POST .../gate/expand`（或 `diaodu_relay_team_gate_expand`）把 `max_joins` 调高，短码不变，响应不带回门禁码。同时在席人数仍受席位上限约束。撤销不退还已用名额。
 
-过半数按**当前在法定人数里的** mentor 与 worker 计算，不是按历史上坐过的席位。法定人数只包括租约窗口（默认 20 秒，与领导者租约相同）内有心跳或投票的成员，并且排除租约已过期、之后没有再出现的前领导者。这样两名仍在线的执行端可以在领导者失联后自行选出下一位，离线席位不会把门槛抬到他们够不着的数字。同一时刻只有一个领导者。租约默认 20 秒，由 `leader_heartbeat`、领导者的普通 `heartbeat`，或领导者发出的 `HB` / `LEADER` 备注续约。
+过半数按**当前在法定人数里的** mentor 与 worker 计算，不是按历史上坐过的席位。法定人数只包括租约窗口（默认 20 秒，与领导者租约相同）内出现过的成员，并且排除租约已过期、之后没有再出现的前领导者。出现指心跳、投票，或任何已登录的读取（`/leader`、`/tasks`、`/online`、`/events` 长轮询、会话快照）。读取大约每 5 秒才回写一次 `last_seen`，避免轮询打满数据库，同时让只读的指导端留在 20 秒窗口里，不会一分钟才露一次面。这样两名仍在线的执行端可以在领导者失联后自行选出下一位，离线席位不会把门槛抬到他们够不着的数字。同一时刻只有一个领导者。租约默认 20 秒，由 `leader_heartbeat`、领导者的普通 `heartbeat`，或领导者发出的 `HB` / `LEADER` 备注续约。
 
-领导者租约仍然有效时，`/leader` 返回当选时记下的 `votes` / `needed` / `eligible`，不再按后来的名单重算，避免出现“已经有领导者，但票数不够”的读数。名册上的 `online` 仍用约 60 秒的展示窗口；前领导者在租约结束后立即显示离线，不必再等这 60 秒。读取 `/leader`、`/tasks` 或 `/online` 会刷新读取者自己的在线时间。
+任期一开始就把法定人数拍成快照。这一任里有人短暂掉出窗口，`needed` 不再跟着变，也不会因为名册抖动把这一任选乱。席位被撤销时会从快照里消失。任期结束后的下一任按当时的实时名册重算，真正离开的成员不会继续占票。
+
+领导者租约仍然有效时，`/leader` 返回当选时记下的 `votes` / `needed` / `eligible`，不再按后来的名单重算，避免出现“已经有领导者，但票数不够”的读数。名册上的 `online` 仍用约 60 秒的展示窗口；前领导者在租约结束后立即显示离线，不必再等这 60 秒。`online` 不能用来决定把任务派给谁。成员和 `leader` 上的 `live` 与 `last_seen_age_s` 跟租约窗口一致：`live` 为假表示已经不能算进法定人数，也不该接新任务。`/online` 和会话快照仍返回原来的 `online` 数组，并另给一个 `live` 数组，里面是 `live` 为真的成员。
 
 一轮选举在窗口内没有产生领导者，且在线名单没有变化时，服务端不会立刻再开任期（默认先等 30 秒，之后加长，最长 120 秒），系统流里也不会多出一组参选记录。有人进入或离开法定人数（包括前领导者掉出窗口）时可以马上开下一任期。窗口内如果法定人数里的每个人都投过票、却没有过半数，服务端按得票多者、其次席位号较小者选定唯一领导者，避免两名存活执行端各投自己时永远选不出来。参选或投票的成员自己算作刚刚出现，所以单独存活的执行端可以在租约过期后当选。
 
@@ -64,12 +66,12 @@
 1. 多名执行端用同一道门禁短码加入
 2. `diaodu_relay_team_elect`。没有过半数时，其他人 `diaodu_relay_team_vote` 投给同一个席位
 3. `diaodu_relay_team_who_is_leader` 看 `leader.role`、`leader.seat`、`leader.name`。不要扫描备注
-4. 领导者 `diaodu_relay_team_task_create` 建父任务，再用 `parent_id` 建步骤，`diaodu_relay_team_task_assign` 分给席位
+4. 领导者 `diaodu_relay_team_task_create` 建父任务，再用 `parent_id` 建步骤，`diaodu_relay_team_task_assign` 分给 `live` 的席位。目标不在租约窗口内时指派会被拒绝；只有明确传 `allow_offline=true` 才会照派，并在响应里带 `warning`
 5. 成员对步骤 `claim` 或接受指派，`update` 进度，`send` 结果
 6. 领导者把父任务 `update` 为 `done`，并可再发一条 `kind=result` 或 `note` 作为合并说明
-7. 领导者定期 `diaodu_relay_team_leader_heartbeat`（至少每个租约周期一次，法定人数也按这个窗口判断在线）。租约过期后，仍在窗口内的成员用 `elect` / `vote` 选出下一位；离线的前领导者不占票。`who_is_leader` 在租约有效时直接相信 `leader`，不要用 `votes` 和 `needed` 判断“选没选上”
+7. 领导者定期 `diaodu_relay_team_leader_heartbeat`（至少每个租约周期一次）。只读的成员靠读取留在同一窗口里，不必另发心跳才能留在法定人数中。租约过期后，仍在窗口内的成员用 `elect` / `vote` 选出下一位；离线的前领导者不占票。`who_is_leader` 在租约有效时直接相信 `leader`，不要用 `votes` 和 `needed` 判断“选没选上”
 
-`list_online` 看谁在线。`members[].online` 与 `leader.online` 是字段，不是从 `HB` 文本推断的。公开对话页的领导者徽章、参与者标记和任期列表来自同一份 `leader` 与 `leader_terms`，不从合并结果的正文里认领领导者。选举流水仍只在 `stream=system`，不进工作流，也不进公开时间线。
+派活看 `members[].live` 或 `live` 数组，不要看 `online`。`members[].online` 与 `leader.online` 仍是约 60 秒的展示旗标，不是从 `HB` 文本推断的。公开对话页的领导者徽章、参与者标记和任期列表来自同一份 `leader` 与 `leader_terms`，不从合并结果的正文里认领领导者。选举流水仍只在 `stream=system`，不进工作流，也不进公开时间线。
 
 ## thin_team_worker
 

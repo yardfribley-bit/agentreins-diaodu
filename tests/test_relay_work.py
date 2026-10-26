@@ -302,7 +302,10 @@ class WorkSurfaceTest(unittest.TestCase):
         dead = next(item for item in roster["members"] if item["role"] == "worker" and item["seat"] == self.seat1)
         mentor = next(item for item in roster["members"] if item["role"] == "mentor")
         self.assertFalse(dead["online"])
+        self.assertFalse(dead["live"])
         self.assertTrue(mentor["online"])
+        self.assertFalse(mentor["live"])
+        self.assertGreaterEqual(mentor["last_seen_age_s"], 20)
         opened = self.teams.campaign(self.worker2, self.sid)
         self.assertEqual(opened["election"]["term"], held["term"] + 1)
         self.assertEqual(opened["election"]["eligible"], 2)
@@ -407,6 +410,91 @@ class WorkSurfaceTest(unittest.TestCase):
         self.assertIn("badge leader", script)
         self.assertIn("leader_terms", script)
         self.assertNotIn("innerHTML", script)
+
+    def test_read_only_member_stays_in_the_electorate(self):
+        seat3 = self.join_invite(self.agent("worker3"), "worker")["seat"]
+        # Inside the refresh interval: a read must not rewrite last_seen.
+        self._age("mentor", 0, time.time() - 2)
+        with sqlite3.connect(self.teams.path) as db:
+            held = db.execute("SELECT last_seen FROM team_members WHERE session_id=? AND role='mentor'",
+                              (self.sid,)).fetchone()[0]
+        self.teams.events(self.mentor, self.sid, after=0, wait=0)
+        with sqlite3.connect(self.teams.path) as db:
+            skipped = db.execute("SELECT last_seen FROM team_members WHERE session_id=? AND role='mentor'",
+                                 (self.sid,)).fetchone()[0]
+        self.assertEqual(skipped, held)
+        # Outside the lease, still inside the old 60s touch gap. A read counts.
+        self._age("mentor", 0, time.time() - 25)
+        self.teams.who_is_leader(self.mentor, self.sid)
+        self.teams.list_tasks(self.mentor, self.sid)
+        self.teams.events(self.mentor, self.sid, after=0, wait=0)
+        with sqlite3.connect(self.teams.path) as db:
+            refreshed = db.execute("SELECT last_seen FROM team_members WHERE session_id=? AND role='mentor'",
+                                   (self.sid,)).fetchone()[0]
+        self.assertLess(time.time() - refreshed, self.teams.PRESENCE_REFRESH)
+        opened = self.teams.campaign(self.worker1, self.sid)
+        self.assertEqual(opened["election"]["eligible"], 4)
+        self.assertEqual(opened["election"]["needed"], 3)
+        self.assertIsNone(opened["elected"])
+        # The reader then goes quiet for the rest of this term. needed stays put,
+        # so two votes cannot elect just because the mentor blipped out.
+        self._age("mentor", 0, time.time() - 25)
+        voted = self.teams.vote(self.worker2, self.sid, {"role": "worker", "seat": self.seat1})
+        self.assertIsNone(voted["elected"])
+        self.assertEqual(voted["election"]["eligible"], 4)
+        self.assertEqual(voted["election"]["needed"], 3)
+        self.assertEqual(voted["election"]["votes"], 2)
+        quiet = self.teams.list_online(self.worker1, self.sid)
+        mentor = next(item for item in quiet["members"] if item["role"] == "mentor")
+        self.assertTrue(mentor["online"])
+        self.assertFalse(mentor["live"])
+        self.assertNotIn("mentor", [item["name"] for item in quiet["live"]])
+        self.assertIn(seat3, [item["seat"] for item in quiet["live"] if item["role"] == "worker"])
+
+    def test_dead_worker_is_not_live_inside_the_online_window(self):
+        self._age("worker", self.seat2, time.time() - 25)
+        roster = self.teams.list_online(self.worker1, self.sid)
+        worker = next(item for item in roster["members"]
+                      if item["role"] == "worker" and item["seat"] == self.seat2)
+        self.assertTrue(worker["online"])
+        self.assertFalse(worker["live"])
+        self.assertGreaterEqual(worker["last_seen_age_s"], 25)
+        self.assertLess(worker["last_seen_age_s"], self.teams.ONLINE_SECONDS)
+        self.assertNotIn(self.seat2, [item["seat"] for item in roster["live"] if item["role"] == "worker"])
+        session = self.teams.get(self.owner, self.sid)["session"]
+        member = next(item for item in session["members"]
+                      if item["role"] == "worker" and item["seat"] == self.seat2)
+        self.assertTrue(member["online"])
+        self.assertFalse(member["live"])
+        self.assertGreaterEqual(member["last_seen_age_s"], 25)
+        peer = next(item for item in session["workers"] if item["seat"] == self.seat2)
+        self.assertFalse(peer["live"])
+
+    def test_assign_rejects_a_seat_outside_the_lease(self):
+        self._age("worker", self.seat2, time.time() - 25)
+        task = self.teams.create_task(self.owner, self.sid, {
+            "title": "交给还在的人", "request_id": "assign-live"})["task"]
+        with self.assertRaises(AuthError) as caught:
+            self.teams.assign_task(self.owner, self.sid, task["id"],
+                                   {"role": "worker", "seat": self.seat2})
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIn("allow_offline", str(caught.exception))
+        board = self.teams.list_tasks(self.owner, self.sid)["tasks"]
+        self.assertEqual(board[0]["status"], "open")
+        self.assertIsNone(board[0]["assignee"])
+        with self.assertRaises(ValueError):
+            self.teams.assign_task(self.owner, self.sid, task["id"],
+                                   {"role": "worker", "seat": self.seat2, "allow_offline": "yes"})
+        forced = self.teams.assign_task(self.owner, self.sid, task["id"],
+                                        {"role": "worker", "seat": self.seat2, "allow_offline": True})
+        self.assertEqual(forced["task"]["assignee"]["seat"], self.seat2)
+        self.assertIn("租约", forced["warning"])
+        other = self.teams.create_task(self.owner, self.sid, {
+            "title": "交给在席的人", "request_id": "assign-live-ok"})["task"]
+        clean = self.teams.assign_task(self.owner, self.sid, other["id"],
+                                       {"role": "worker", "seat": self.seat1})
+        self.assertEqual(clean["task"]["assignee"]["seat"], self.seat1)
+        self.assertNotIn("warning", clean)
 
     def test_owner_read_of_leader_or_tasks_counts_as_online(self):
         with sqlite3.connect(self.teams.path) as db:
