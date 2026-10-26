@@ -50,6 +50,13 @@
   function taskAnchor(id) {
     return /^tt_[0-9a-f]{8,32}$/.test(id) ? 'task-' + id : '';
   }
+  function withLive(leader, participants) {
+    if (!leader || leader.live === true || leader.live === false) return leader;
+    const match = (participants || []).find(person =>
+      person.role === leader.role && Number(person.seat) === Number(leader.seat));
+    if (!match || (match.live !== true && match.live !== false)) return leader;
+    return Object.assign({}, leader, {live: match.live, last_seen_age_s: match.last_seen_age_s});
+  }
   function leaderBadge(leader, compact) {
     const seat = Number(leader.seat);
     const seatText = compact ? '' : (leader.role === 'worker' && Number.isInteger(seat) && seat > 0
@@ -145,12 +152,13 @@
       const stamp = node('time', when(item.updated_at));
       stamp.dateTime = text(item.updated_at);
       head.append(stamp);
+      const participants = Array.isArray(item.participants) ? item.participants : [];
       const meta = node('div', null, 'card-meta');
       meta.append(node('span', modes[item.mode] || '对话', 'chip mode'));
       const status = text(item.status);
       meta.append(node('span', states[item.status] || '状态待确认', 'chip status' + (states[status] ? ' ' + status : '')));
-      if (item.leader && item.leader.name) meta.append(leaderBadge(item.leader, true));
-      const participants = Array.isArray(item.participants) ? item.participants : [];
+      const leader = item.leader && item.leader.name ? withLive(item.leader, participants) : null;
+      if (leader) meta.append(leaderBadge(leader, true));
       meta.append(node('span', participants.length + ' 位成员', 'chip who'));
       body.append(head, meta);
       const faces = node('div', null, 'face-row');
@@ -333,11 +341,11 @@
         node('span', modes[conversation.mode] || '对话', 'badge mode'),
         node('span', states[conversation.status] || '状态待确认', 'badge ' + text(conversation.status))
       );
-      leader = conversation.leader && conversation.leader.name ? conversation.leader : null;
+      const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
+      leader = conversation.leader && conversation.leader.name ? withLive(conversation.leader, participants) : null;
       if (leader) meta.append(leaderBadge(leader, false));
       goal.textContent = text(conversation.goal);
       people.replaceChildren();
-      const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
       for (const person of participants) {
         const leading = leader && person.role === leader.role && Number(person.seat) === Number(leader.seat);
         const card = node('article', null, 'roster-card' + (leading ? ' is-leader' : '') + (person.live === false ? ' is-away' : ''));
