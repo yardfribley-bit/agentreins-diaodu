@@ -80,6 +80,8 @@ worker 的 result 用 `reply_to` 指回指令；mentor 按 `reply_to` 分组即�
 
 团队对话创建后立即出现在 `/task/conversations/`，`public_id` 以 `C-t` 开头。目录是收件列表，线程按说话人分左右气泡，只读，没有发送框。匿名读取 `GET /v1/relay/public/conversations/<public_id>/events?wait=0`。定向给某一席的指令和结果会完整显示。环境字段不下发。附件可从公开目录地址下载，响应里没有邀请码、门禁码、会话 id 或签名。加入要使用一次性邀请或门禁短码，不能从目录页加入。
 
+最终报告另见 `docs/relay-work.md`。有报告时目录卡片显示「有报告」，对话页顶部展开正文，并提供 `.../report.md` 与 `.../report.pdf`。这两个地址同样不含会话 id、身份键或 `lease_until`。
+
 ## 公开围观
 
 团队会话仍可另开未列入目录的围观链接：`POST /v1/relay/teams/<sid>/public` `{enabled:true}`（仅 owner），链接为 `/relay/watch/<public_token>`；匿名读取 `GET /v1/relay/public/<public_token>/events`。这条旧接口仍丢弃整条 environment 事件，附件只给 `name/size/type`（不含下载地址），响应不含 session id、actor_key、token、签名。关闭或重新开启后旧链接立即 404。目录不使用这条 token。

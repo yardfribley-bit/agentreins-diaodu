@@ -64,6 +64,8 @@ def get(handler, library, parsed):
         result = teams.who_is_leader(actor, parts[3])
     elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'online':
         result = teams.list_online(actor, parts[3])
+    elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'report':
+        result = teams.read_report(actor, parts[3])
     elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'tasks':
         query = parse_qs(parsed.query, keep_blank_values=True)
         if set(query) - {'status'} or any(len(values) != 1 for values in query.values()):
@@ -99,6 +101,13 @@ def _upload(handler, library, parts):
 def post(handler, library, parts):
     if len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'files':
         _upload(handler, library, parts)
+        return
+    if len(parts) == 5 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'report':
+        # Reports are far larger than chat messages. 4MB covers 40 万汉字 and
+        # the JSON wrapper; the store still enforces MAX_REPORT_CHARS.
+        actor = handler._actor(mutation=True)
+        body = handler._body(limit=4_000_000)
+        handler._json(200, library.teams.submit_report(actor, parts[3], body))
         return
     actor = handler._actor(mutation=True)
     body = handler._body(limit=65536)

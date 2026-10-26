@@ -187,6 +187,16 @@ def _public_conversations(handler, library, parsed):
             raise error or AuthError("没有这个公开附件", 404)
         handler._stream_file(item, path, content_type=item.get("type"), inline=item.get("inline", False))
         return
+    if len(parts) == 6 and parts[5] in ("report.md", "report.pdf"):
+        _one_query(query, set())
+        teams = getattr(library, "teams", None)
+        if teams is None:
+            raise AuthError("没有这个公开对话", 404)
+        kind = "markdown" if parts[5] == "report.md" else "pdf"
+        meta, path = teams.public_report_path(parts[4], kind)
+        content_type = "text/markdown; charset=utf-8" if kind == "markdown" else "application/pdf"
+        handler._stream_file(meta, path, content_type=content_type, inline=True)
+        return
     handler._json(404, {"error": "没有这个公开对话"})
 
 

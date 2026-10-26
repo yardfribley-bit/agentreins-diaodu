@@ -13,12 +13,14 @@ import math
 import os
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from diaodu import relay_files
+from diaodu import relay_files, report_pdf
 from diaodu.identity import AuthError
 from diaodu.relay import (
     DEFAULT_MAX_WAITERS, DEFAULT_SESSION_WAITERS, FILE_ID_RE, PUBLIC_ID_RE, Relay,
@@ -66,6 +68,11 @@ class RelayTeams:
     GATE_JOIN_IP_LIMIT = 30
     MAX_FILE_BYTES = 100 * 1024 * 1024
     MAX_ATTACHMENTS = 20
+    # Ordinary messages stay at 8000 characters. A team's final deliverable is
+    # a separate Markdown attachment so a long report is not sliced into
+    # several task results. One call or several appends may reach this cap.
+    MAX_REPORT_CHARS = 400_000
+    MAX_REPORT_CHUNK = 400_000
     # Raft-lite lease. A live leader blocks a new term so two workers cannot
     # both observe themselves as leader. Heartbeats renew the lease; they are
     # not work events. Election transitions go to team_protocol.
@@ -91,6 +98,7 @@ class RelayTeams:
         self.public_origin = (public_origin or "").rstrip("/")
         self.files_dir = root / "relay-team-files"
         self.files_dir.mkdir(parents=True, exist_ok=True)
+        self._pdf_lock = threading.Lock()
         self.key_path = root / "relay-team-files.key"
         self._signing_key = relay_files.load_key(self.key_path)
         self.path = root / "relay_teams.sqlite3"
@@ -183,6 +191,18 @@ class RelayTeams:
                   ON team_tasks(session_id, creator_key, request_id);
                 CREATE INDEX IF NOT EXISTS team_tasks_session
                   ON team_tasks(session_id, status, created);
+                CREATE TABLE IF NOT EXISTS team_reports (
+                  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT,
+                  file_id TEXT NOT NULL, title TEXT NOT NULL, chars INTEGER NOT NULL,
+                  sha256 TEXT NOT NULL, status TEXT NOT NULL,
+                  author_role TEXT NOT NULL, author_seat INTEGER NOT NULL,
+                  author_name TEXT NOT NULL, author_key TEXT NOT NULL,
+                  request_id TEXT NOT NULL, content_hash TEXT NOT NULL,
+                  created REAL NOT NULL, updated REAL NOT NULL, revision INTEGER NOT NULL);
+                CREATE UNIQUE INDEX IF NOT EXISTS team_reports_request
+                  ON team_reports(session_id, author_key, request_id);
+                CREATE INDEX IF NOT EXISTS team_reports_current
+                  ON team_reports(session_id, status, revision);
             """)
             for name, ddl in (
                 ("leader_role", "TEXT"),
@@ -314,7 +334,8 @@ class RelayTeams:
                 "members": roster,
                 "online": [item for item in roster if item["online"]],
                 "live": [item for item in roster if item["live"]],
-                "tasks": [self._task_json(row) for row in self._task_rows(db, session["id"])],
+                "tasks": self._tasks_for_report(db, session["id"]),
+                "report": self._report_member(self._current_report_row(db, session["id"])),
                 "mentor": self._peer(mentor, session=session) if mentor else None,
                 "workers": [self._peer(row, member["role"] != "worker"
                                        or row["seat"] == member["seat"], session)
@@ -609,9 +630,15 @@ class RelayTeams:
                 "participants": participants, "leader": self._public_leader(db, session),
                 "last_message": self._work_preview(db, session["id"]),
                 "tasks_total": len(task_rows),
-                "tasks_done": sum(1 for row in task_rows if row["status"] == "done")}
+                "tasks_done": sum(1 for row in task_rows if row["status"] == "done"),
+                "report_available": self._current_report_row(db, session["id"]) is not None}
         if not summary:
+            public_report = self._report_public(self._current_report_row(db, session["id"]),
+                                                session["public_id"])
+            if public_report:
+                item["report"] = public_report
             item["tasks"] = [self._task_json(row) for row in task_rows]
+            self._annotate_report(item["tasks"], public_report)
             item["leader_terms"] = self._leader_terms(db, session["id"])
         return item
 
@@ -694,7 +721,7 @@ class RelayTeams:
         """Work poll: instructions, results, tasks, membership. Not env or election."""
         if row["kind"] == "environment" or self._protocol_note_row(row):
             return False
-        return row["kind"] in ("message", "task", "joined", "state", "revoked")
+        return row["kind"] in ("message", "task", "joined", "state", "revoked", "report")
 
     def _page(self, actor, sid, after, stream="work", include_view=True):
         with self._read() as db:
@@ -783,7 +810,7 @@ class RelayTeams:
         return self._light_session(db, session, member)
 
     def send(self, actor, sid, body):
-        body = _body(body, {"kind", "text", "request_id", "reply_to", "to", "attachments", "task_id"})
+        body = _body(body, {"kind", "text", "request_id", "reply_to", "to", "attachments", "task_id", "outcome"})
         kind = body.get("kind")
         if kind not in ("instruction", "progress", "result", "question", "note"):
             raise ValueError("未知消息类型")
@@ -819,6 +846,11 @@ class RelayTeams:
             if not isinstance(task_id, str) or not task_id.startswith("tt_") or len(task_id) > 80:
                 raise ValueError("task_id不合法")
             message["task_id"] = task_id
+        outcome = body.get("outcome")
+        if outcome is not None:
+            if kind != "result" or outcome not in ("final", "draft", "failed", "empty"):
+                raise ValueError("outcome 只能用于结果，且须为 final、draft、failed 或 empty")
+            message["outcome"] = outcome
         hashed = hashlib.sha256(json.dumps(message, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         with self._write() as db:
             session, member = self._access(db, actor, sid)
@@ -2147,9 +2179,13 @@ class RelayTeams:
     def _work_preview(self, db, session_id):
         rows = db.execute(
             "SELECT kind, created, payload FROM team_events WHERE session_id=? "
-            "AND kind IN ('message','task') ORDER BY seq DESC LIMIT 40",
+            "AND kind IN ('message','task','report') ORDER BY seq DESC LIMIT 40",
             (session_id,)).fetchall()
         for row in rows:
+            if row["kind"] == "report":
+                report = json.loads(row["payload"]).get("report") or {}
+                title = report.get("title") if isinstance(report.get("title"), str) else ""
+                return {"kind": "report", "created_at": _iso(row["created"]), "preview": _preview(title)}
             if row["kind"] == "task":
                 task = json.loads(row["payload"]).get("task") or {}
                 title = task.get("title") if isinstance(task.get("title"), str) else ""
@@ -2174,6 +2210,16 @@ class RelayTeams:
             task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
             event["action"] = payload.get("action") if isinstance(payload.get("action"), str) else None
             event["task"] = self._public_task(task)
+            return event
+        if row["kind"] == "report":
+            payload = json.loads(row["payload"])
+            report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+            event["report"] = {
+                "title": report.get("title") if isinstance(report.get("title"), str) else "",
+                "chars": report.get("chars") if isinstance(report.get("chars"), int) else None,
+                "task_id": report.get("task_id") if isinstance(report.get("task_id"), str) else None,
+                "revision": report.get("revision") if isinstance(report.get("revision"), int) else None,
+            }
             return event
         event.update(Relay._public_payload(
             row["kind"], json.loads(row["payload"]), db, row["session_id"], "team_files",
@@ -2243,8 +2289,10 @@ class RelayTeams:
         self._touch(sid, _actor(actor))
         with self._read() as db:
             session, _member = self._access(db, actor, sid)
-            return {"tasks": [self._task_json(row) for row in self._task_rows(db, sid, status)],
-                    "leader": self._leader_public(db, session)}
+            report = self._report_member(self._current_report_row(db, sid))
+            tasks = [self._task_json(row) for row in self._task_rows(db, sid, status)]
+            self._annotate_report(tasks, report)
+            return {"tasks": tasks, "leader": self._leader_public(db, session), "report": report}
 
     def create_task(self, actor, sid, body):
         body = _body(body, {"title", "detail", "request_id", "parent_id"})
@@ -2397,3 +2445,296 @@ class RelayTeams:
                 return {"task": task, "duplicate": False, "coalesced": True}
             self._append(db, sid, member, "task", {"action": "updated", "task": task})
             return {"task": task, "duplicate": False, "coalesced": False}
+
+    # -- final report ---------------------------------------------------
+
+    def _tasks_for_report(self, db, sid):
+        report = self._report_member(self._current_report_row(db, sid))
+        tasks = [self._task_json(row) for row in self._task_rows(db, sid)]
+        self._annotate_report(tasks, report)
+        return tasks
+
+    @staticmethod
+    def _annotate_report(tasks, report):
+        if not report or not report.get("task_id"):
+            return tasks
+        brief = {"title": report.get("title"), "chars": report.get("chars"),
+                 "updated_at": report.get("updated_at"), "revision": report.get("revision")}
+        for task in tasks:
+            if task.get("id") == report["task_id"]:
+                task["report"] = brief
+        return tasks
+
+    def _current_report_row(self, db, sid):
+        return db.execute(
+            "SELECT * FROM team_reports WHERE session_id=? AND status='current' "
+            "ORDER BY revision DESC LIMIT 1", (sid,)).fetchone()
+
+    def _report_text(self, file_id):
+        if not isinstance(file_id, str) or FILE_ID_RE.fullmatch(file_id) is None:
+            raise AuthError("报告文件已不存在", 404)
+        path = self.files_dir / file_id
+        if not path.is_file():
+            raise AuthError("报告文件已不存在", 404)
+        return path.read_text(encoding="utf-8")
+
+    def _report_member(self, row, include_markdown=False):
+        if row is None:
+            return None
+        item = {"id": row["id"], "title": row["title"], "task_id": row["task_id"],
+                "chars": row["chars"], "sha256": row["sha256"], "revision": row["revision"],
+                "file_id": row["file_id"], "created_at": _iso(row["created"]),
+                "updated_at": _iso(row["updated"]),
+                "author": {"role": row["author_role"], "seat": row["author_seat"],
+                           "name": row["author_name"]}}
+        if include_markdown:
+            item["markdown"] = self._report_text(row["file_id"])
+        return item
+
+    def _report_public(self, row, public_id):
+        if row is None:
+            return None
+        base = self._base_url() + "/v1/relay/public/conversations/" + public_id
+        return {"available": True, "title": row["title"], "chars": row["chars"],
+                "revision": row["revision"], "task_id": row["task_id"],
+                "updated_at": _iso(row["updated"]),
+                "author": {"role": row["author_role"], "seat": row["author_seat"],
+                           "name": row["author_name"]},
+                "markdown_url": base + "/report.md",
+                "pdf_url": base + "/report.pdf"}
+
+    def _can_submit_report(self, session, member):
+        if member["role"] in ("owner", "mentor"):
+            return True
+        return self._is_leader_member(session, member)
+
+    def _normalize_report(self, value, *, strip):
+        if not isinstance(value, str) or "\x00" in value:
+            raise ValueError("报告正文不合法")
+        text = value.replace("\r\n", "\n").replace("\r", "\n")
+        if text.startswith("\ufeff"):
+            text = text[1:]
+        # Keep the author's bytes after newline normalization. strip only
+        # decides whether a replace of blank space is an empty report.
+        if strip and not text.strip():
+            raise ValueError("报告正文不能为空")
+        if not strip and not text:
+            raise ValueError("报告正文不能为空")
+        if len(text) > self.MAX_REPORT_CHUNK:
+            raise ValueError("报告正文超过单次长度限制")
+        return text
+
+    def _store_report_file(self, db, session, member, text):
+        raw = text.encode("utf-8")
+        file_id = "fl_" + secrets.token_hex(12)
+        target = self.files_dir / file_id
+        temporary = self.files_dir / (".report-" + secrets.token_hex(8))
+        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            view = memoryview(raw)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, target)
+        digest = hashlib.sha256(raw).hexdigest()
+        try:
+            db.execute("INSERT INTO team_files VALUES (?,?,?,?,?,?,?,?,?)",
+                       (file_id, session["id"], "report.md", len(raw), digest, "text/markdown",
+                        member["name"], member["actor_key"], time.time()))
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+        return file_id, digest, target
+
+    def submit_report(self, actor, sid, body):
+        body = _body(body, {"title", "markdown", "append", "task_id", "request_id", "mode"})
+        request_id = _text(body.get("request_id"), "request_id", 160)
+        has_markdown = "markdown" in body
+        has_append = "append" in body
+        if has_markdown and has_append:
+            raise ValueError("markdown 与 append 只能填写一个")
+        if not has_markdown and not has_append:
+            raise ValueError("需要 markdown 或 append")
+        mode = body.get("mode")
+        if mode is None:
+            mode = "append" if has_append else "replace"
+        elif mode not in ("replace", "append"):
+            raise ValueError("mode 须为 replace 或 append")
+        if mode == "replace" and not has_markdown:
+            raise ValueError("replace 需要 markdown")
+        if mode == "append" and not has_append:
+            raise ValueError("append 需要 append")
+        title_input = body.get("title")
+        if title_input is not None:
+            title_input = _text(title_input, "标题", 160)
+        task_id = body.get("task_id") if "task_id" in body else None
+        if task_id is not None and (not isinstance(task_id, str) or not task_id.startswith("tt_")
+                                    or len(task_id) > 80):
+            raise ValueError("task_id不合法")
+        chunk = self._normalize_report(body["markdown"] if mode == "replace" else body["append"],
+                                       strip=mode == "replace")
+        digest = hashlib.sha256(json.dumps(
+            {"mode": mode, "text": chunk, "title": title_input, "task_id": task_id},
+            ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        created_path = None
+        try:
+            with self._write() as db:
+                session, member = self._access(db, actor, sid)
+                self._require_task_open_session(session)
+                if not self._can_submit_report(session, member):
+                    raise AuthError("只有创建者、指导端或现任领导者可以提交最终报告", 403)
+                existing = db.execute(
+                    "SELECT * FROM team_reports WHERE session_id=? AND author_key=? AND request_id=?",
+                    (sid, member["actor_key"], request_id)).fetchone()
+                if existing is not None:
+                    if existing["content_hash"] != digest:
+                        raise AuthError("相同request_id不能对应不同报告", 409)
+                    return {"report": self._report_member(existing, include_markdown=True),
+                            "duplicate": True}
+                if task_id and not db.execute("SELECT 1 FROM team_tasks WHERE id=? AND session_id=?",
+                                              (task_id, sid)).fetchone():
+                    raise ValueError("任务不属于本团队会话")
+                current = self._current_report_row(db, sid)
+                if mode == "append" and current is not None:
+                    text = self._report_text(current["file_id"]) + chunk
+                else:
+                    text = chunk
+                if len(text) > self.MAX_REPORT_CHARS:
+                    raise ValueError("报告累计长度超过上限")
+                if title_input:
+                    title = title_input
+                elif current is not None:
+                    title = current["title"]
+                else:
+                    title = "最终报告"
+                if task_id is None and current is not None:
+                    task_id = current["task_id"]
+                file_id, sha, path = self._store_report_file(db, session, member, text)
+                created_path = path
+                now = time.time()
+                revision = (int(current["revision"]) if current is not None else 0) + 1
+                db.execute("UPDATE team_reports SET status='superseded' "
+                           "WHERE session_id=? AND status='current'", (sid,))
+                report_id = "tr_" + secrets.token_hex(8)
+                db.execute(
+                    "INSERT INTO team_reports (id,session_id,task_id,file_id,title,chars,sha256,"
+                    "status,author_role,author_seat,author_name,author_key,request_id,content_hash,"
+                    "created,updated,revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (report_id, sid, task_id, file_id, title, len(text), sha, "current",
+                     member["role"], member["seat"], member["name"], member["actor_key"],
+                     request_id, digest, now, now, revision))
+                db.execute("UPDATE team_members SET last_seen=? WHERE session_id=? AND actor_key=?",
+                           (now, sid, member["actor_key"]))
+                # The work-stream event does not reuse request_id: that column is
+                # also unique for ordinary messages from the same sender.
+                self._append(db, sid, member, "report",
+                             {"report": {"title": title, "chars": len(text),
+                                         "task_id": task_id, "revision": revision}},
+                             content_hash=digest, critical=True)
+                row = db.execute("SELECT * FROM team_reports WHERE id=?", (report_id,)).fetchone()
+                report = self._report_member(row)
+                report["markdown"] = text
+                result = {"report": report, "duplicate": False}
+            created_path = None
+            return result
+        finally:
+            if created_path is not None:
+                created_path.unlink(missing_ok=True)
+
+    def read_report(self, actor, sid):
+        self._touch(sid, _actor(actor))
+        with self._read() as db:
+            session, _member = self._access(db, actor, sid)
+            row = self._current_report_row(db, session["id"])
+            if row is None:
+                raise AuthError("还没有最终报告", 404)
+            return {"report": self._report_member(row, include_markdown=True)}
+
+    def _public_report_record(self, public_id):
+        if (not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None
+                or public_id[2] != self.PUBLIC_MARK):
+            raise AuthError("没有这个公开对话", 404)
+        with self._read() as db:
+            session = db.execute(
+                "SELECT * FROM team_sessions WHERE public_id=? AND visibility='public'",
+                (public_id,)).fetchone()
+            if session is None:
+                raise AuthError("没有这个公开对话", 404)
+            row = self._current_report_row(db, session["id"])
+            if row is None:
+                raise AuthError("还没有最终报告", 404)
+            spec = {"title": row["title"], "team_title": session["title"],
+                    "author_role": row["author_role"], "author_seat": row["author_seat"],
+                    "author_name": row["author_name"], "updated": row["updated"],
+                    "chars": row["chars"], "sha256": row["sha256"], "file_id": row["file_id"]}
+        spec["markdown"] = self._report_text(spec["file_id"])
+        return spec
+
+    def _pdf_cache_key(self, spec):
+        payload = json.dumps({
+            "v": report_pdf.RENDER_VERSION,
+            "sha": spec["sha256"],
+            "title": spec["title"],
+            "team": spec["team_title"],
+            "author": spec["author_name"],
+            "role": spec["author_role"],
+            "seat": spec["author_seat"],
+            "updated": _iso(spec["updated"]),
+        }, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def _ensure_pdf(self, spec):
+        key = self._pdf_cache_key(spec)
+        if len(key) != 64 or any(char not in "0123456789abcdef" for char in key):
+            raise AuthError("报告 PDF 暂不可用", 503)
+        folder = self.files_dir / "pdf-cache"
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / (key + ".pdf")
+        if dest.is_file() and dest.stat().st_size > 500 and dest.read_bytes()[:4] == b"%PDF":
+            return dest
+        with self._pdf_lock:
+            if dest.is_file() and dest.stat().st_size > 500 and dest.read_bytes()[:4] == b"%PDF":
+                return dest
+            temporary = folder / (".%s.%s.pdf" % (key, secrets.token_hex(4)))
+            try:
+                report_pdf.write_pdf(
+                    temporary, markdown=spec["markdown"], title=spec["title"],
+                    team_title=spec["team_title"],
+                    author=self._report_author_line(spec["author_role"], spec["author_seat"],
+                                                    spec["author_name"]),
+                    when=_report_clock(spec["updated"]), chars=spec["chars"])
+                os.replace(temporary, dest)
+            except report_pdf.PdfError as exc:
+                sys.stderr.write("report pdf failed: %s\n" % exc)
+                raise AuthError(
+                    "报告 PDF 暂不可用。生产环境需要可执行的 Chromium（或 WeasyPrint）以及 fonts-noto-cjk。",
+                    503)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return dest
+
+    @staticmethod
+    def _report_author_line(role, seat, name):
+        labels = {"owner": "管理者", "mentor": "指导", "worker": "执行"}
+        label = labels.get(role, "参与者")
+        if role == "worker" and isinstance(seat, int) and seat > 0:
+            label += " %d 号席" % seat
+        return "%s · %s" % (label, name)
+
+    def public_report_path(self, public_id, kind):
+        spec = self._public_report_record(public_id)
+        if kind == "markdown":
+            path = self.files_dir / spec["file_id"]
+            if not path.is_file():
+                raise AuthError("报告文件已不存在", 404)
+            return {"name": "report.md", "type": "text/markdown", "size": path.stat().st_size}, path
+        if kind != "pdf":
+            raise AuthError("没有这个公开报告", 404)
+        path = self._ensure_pdf(spec)
+        return {"name": "report.pdf", "type": "application/pdf", "size": path.stat().st_size}, path
+
+
+def _report_clock(value):
+    return datetime.fromtimestamp(float(value), timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")

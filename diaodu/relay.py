@@ -524,6 +524,8 @@ class Relay:
                         attachments.append(attachment)
             public = {"kind": message.get("kind"), "text": message.get("text"),
                       "reply_to": message.get("reply_to")}
+            if message.get("outcome") in ("final", "draft", "failed", "empty"):
+                public["outcome"] = message.get("outcome")
             if message.get("to") is not None:
                 public["to"] = message.get("to")
             if isinstance(message.get("task_id"), str):

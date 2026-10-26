@@ -10,7 +10,7 @@ TOOLS = [
     ('relay_team_list', '列出本人参与的团队会话。', {}, []),
     ('relay_team_get', '读取团队会话快照：指导席、各执行席在线/确认进度。', {'session': S}, ['session']),
     ('relay_team_read', '按序号增量读取工作流（指令、结果、任务、成员事件）。默认 stream=work，不含 ELECT/LEADER/HB 与环境。stream=system 用另一条游标读取选举变更。默认附带完整会话（leader、members、online、tasks）；view=0 只返回游标、身份和 leader，便于长轮询。', {'session': S, 'after': {'type': 'integer', 'minimum': 0}, 'wait': {'type': 'integer', 'minimum': 0, 'maximum': 20}, 'stream': {'type': 'string', 'enum': ['work', 'system']}, 'view': {'type': 'integer', 'minimum': 0, 'maximum': 1}}, ['session']),
-    ('relay_team_send', '发送指令/进度/结果/问题/备注。可带 task_id 挂到任务板。mentor、owner 与现任领导者可用 to="worker:N"；其他 worker 只能默认或 to="all"。以 ELECT、LEADER、HB、VOTE 开头的 note 不进入工作流，转交选举侧信道。可带 attachments（≤20）。', {'session': S, 'kind': KIND, 'text': S, 'request_id': S, 'reply_to': {'type': 'integer', 'minimum': 1}, 'to': S, 'task_id': S, 'attachments': {'type': 'array', 'items': S, 'maxItems': 20}}, ['session', 'kind', 'text', 'request_id']),
+    ('relay_team_send', '发送指令/进度/结果/问题/备注。可带 task_id 挂到任务板。mentor、owner 与现任领导者可用 to="worker:N"；其他 worker 只能默认或 to="all"。以 ELECT、LEADER、HB、VOTE 开头的 note 不进入工作流，转交选举侧信道。可带 attachments（≤20）。结果可带 outcome=final|draft|failed|empty，公开页会把草稿、失败和空结果折起来。长文最终交付用 relay_team_report，不要拆进多条 result。', {'session': S, 'kind': KIND, 'text': S, 'request_id': S, 'reply_to': {'type': 'integer', 'minimum': 1}, 'to': S, 'task_id': S, 'attachments': {'type': 'array', 'items': S, 'maxItems': 20}, 'outcome': {'type': 'string', 'enum': ['final', 'draft', 'failed', 'empty']}}, ['session', 'kind', 'text', 'request_id']),
     ('relay_team_who_is_leader', '查询现任领导者、任期与选举是否进行中。不要从备注正文里找 ELECT/LEADER。', {'session': S}, ['session']),
     ('relay_team_list_online', '查询成员名单。online 是约 60 秒的展示旗标；派活看 live 和 last_seen_age_s（与 20 秒租约窗口一致）。另有 live 数组。不含环境与邀请码。', {'session': S}, ['session']),
     ('relay_team_elect', '发起或加入 Raft-lite 选举并给自己投票。已有未过期领导者时拒绝，避免双主。过半数后服务端写入唯一领导者。', {'session': S}, ['session']),
@@ -22,6 +22,8 @@ TOOLS = [
     ('relay_team_task_claim', '指导端或执行端认领未分配任务，状态变为 in_progress。', {'session': S, 'task_id': S}, ['session', 'task_id']),
     ('relay_team_task_assign', '创建者、指导端或现任领导者把任务指派给某个席位。席位号不会复用。目标须在租约窗口内（live）。已离开窗口时拒绝；确认后可传 allow_offline=true，响应带 warning。', {'session': S, 'task_id': S, 'role': ROLE, 'seat': {'type': 'integer', 'minimum': 0, 'maximum': 10000}, 'allow_offline': {'type': 'boolean'}}, ['session', 'task_id', 'role', 'seat']),
     ('relay_team_task_update', '认领者、领导者或创建者更新进度、状态或说明。done 会把进度记为 100（除非另行给出）。只改 progress 时写入任务板，不往工作流追加事件。', {'session': S, 'task_id': S, 'progress': {'type': 'integer', 'minimum': 0, 'maximum': 100}, 'status': {'type': 'string', 'enum': ['open', 'in_progress', 'done']}, 'detail': S}, ['session', 'task_id']),
+    ('relay_team_report', '提交团队最终报告（Markdown），存成附件。现任领导者、创建者或指导端可提交。markdown 整篇替换，append 原样追加，二者择一。单次与累计最多 40 万字。可带 task_id 挂到父任务。公开页同时提供 report.md 与 report.pdf。', {'session': S, 'request_id': S, 'title': S, 'markdown': S, 'append': S, 'task_id': S, 'mode': {'type': 'string', 'enum': ['replace', 'append']}}, ['session', 'request_id']),
+    ('relay_team_report_read', '读取当前最终报告的 Markdown 全文，供智能体继续使用。不含身份键、邀请码或租约。', {'session': S}, ['session']),
     ('relay_team_ack', '确认已接收至指定全局 seq（不等于执行完成）。', {'session': S, 'seq': {'type': 'integer', 'minimum': 0}}, ['session', 'seq']),
     ('relay_team_heartbeat', '刷新在线状态；执行端可更新系统环境。', {'session': S, 'environment': ENV}, ['session']),
     ('relay_team_state', '仅创建者：暂停、继续或结束团队会话。', {'session': S, 'status': {'type': 'string', 'enum': ['active', 'paused', 'closed']}}, ['session', 'status']),
@@ -83,6 +85,10 @@ def call(name, args, actor, teams, identity, client_ip=None):
         return teams.assign_task(actor, sid, args.get('task_id'), body)
     if name == 'relay_team_task_update':
         return teams.update_task(actor, sid, args.get('task_id'), body)
+    if name == 'relay_team_report':
+        return teams.submit_report(actor, sid, body)
+    if name == 'relay_team_report_read':
+        return teams.read_report(actor, sid)
     if name == 'relay_team_invite':
         return teams.invite(actor, sid, body)
     if name == 'relay_team_invites':
