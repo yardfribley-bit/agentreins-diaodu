@@ -87,3 +87,7 @@
 - 这些调用的返回体是 `{protocol, op, applied, leader, election, session}`，没有工作事件的 `event`。
 - 选举变更用 `relay_team_read` 的 `stream=system`，序号从 0 另计，不要和 `last_seq` 混用。
 - 新的 worker 应改调 `elect`、`vote`、`leader_heartbeat`、`who_is_leader`、`list_online`。
+
+## 公开页
+
+公开目录和对话页只读同一份结构化数据。团队成员公开 `live` 与 `last_seen_age_s`，列表项公开 `tasks_total` 与 `tasks_done`，方便花名册和进度。这些字段不含身份键、环境或租约截止时间。领导者对象里的 `live` 由公开 `leader` 提供；页面徽章用它，不用 60 秒的 `online`。

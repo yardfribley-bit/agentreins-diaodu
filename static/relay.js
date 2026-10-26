@@ -239,7 +239,13 @@
     if (leader && member && leader.role === role && Number(leader.seat) === Number(seat)) {
       top.append(element('span','领导者','peer-leader'));
     }
-    top.append(element('span',member ? (member.online === true ? '在线' : '离线') : '等待接入','peer-presence' + (member?.online === true ? ' online' : '')));
+    const presence = !member ? ['等待接入', '']
+      : member.live === true ? ['在席', ' live']
+      : member.live === false && member.online === true ? ['刚离开', ' away']
+      : member.live === false ? ['离席', '']
+      : member.online === true ? ['在线', ' online']
+      : ['离线', ''];
+    top.append(element('span', presence[0], 'peer-presence' + presence[1]));
     card.append(top);
     card.append(element('p',member?.name || '尚未接入','peer-name'));
     if (member) {
@@ -341,12 +347,36 @@
       list.replaceChildren(element('p','还没有任务。任务板和下面的消息是同一份记录。','peer-vacant'));
       return;
     }
-    list.replaceChildren(...tasks.slice(0, 12).map(task => {
-      const item = element('article', null, 'summary-item');
+    const ids = new Set(tasks.map(task => text(task.id)));
+    const children = new Map();
+    for (const task of tasks) {
+      const parent = text(task.parent_id);
+      if (parent && ids.has(parent)) {
+        if (!children.has(parent)) children.set(parent, []);
+        children.get(parent).push(task);
+      }
+    }
+    const ordered = [];
+    const walk = (task, depth) => {
+      ordered.push([task, depth]);
+      for (const child of children.get(text(task.id)) || []) walk(child, depth + 1);
+    };
+    for (const task of tasks) {
+      const parent = text(task.parent_id);
+      if (!parent || !ids.has(parent)) walk(task, 0);
+    }
+    list.replaceChildren(...ordered.slice(0, 16).map(([task, depth]) => {
+      const item = element('article', null, 'summary-item' + (depth ? ' task-child' : ''));
+      if (depth) item.style.marginLeft = Math.min(depth, 3) * 14 + 'px';
       const assignee = task.assignee;
       const who = assignee ? (text(assignee.name) || '成员') + ' · ' + (assignee.seat ?? '') + '号席' : '未认领';
       item.append(element('p', (text(task.title) || '未命名任务') + ' · ' + (taskStatuses[task.status] || ''), 'summary-instruction'));
       item.append(element('p', who + ' · ' + (Number(task.progress) || 0) + '%', 'summary-seat'));
+      const meter = element('div', null, 'task-meter');
+      const fill = element('span', '', 'task-meter-fill');
+      fill.style.width = Math.max(0, Math.min(100, Number(task.progress) || 0)) + '%';
+      meter.append(fill);
+      item.append(meter);
       return item;
     }));
   }
