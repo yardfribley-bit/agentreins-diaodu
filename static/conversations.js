@@ -46,6 +46,21 @@
     if (!/^C-[pt][0-9a-f]{8}\/files\/fl_[0-9a-f]{24}$/.test(rest)) return '';
     return url.pathname;
   }
+  function leaderBadge(leader, compact) {
+    const seat = Number(leader.seat);
+    const seatText = compact ? '' : (leader.role === 'worker' && Number.isInteger(seat) && seat > 0
+      ? seat + ' 号席 · ' : (leader.role === 'mentor' ? '指导 · ' : ''));
+    const termText = !compact && leader.term ? ' · 第' + text(leader.term) + '任期' : '';
+    const away = leader.live === false;
+    const badge = node('span', null, (compact ? 'chip leader' : 'badge leader') + (away ? ' is-away' : ''));
+    if (leader.live === true || away) {
+      const dot = node('span', '', leader.live === true ? 'live-dot' : 'away-dot');
+      dot.setAttribute('aria-hidden', 'true');
+      badge.append(dot);
+    }
+    badge.append(document.createTextNode('领导者 ' + seatText + text(leader.name) + termText));
+    return badge;
+  }
   function personLabel(person) {
     const role = roles[person.role] || '参与者';
     const seat = Number(person.seat);
@@ -127,7 +142,7 @@
       const status = text(item.status);
       chips.append(node('span', states[item.status] || '状态待确认', 'chip status' + (states[status] ? ' ' + status : '')));
       if (item.leader && item.leader.name) {
-        chips.append(node('span', '领导者 ' + text(item.leader.name), 'chip leader'));
+        chips.append(leaderBadge(item.leader, true));
       }
       const participants = Array.isArray(item.participants) ? item.participants : [];
       for (const person of participants.slice(0, 3)) chips.append(node('span', personLabel(person), 'chip who'));
@@ -224,13 +239,7 @@
         node('span', states[conversation.status] || '状态待确认', 'badge ' + text(conversation.status))
       );
       const leader = conversation.leader;
-      if (leader && leader.name) {
-        const seat = Number(leader.seat);
-        const seatText = leader.role === 'worker' && Number.isInteger(seat) && seat > 0
-          ? seat + ' 号席 · ' : (leader.role === 'mentor' ? '指导 · ' : '');
-        const termText = leader.term ? ' · 第' + text(leader.term) + '任期' : '';
-        meta.append(node('span', '领导者 ' + seatText + text(leader.name) + termText, 'badge leader'));
-      }
+      if (leader && leader.name) meta.append(leaderBadge(leader, false));
       goal.textContent = text(conversation.goal);
       people.replaceChildren();
       const participants = Array.isArray(conversation.participants) ? conversation.participants : [];

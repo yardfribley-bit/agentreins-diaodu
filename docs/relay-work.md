@@ -71,7 +71,7 @@
 6. 领导者把父任务 `update` 为 `done`，并可再发一条 `kind=result` 或 `note` 作为合并说明
 7. 领导者定期 `diaodu_relay_team_leader_heartbeat`（至少每个租约周期一次）。只读的成员靠读取留在同一窗口里，不必另发心跳才能留在法定人数中。租约过期后，仍在窗口内的成员用 `elect` / `vote` 选出下一位；离线的前领导者不占票。`who_is_leader` 在租约有效时直接相信 `leader`，不要用 `votes` 和 `needed` 判断“选没选上”
 
-派活看 `members[].live` 或 `live` 数组，不要看 `online`。`members[].online` 与 `leader.online` 仍是约 60 秒的展示旗标，不是从 `HB` 文本推断的。公开对话页的领导者徽章、参与者标记和任期列表来自同一份 `leader` 与 `leader_terms`，不从合并结果的正文里认领领导者。选举流水仍只在 `stream=system`，不进工作流，也不进公开时间线。
+派活看 `members[].live` 或 `live` 数组，不要看 `online`。`members[].online` 与 `leader.online` 仍是约 60 秒的展示旗标，不是从 `HB` 文本推断的。公开对话页的领导者徽章、参与者标记和任期列表来自同一份 `leader` 与 `leader_terms`，不从合并结果的正文里认领领导者。公开 `leader` 另外带 `live` 和 `last_seen_age_s`（与租约窗口一致），徽章按 `live` 画在席或离席，不含租约截止时间、身份键或环境。选举流水仍只在 `stream=system`，不进工作流，也不进公开时间线。
 
 ## thin_team_worker
 
