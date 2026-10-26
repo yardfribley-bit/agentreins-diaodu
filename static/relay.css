@@ -441,8 +441,19 @@ dialog {
   background: var(--line);
 }
 
-.peer-presence.online { color: var(--ok); }
-.peer-presence.online:before { background: var(--ok); }
+.peer-presence.online, .peer-presence.live { color: var(--ok); }
+.peer-presence.online:before, .peer-presence.live:before { background: var(--ok); }
+.peer-presence.away { color: var(--warn); }
+.peer-presence.away:before { background: var(--warn); }
+.task-meter {
+  height: 4px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: var(--bg);
+  overflow: hidden;
+}
+.task-meter-fill { display: block; height: 100%; background: var(--primary); }
+.summary-item.task-child { border-left: 2px solid var(--line); }
 .peer-leader {
   margin-left: 8px;
   color: var(--warn);

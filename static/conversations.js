@@ -13,6 +13,7 @@
   const roles = {owner:'管理者', mentor:'指导', worker:'执行'};
   const states = {active:'进行中', paused:'已暂停', closed:'已结束'};
   const modes = {pair:'一对一', team:'团队'};
+  const taskState = {open:'待认领', in_progress:'进行中', done:'已完成'};
 
   const text = value => typeof value === 'string' ? value : typeof value === 'number' ? String(value) : '';
   function node(tag, textValue, className) {
@@ -46,6 +47,24 @@
     if (!/^C-[pt][0-9a-f]{8}\/files\/fl_[0-9a-f]{24}$/.test(rest)) return '';
     return url.pathname;
   }
+  function taskAnchor(id) {
+    return /^tt_[0-9a-f]{8,32}$/.test(id) ? 'task-' + id : '';
+  }
+  function leaderBadge(leader, compact) {
+    const seat = Number(leader.seat);
+    const seatText = compact ? '' : (leader.role === 'worker' && Number.isInteger(seat) && seat > 0
+      ? seat + ' 号席 · ' : (leader.role === 'mentor' ? '指导 · ' : ''));
+    const termText = !compact && leader.term ? ' · 第' + text(leader.term) + '任期' : '';
+    const away = leader.live === false;
+    const badge = node('span', null, (compact ? 'chip leader' : 'badge leader') + (away ? ' is-away' : ''));
+    if (leader.live === true || away) {
+      const dot = node('span', '', leader.live === true ? 'live-dot' : 'away-dot');
+      dot.setAttribute('aria-hidden', 'true');
+      badge.append(dot);
+    }
+    badge.append(document.createTextNode('领导者 ' + seatText + text(leader.name) + termText));
+    return badge;
+  }
   function personLabel(person) {
     const role = roles[person.role] || '参与者';
     const seat = Number(person.seat);
@@ -56,14 +75,20 @@
     const label = text(value).trim();
     return label ? label.slice(0, 1) : '对';
   }
+  function presenceDot(person) {
+    if (person.live !== true && person.live !== false) return null;
+    const dot = node('span', '', person.live === true ? 'live-dot' : 'away-dot');
+    dot.setAttribute('aria-hidden', 'true');
+    return dot;
+  }
 
   if (!isThread) renderDirectory();
   else renderThread();
 
   function renderDirectory() {
     const state = {mode:'', status:'', cursor:null, loading:false};
-    app.append(node('p', 'Agent 通信', 'page-kicker'), node('h1', '对话'));
-    app.append(node('p', '这里是公开目录。点进一场对话可以阅读全文。加入和发送仍在通信工作台，需要配对码或邀请。', 'lede'));
+    app.append(node('p', 'Agent 协作', 'page-kicker'), node('h1', '公开对话'));
+    app.append(node('p', '这些是正在协作的团队和一对一对话。点进去看领导者、任务和他们怎么把话说完。加入和发送在通信工作台。', 'lede'));
     const filters = node('div', null, 'filter-bar');
     filters.setAttribute('role', 'group');
     filters.setAttribute('aria-label', '筛选对话');
@@ -112,29 +137,46 @@
     function card(item) {
       const id = text(item.public_id);
       if (!/^C-[pt][0-9a-f]{8}$/.test(id)) return null;
-      const link = node('a', null, 'conversation-card inbox-row');
+      const link = node('a', null, 'conversation-card');
       link.href = './' + id + '/';
-      const avatar = node('span', initial(item.title), 'avatar');
-      avatar.setAttribute('aria-hidden', 'true');
-      const body = node('div', null, 'inbox-body');
-      const head = node('div', null, 'inbox-head');
+      const body = node('div', null, 'card-body');
+      const head = node('div', null, 'card-head');
       head.append(node('h2', text(item.title) || '未命名对话'));
       const stamp = node('time', when(item.updated_at));
       stamp.dateTime = text(item.updated_at);
       head.append(stamp);
-      const chips = node('div', null, 'inbox-chips');
-      chips.append(node('span', modes[item.mode] || '对话', 'chip mode'));
+      const meta = node('div', null, 'card-meta');
+      meta.append(node('span', modes[item.mode] || '对话', 'chip mode'));
       const status = text(item.status);
-      chips.append(node('span', states[item.status] || '状态待确认', 'chip status' + (states[status] ? ' ' + status : '')));
-      if (item.leader && item.leader.name) {
-        chips.append(node('span', '领导者 ' + text(item.leader.name), 'chip leader'));
-      }
+      meta.append(node('span', states[item.status] || '状态待确认', 'chip status' + (states[status] ? ' ' + status : '')));
+      if (item.leader && item.leader.name) meta.append(leaderBadge(item.leader, true));
       const participants = Array.isArray(item.participants) ? item.participants : [];
-      for (const person of participants.slice(0, 3)) chips.append(node('span', personLabel(person), 'chip who'));
+      meta.append(node('span', participants.length + ' 位成员', 'chip who'));
+      body.append(head, meta);
+      const faces = node('div', null, 'face-row');
+      faces.setAttribute('aria-hidden', 'true');
+      for (const person of participants.slice(0, 8)) {
+        const away = person.live === false ? ' is-away' : '';
+        const face = node('span', initial(person.name || roles[person.role]), 'avatar avatar-' + (person.role || 'member') + away);
+        faces.append(face);
+      }
+      if (faces.childElementCount) body.append(faces);
+      const total = Number(item.tasks_total);
+      const done = Number(item.tasks_done);
+      if (Number.isFinite(total) && total > 0 && Number.isFinite(done)) {
+        const ratio = Math.max(0, Math.min(1, done / total));
+        const meter = node('div', null, 'meter');
+        meter.setAttribute('role', 'img');
+        meter.setAttribute('aria-label', done + ' / ' + total + ' 项任务已完成');
+        const fill = node('span', '', 'meter-fill');
+        fill.style.width = Math.round(ratio * 100) + '%';
+        meter.append(fill);
+        body.append(meter, node('p', done + ' / ' + total + ' 项已完成', 'meter-label'));
+      }
       const last = item.last_message;
       const preview = last && text(last.preview) ? text(last.preview) : text(item.goal);
-      body.append(head, chips, node('p', preview, 'inbox-preview'));
-      link.append(avatar, body);
+      if (preview) body.append(node('p', preview, 'card-preview'));
+      link.append(body);
       return link;
     }
     async function load(append) {
@@ -160,12 +202,13 @@
         state.cursor = data.has_more ? text(data.next_cursor) : null;
         more.hidden = !state.cursor;
         empty.hidden = list.childElementCount !== 0;
-        statusLine.textContent = list.childElementCount ? '' : '';
+        statusLine.textContent = '';
       } catch (error) {
         statusLine.textContent = '目录暂时读不到，请稍后重试。';
       } finally {
         state.loading = false;
         more.disabled = false;
+        paintFilters();
       }
     }
     paintFilters();
@@ -173,40 +216,48 @@
   }
 
   function renderThread() {
-    const header = node('header', null, 'thread-header');
-    const back = node('p', null, 'page-kicker');
-    const backLink = node('a', '返回目录');
-    backLink.href = '../';
-    back.append(backLink);
-    const title = node('h1', '对话');
+    const back = node('a', '全部对话');
+    back.href = '../';
+    const kicker = node('p', null, 'page-kicker');
+    kicker.append(back);
+    const title = node('h1', '正在读取…');
     const meta = node('div', null, 'thread-meta');
     const goal = node('p', '', 'goal');
-    const people = node('div', null, 'participant-row');
-    const termsBox = node('div', null, 'term-list');
+    const rosterTitle = node('h2', '参与者', 'section-title');
+    const people = node('div', null, 'roster');
+    const termsBox = node('div', null, 'term-row');
     termsBox.hidden = true;
-    header.append(back, title, meta, goal, people, termsBox);
-    const banner = node('p', '此页只读，不能在这里发送或加入。', 'read-only');
+    const tasksTitle = node('h2', '任务', 'section-title');
     const tasksBox = node('section', null, 'task-board');
+    const tasksList = node('div', null, 'task-tree');
+    tasksBox.append(tasksTitle, tasksList);
     tasksBox.hidden = true;
-    tasksBox.append(node('h2', '任务板'));
-    const tasksList = node('div', null, 'task-list');
-    tasksBox.append(tasksList);
+    const talkTitle = node('h2', '对话', 'section-title');
     const feed = node('div', null, 'thread');
-    feed.setAttribute('role', 'log');
     feed.setAttribute('aria-live', 'polite');
-    feed.setAttribute('aria-label', '对话记录');
-    const statusLine = node('p', '正在读取…', 'muted');
+    const statusLine = node('p', '正在读取…', 'read-only');
     statusLine.setAttribute('role', 'status');
-    app.append(header, banner, tasksBox, feed, statusLine);
-    let cursor = 0, stopped = false, leaderTerms = [];
+    app.append(kicker, title, meta, goal, rosterTitle, people, termsBox, tasksBox, talkTitle, feed, statusLine);
 
-    function termAt(created) {
-      let current = null;
-      const stamp = text(created);
+    let cursor = 0;
+    let stopped = false;
+    let leader = null;
+    let leaderTerms = [];
+    const spoken = [];
+    const titles = new Map();
+
+    function termAt(iso) {
+      const at = Date.parse(iso);
+      if (!Number.isFinite(at)) return null;
+      let found = null;
       for (const term of leaderTerms) {
-        if (text(term.started_at) && text(term.started_at) <= stamp) current = term;
+        const start = Date.parse(term.started_at);
+        if (!Number.isFinite(start) || start > at) continue;
+        const end = term.ended_at ? Date.parse(term.ended_at) : NaN;
+        if (term.ended_at && Number.isFinite(end) && end < at) continue;
+        found = term;
       }
-      return current;
+      return found;
     }
     function termLabel(term) {
       if (!term || !term.name) return '';
@@ -214,6 +265,65 @@
       const who = term.role === 'worker' && Number.isInteger(seat) && seat > 0
         ? seat + ' 号席 ' + text(term.name) : text(term.name);
       return '第' + text(term.term) + '任期 · ' + who;
+    }
+    function senderKey(event) {
+      const sender = event.sender || {};
+      return [text(sender.role || event.role), String(sender.seat ?? event.seat ?? ''), text(sender.name)].join('|');
+    }
+    function resultPreview(taskId) {
+      let found = '';
+      for (const event of spoken) {
+        const message = event.message || {};
+        if (text(message.task_id) === taskId && message.kind === 'result') {
+          found = text(message.text).replace(/\s+/g, ' ').trim();
+        }
+      }
+      if (found.length > 96) return found.slice(0, 96) + '…';
+      return found;
+    }
+    function paintTasks(tasks) {
+      tasksList.replaceChildren();
+      tasksBox.hidden = !tasks.length;
+      if (!tasks.length) return;
+      const ids = new Set(tasks.map(task => text(task.id)));
+      const children = new Map();
+      const roots = [];
+      for (const task of tasks) {
+        const parent = text(task.parent_id);
+        if (parent && ids.has(parent)) {
+          if (!children.has(parent)) children.set(parent, []);
+          children.get(parent).push(task);
+        } else roots.push(task);
+      }
+      const draw = (task, depth) => {
+        const id = text(task.id);
+        titles.set(id, text(task.title) || '未命名任务');
+        const card = node('article', null, 'task-card depth-' + Math.min(depth, 3) + ' status-' + text(task.status));
+        const anchor = taskAnchor(id);
+        if (anchor) card.id = anchor;
+        const head = node('div', null, 'task-card-head');
+        head.append(node('h3', text(task.title) || '未命名任务'));
+        head.append(node('span', taskState[task.status] || text(task.status), 'pill status-' + text(task.status)));
+        card.append(head);
+        const assignee = task.assignee;
+        const seat = assignee ? Number(assignee.seat) : NaN;
+        const who = assignee
+          ? (assignee.role === 'worker' && Number.isInteger(seat) && seat > 0 ? seat + ' 号席 ' : '') + text(assignee.name)
+          : '未认领';
+        card.append(node('p', who + ' · ' + (Number(task.progress) || 0) + '%', 'task-meta'));
+        const meter = node('div', null, 'meter');
+        const fill = node('span', '', 'meter-fill');
+        fill.style.width = Math.max(0, Math.min(100, Number(task.progress) || 0)) + '%';
+        meter.append(fill);
+        card.append(meter);
+        const preview = resultPreview(id);
+        if (preview) card.append(node('p', preview, 'task-preview'));
+        const led = termLabel(termAt(task.updated_at || task.created_at));
+        if (led) card.append(node('p', led, 'task-term'));
+        tasksList.append(card);
+        for (const child of children.get(id) || []) draw(child, depth + 1);
+      };
+      for (const task of roots) draw(task, 0);
     }
     function paintConversation(conversation) {
       if (!conversation) return;
@@ -223,25 +333,29 @@
         node('span', modes[conversation.mode] || '对话', 'badge mode'),
         node('span', states[conversation.status] || '状态待确认', 'badge ' + text(conversation.status))
       );
-      const leader = conversation.leader;
-      if (leader && leader.name) {
-        const seat = Number(leader.seat);
-        const seatText = leader.role === 'worker' && Number.isInteger(seat) && seat > 0
-          ? seat + ' 号席 · ' : (leader.role === 'mentor' ? '指导 · ' : '');
-        const termText = leader.term ? ' · 第' + text(leader.term) + '任期' : '';
-        meta.append(node('span', '领导者 ' + seatText + text(leader.name) + termText, 'badge leader'));
-      }
+      leader = conversation.leader && conversation.leader.name ? conversation.leader : null;
+      if (leader) meta.append(leaderBadge(leader, false));
       goal.textContent = text(conversation.goal);
       people.replaceChildren();
       const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
       for (const person of participants) {
         const leading = leader && person.role === leader.role && Number(person.seat) === Number(leader.seat);
-        const chip = node('span', null, 'participant' + (leading ? ' is-leader' : ''));
+        const card = node('article', null, 'roster-card' + (leading ? ' is-leader' : '') + (person.live === false ? ' is-away' : ''));
         const mark = node('span', initial(person.name || roles[person.role]), 'avatar avatar-' + (person.role || 'member'));
         mark.setAttribute('aria-hidden', 'true');
-        chip.append(mark, node('span', personLabel(person)));
-        if (leading) chip.append(node('span', '领导者', 'leader-mark'));
-        people.append(chip);
+        const copy = node('div', null, 'roster-copy');
+        copy.append(node('p', text(person.name) || '未命名', 'roster-name'));
+        const role = node('p', null, 'roster-role');
+        const dot = presenceDot(person);
+        if (dot) role.append(dot);
+        const seat = Number(person.seat);
+        const seatText = person.role === 'worker' && Number.isInteger(seat) && seat > 0 ? ' · ' + seat + ' 号席' : '';
+        const liveText = person.live === true ? '在席' : person.live === false ? '离席' : '';
+        role.append(document.createTextNode((roles[person.role] || '参与者') + seatText + (liveText ? ' · ' + liveText : '')));
+        copy.append(role);
+        if (leading) copy.append(node('p', '现任领导者', 'leader-mark'));
+        card.append(mark, copy);
+        people.append(card);
       }
       leaderTerms = Array.isArray(conversation.leader_terms) ? conversation.leader_terms : [];
       termsBox.replaceChildren();
@@ -254,44 +368,50 @@
           if (label) termsBox.append(node('span', label, 'term-chip'));
         }
       }
-      const tasks = Array.isArray(conversation.tasks) ? conversation.tasks : [];
-      tasksList.replaceChildren();
-      tasksBox.hidden = !tasks.length;
-      const taskState = {open:'待认领', in_progress:'进行中', done:'已完成'};
-      for (const task of tasks) {
-        const row = node('div', null, 'task-row');
-        const assignee = task.assignee;
-        const seat = assignee ? Number(assignee.seat) : NaN;
-        const who = assignee
-          ? (assignee.role === 'worker' && Number.isInteger(seat) && seat > 0 ? seat + ' 号席 ' : '') + text(assignee.name)
-          : '未认领';
-        row.append(node('span', text(task.title) || '未命名任务', 'task-title'));
-        row.append(node('span', taskState[task.status] || text(task.status), 'task-state'));
-        row.append(node('span', who + ' · ' + (Number(task.progress) || 0) + '%', 'task-progress'));
-        const led = termAt(task.updated_at || task.created_at);
-        const ledLabel = termLabel(led);
-        if (ledLabel) row.append(node('span', ledLabel, 'task-term'));
-        tasksList.append(row);
-      }
+      paintTasks(Array.isArray(conversation.tasks) ? conversation.tasks : []);
     }
-    function senderKey(event) {
-      const sender = event.sender || {};
-      return [text(sender.role || event.role), String(sender.seat ?? event.seat ?? ''), text(sender.name)].join('|');
+    function messageBody(value) {
+      const raw = text(value);
+      const lines = raw.split('\n');
+      const code = raw.includes('```') || lines.some(line => line.startsWith('$ ') || line.startsWith('$'));
+      const long = raw.length > 360 || lines.length > 8;
+      if (!long && !code) return node('p', raw, 'bubble-text');
+      const details = document.createElement('details');
+      details.className = code ? 'fold code' : 'fold';
+      const summary = document.createElement('summary');
+      const preview = raw.replace(/\s+/g, ' ').trim().slice(0, 72);
+      summary.textContent = (code ? '代码输出' : '长消息') + (preview ? ' · ' + preview : '');
+      const body = document.createElement(code ? 'pre' : 'p');
+      body.className = code ? 'bubble-code' : 'bubble-text';
+      body.textContent = raw;
+      details.append(summary, body);
+      return details;
+    }
+    function taskLink(taskId) {
+      const id = text(taskId);
+      const anchor = taskAnchor(id);
+      if (!anchor) return null;
+      const link = node('a', titles.get(id) || '关联任务', 'task-link');
+      link.href = '#' + anchor;
+      return link;
     }
     function renderEvent(event) {
       const message = event.kind === 'message' ? event.message || null : null;
       if (event.kind === 'task') {
         const task = event.task || {};
-        const taskState = {open:'待认领', in_progress:'进行中', done:'已完成'}[task.status] || text(task.status);
+        const stateLabel = taskState[task.status] || text(task.status);
         const assignee = task.assignee;
         const seat = assignee ? Number(assignee.seat) : NaN;
         const who = assignee && assignee.name
           ? ' · ' + (assignee.role === 'worker' && Number.isInteger(seat) && seat > 0 ? seat + ' 号席 ' : '') + text(assignee.name)
           : '';
-        const led = termLabel(termAt(event.created_at));
-        const taskLabel = '任务「' + text(task.title) + '」' + taskState + who + (led ? ' · ' + led : '');
         const line = node('div', null, 'system-turn');
-        line.append(node('span', taskLabel), node('time', when(event.created_at)));
+        line.append(node('span', '任务「' + text(task.title) + '」' + stateLabel + who));
+        const jump = taskLink(task.id);
+        if (jump) line.append(jump);
+        const stamp = node('time', when(event.created_at));
+        stamp.dateTime = text(event.created_at);
+        line.append(stamp);
         feed.append(line);
         return;
       }
@@ -307,7 +427,10 @@
           label = '一个席位已被撤销';
         }
         const line = node('div', null, 'system-turn');
-        line.append(node('span', label), node('time', when(event.created_at)));
+        line.append(node('span', label));
+        const stamp = node('time', when(event.created_at));
+        stamp.dateTime = text(event.created_at);
+        line.append(stamp);
         feed.append(line);
         return;
       }
@@ -315,8 +438,11 @@
       const kind = Object.prototype.hasOwnProperty.call(kinds, message.kind) ? message.kind : '';
       const role = sender.role || '';
       const side = role === 'worker' ? 'incoming' : 'outgoing';
-      const article = node('article', null, 'turn ' + side + (kind ? ' kind-' + kind : ''));
-      const who = senderKey(event) + '|' + kind;
+      const leading = leader && sender.role === leader.role && Number(sender.seat) === Number(leader.seat);
+      const article = node('article', null, 'turn ' + side + ' role-' + (roles[role] ? role : 'member')
+        + (kind ? ' kind-' + kind : '') + (leading ? ' is-leader' : ''));
+      const taskId = text(message.task_id);
+      const who = senderKey(event) + '|' + kind + '|' + taskId;
       const previous = feed.lastElementChild;
       if (previous && previous.dataset.who === who) article.classList.add('continued');
       article.dataset.who = who;
@@ -329,28 +455,31 @@
       const head = node('div', null, 'turn-head');
       head.append(node('span', name, 'speaker'));
       if (roles[role] || seatLabel) head.append(node('span', (roles[role] || '参与者') + seatLabel, 'role-chip'));
+      if (leading) head.append(node('span', '领导者', 'role-chip leader-chip'));
       if (kind) head.append(node('span', kinds[kind], 'kind-chip'));
       const stamp = node('time', when(event.created_at));
       stamp.dateTime = text(event.created_at);
       head.append(stamp);
       const bubble = node('div', null, 'bubble');
+      const linked = taskLink(taskId);
+      if (linked) bubble.append(linked);
       const notes = [];
       if (message.reply_to) notes.push('回复 #' + text(message.reply_to));
       const to = text(message.to);
       if (to === 'all') notes.push('发给全体');
       else if (to.startsWith('worker:')) notes.push('发给 ' + to.slice(7) + ' 号席');
       if (notes.length) bubble.append(node('p', notes.join(' · '), 'bubble-note'));
-      bubble.append(node('p', text(message.text), 'bubble-text'));
+      bubble.append(messageBody(message.text));
       const attachments = Array.isArray(message.attachments) ? message.attachments : [];
       for (const attachment of attachments) {
         const line = node('div', null, 'attachment');
         line.append(node('span', text(attachment.name) + (attachment.size ? ' · ' + sizes(attachment.size) : '')));
         const href = safeFileUrl(attachment.url);
         if (href) {
-          const link = node('a', '下载');
-          link.href = href;
-          link.rel = 'noopener';
-          line.append(link);
+          const file = node('a', '下载');
+          file.href = href;
+          file.rel = 'noopener';
+          line.append(file);
         }
         bubble.append(line);
       }
@@ -371,8 +500,12 @@
         }
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const data = await response.json();
+        const incoming = Array.isArray(data.events) ? data.events : [];
+        for (const event of incoming) {
+          if (event.kind === 'message' && event.message) spoken.push(event);
+        }
         paintConversation(data.conversation);
-        for (const event of data.events || []) renderEvent(event);
+        for (const event of incoming) renderEvent(event);
         cursor = Number(data.next_cursor) || cursor;
         const closed = data.conversation && data.conversation.status === 'closed';
         statusLine.textContent = closed ? '会话已结束。这里保留已公开的记录。' : '只读';

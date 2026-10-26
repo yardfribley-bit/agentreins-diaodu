@@ -591,20 +591,27 @@ class RelayTeams:
     PUBLIC_MARK = "t"
 
     def _directory_item(self, db, session, summary=True):
-        rows = db.execute("SELECT role,seat,name FROM team_members WHERE session_id=?",
+        rows = db.execute("SELECT * FROM team_members WHERE session_id=?",
                           (session["id"],)).fetchall()
         order = {"owner": 0, "mentor": 1, "worker": 2}
         participants = []
+        seen_at = time.time()
         for row in sorted(rows, key=lambda item: (order.get(item["role"], 9), item["seat"])):
-            participants.append({"role": row["role"], "seat": row["seat"], "name": row["name"]})
+            presence = self._presence_fields(row, session, seen_at)
+            participants.append({"role": row["role"], "seat": row["seat"], "name": row["name"],
+                                 "online": presence["online"], "live": presence["live"],
+                                 "last_seen_age_s": presence["last_seen_age_s"]})
         goal = session["goal"]
+        task_rows = self._task_rows(db, session["id"])
         item = {"public_id": session["public_id"], "mode": "team", "title": session["title"],
                 "goal": _preview(goal) if summary else goal, "status": session["status"],
                 "created_at": _iso(session["created"]), "updated_at": _iso(session["updated"]),
                 "participants": participants, "leader": self._public_leader(db, session),
-                "last_message": self._work_preview(db, session["id"])}
+                "last_message": self._work_preview(db, session["id"]),
+                "tasks_total": len(task_rows),
+                "tasks_done": sum(1 for row in task_rows if row["status"] == "done")}
         if not summary:
-            item["tasks"] = [self._task_json(row) for row in self._task_rows(db, session["id"])]
+            item["tasks"] = [self._task_json(row) for row in task_rows]
             item["leader_terms"] = self._leader_terms(db, session["id"])
         return item
 
