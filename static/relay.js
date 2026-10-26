@@ -231,9 +231,14 @@
   }
   function peerCard(role, member, seat) {
     const team = isTeam();
-    const label = role === 'mentor' ? '指导端' : team ? '执行端 · ' + seat + ' 号席' : '执行端';
+    const numbered = role === 'worker' && team && Number.isInteger(Number(seat)) && Number(seat) > 0;
+    const label = role === 'mentor' ? '指导端' : numbered ? '执行端 · ' + seat + ' 号席' : team ? '执行端 · 新席位' : '执行端';
     const card = element('article',null,'peer-card ' + role), top = element('div',null,'peer-card-top');
-    top.append(element('span',role === 'mentor' ? '导' : team ? String(seat) : '执','peer-avatar'),element('h4',label));
+    top.append(element('span',role === 'mentor' ? '导' : numbered ? String(seat) : team ? '新' : '执','peer-avatar'),element('h4',label));
+    const leader = current && current.leader;
+    if (leader && member && leader.role === role && Number(leader.seat) === Number(seat)) {
+      top.append(element('span','领导者','peer-leader'));
+    }
     top.append(element('span',member ? (member.online === true ? '在线' : '离线') : '等待接入','peer-presence' + (member?.online === true ? ' online' : '')));
     card.append(top);
     card.append(element('p',member?.name || '尚未接入','peer-name'));
@@ -258,15 +263,15 @@
       card.append(element('p',role === 'mentor'
         ? (team ? '生成一条指导端邀请，交给负责分析、指挥的 Agent。'
                 : '将指导端配对码交给负责分析、指导的 Agent。')
-        : (team ? '生成一条 ' + seat + ' 号席邀请，链接只对应这一个席位。'
+        : (team ? '生成一条新执行端邀请。席位号由服务端分配，已撤销的号码不会再用。'
                 : '将执行端配对码交给负责操作的 Agent；接入时必须自报系统环境。'),'peer-vacant'));
     }
     if (owner() && (isTeam() || role !== 'worker' || seat === undefined)) {
       const actions = element('div',null,'peer-actions');
       if (isTeam() && !member) {
-        const button = element('button','生成该席邀请');
+        const button = element('button', numbered ? '生成该席邀请' : '生成新席邀请');
         button.type = 'button'; button.disabled = mutationBusy || current.status === 'closed';
-        button.addEventListener('click',() => inviteTeam(role, seat));
+        button.addEventListener('click',() => inviteTeam(role, numbered ? seat : undefined));
         actions.append(button);
       } else if (!isTeam()) {
         const button = element('button',member ? '撤销访问' : '生成 / 重发配对码',member ? 'danger-quiet' : '');
@@ -281,8 +286,10 @@
   function renderPeers() {
     if (isTeam()) {
       const cards = [peerCard('mentor', current?.mentor || null, 0)];
+      const workers = teamWorkers().slice().sort((left, right) => Number(left.seat) - Number(right.seat));
+      for (const worker of workers) cards.push(peerCard('worker', worker, Number(worker.seat)));
       const max = Number(current?.max_workers) || 8;
-      for (let seat = 1; seat <= max; seat += 1) cards.push(peerCard('worker', workerAt(seat) || null, seat));
+      if (workers.length < max) cards.push(peerCard('worker', null, null));
       $('peer-cards').replaceChildren(...cards);
       return;
     }
@@ -694,24 +701,17 @@
   }
   function populateInviteSeats() {
     const role = $('team-invite-role').value, select = $('team-invite-seat');
-    const previous = select.value;
     if (role === 'mentor') {
-      select.replaceChildren(element('option','指导端固定席位'));
+      const fixed = element('option','指导端固定席位');
+      fixed.value = '0';
+      select.replaceChildren(fixed);
       select.value = '0'; select.disabled = true; return;
     }
     select.disabled = false;
-    const max = Number(current?.max_workers) || 8;
-    const options = [['','任意空席']];
-    for (let seat = 1; seat <= max; seat += 1) {
-      const holder = workerAt(seat);
-      options.push([String(seat), seat + ' 号席' + (holder ? '（已占用：' + text(holder.name) + '）' : '（空）')]);
-    }
-    select.replaceChildren(...options.map(([value,label]) => {
-      const option = element('option',label); option.value = value;
-      if (!value) option.selected = value === previous;
-      return option;
-    }));
-    if (options.some(([value]) => value === previous)) select.value = previous;
+    const option = element('option','自动分配新席位号（不复用已撤销号码）');
+    option.value = '';
+    select.replaceChildren(option);
+    select.value = '';
   }
   function openTeamDialog(role = 'worker', seat = '') {
     if (!owner() || !isTeam()) return;

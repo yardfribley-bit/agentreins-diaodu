@@ -555,7 +555,11 @@ class GateTest(unittest.TestCase):
         self.assertEqual(blocked.exception.status, 403)
         self.assertIn("撤销", str(blocked.exception))
         self.assertEqual(self.teams.gate_status(self.owner, self.sid, "worker")["gate"]["remaining"], 1)
-        self.assertEqual(self.enter(self.agent("w2"), gate["code"])["seat"], 1)
+        self.assertEqual(self.enter(self.agent("w2"), gate["code"])["seat"], 2)
+        with self.assertRaises(AuthError) as reused_number:
+            self.teams.invite(self.owner, self.sid, {"role": "worker", "seat": 1})
+        self.assertEqual(reused_number.exception.status, 409)
+        self.assertIn("不会再分配", str(reused_number.exception))
         with self.assertRaises(AuthError):
             self.enter(self.agent("w3"), "OOOOOO")
 
@@ -608,6 +612,24 @@ class GateTest(unittest.TestCase):
         status = self.teams.gate_status(self.owner, self.sid, "worker")["gate"]
         self.assertEqual(status["remaining"], 0)
         self.assertEqual(len(status["used_by"]), 2)
+
+    def test_expand_raises_max_joins_without_returning_or_rotating_the_code(self):
+        gate = self.open(max_joins=1)
+        self.enter(self.agent("w1"), gate["code"])
+        with self.assertRaises(ValueError):
+            self.teams.expand_gate(self.owner, self.sid, {"role": "worker", "max_joins": 1})
+        with self.assertRaises(AuthError):
+            self.enter(self.agent("w2"), gate["code"])
+        expanded = self.teams.expand_gate(self.owner, self.sid, {"role": "worker", "max_joins": 3})["gate"]
+        self.assertEqual(expanded["id"], gate["id"])
+        self.assertEqual(expanded["max_joins"], 3)
+        self.assertEqual(expanded["remaining"], 2)
+        self.assertNotIn("code", expanded)
+        blob = json.dumps(expanded)
+        self.assertNotIn(gate["code"], blob)
+        self.assertEqual(self.enter(self.agent("w2"), gate["code"])["seat"], 2)
+        self.teams.revoke(self.owner, self.sid, {"role": "worker", "seat": 1})
+        self.assertEqual(self.enter(self.agent("w3"), gate["code"])["seat"], 3)
 
     def test_existing_database_gains_gate_tables(self):
         with sqlite3.connect(self.teams.path) as db:

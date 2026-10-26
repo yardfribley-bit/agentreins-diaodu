@@ -4,13 +4,13 @@
 
 ## 成员与席位
 
-- 一个团队会话有一个 owner（创建者，不占席位）、一个 mentor（指导席 seat 0）、最多 8 个 worker（seat 1..8，`DIAODU_RELAY_MAX_WORKERS` 可调）。
+- 一个团队会话有一个 owner（创建者，不占席位）、一个 mentor（指导席 seat 0）、最多 8 个同时在席的 worker（`DIAODU_RELAY_MAX_WORKERS` 可调）。worker 席位号从 1 递增，撤销后不再分配给下一个人，因此历史里的 `to=worker:N` 不会改指新人。
 - 长轮询名额与一对一分开计算，默认全局 256、单会话 32（`DIAODU_RELAY_MAX_WAITERS`、`DIAODU_RELAY_SESSION_WAITERS`）。一个满员团队不能把其他团队挤成 HTTP 429。`wait=0` 不占名额；超时、报错和客户端断开都会释放。
 - `create` 不再返回通用配对码。owner 通过邀请把链接发给具体的人，一席一码。
 
 ## 邀请
 
-- `POST /v1/relay/teams/<sid>/invites` `{role, seat?, note?}`：owner 生成邀请。worker 指定 `seat` 时绑定该席；不指定表示任意空席（加入时分配最小空闲号）。mentor 邀请固定 seat 0。默认 24 小时过期，`note` 用来标注用途（如“Alice 的笔记本”）。
+- `POST /v1/relay/teams/<sid>/invites` `{role, seat?, note?}`：owner 生成邀请。worker 指定 `seat` 时绑定该席（已撤销的号码会拒绝）；不指定表示由服务端分配尚未用过的最小号。mentor 邀请固定 seat 0。默认 24 小时过期，`note` 用来标注用途（如“Alice 的笔记本”）。
 - 返回 `{invite:{id, role, seat, note, status, created_at, expires_at, code}}`；`code` 只在创建时返回一次。
 - 校验顺序：码不存在 → 过期 → 已撤销 → 已使用 → 席位已空。错误分开：无效/过期/撤销/已使用 403，席位被占或席位已满 409。
 - 使用后写入 `used_by`（展示名 + 时间），码立即失效；同一码第二次使用返回 403。
@@ -25,9 +25,9 @@
 
 同一会话、同一角色同时只能有一道未关闭且未过期的门禁（worker 与 mentor 互不影响）。名额用尽后这道门禁仍算未关闭，要再开一道须先关闭或等它过期。
 
-- `POST /v1/relay/teams/<sid>/gate` `{role, max_joins, ttl_hours?, note?}`：仅 owner。`role` 为 `worker` 或 `mentor`；worker 的 `max_joins` 为 1 到席位上限，mentor 只能为 1。`ttl_hours` 默认 24，范围 1–168。
+- `POST /v1/relay/teams/<sid>/gate` `{role, max_joins, ttl_hours?, note?}`：仅 owner。`role` 为 `worker` 或 `mentor`；worker 的 `max_joins` 为 1 到席位上限，mentor 只能为 1。`ttl_hours` 默认 24，范围 1–168。名额用尽后不必换码：`POST .../gate/expand` `{role?, max_joins}` 只把 worker 门禁的 `max_joins` 调高（上限 64），响应不包含门禁码。同时在席人数仍不能超过席位上限。
 - 返回 `{gate:{id, code, role, note, status, max_joins, used, remaining, created_at, expires_at, session_id, public_id, join_hint, used_by}}`。`code` 为 6 位，字母表去掉 `0/O/1/I/L`（大小写不敏感）。`join_hint` 是一行 MCP 调用说明，不是多段邀请 Markdown。明文码只在开闸和换码时返回。
-- `POST /v1/relay/teams/gate/join` `{gate_code, role?, environment?}`：worker 必须提交真实环境；服务端分配最小空闲席位。成功一次，`remaining` 减一，并记下使用者的展示名、席位和时间。角色以门禁为准。
+- `POST /v1/relay/teams/gate/join` `{gate_code, role?, environment?}`：worker 必须提交真实环境；服务端分配尚未用过的最小席位号。成功一次，`remaining` 减一，并记下使用者的展示名、席位和时间。角色以门禁为准。
 - 校验顺序：码不存在或格式不对 → 已关闭 → 已过期 → 名额用尽 → 角色不符 → 会话已结束 / 身份已撤销 / 已是成员 → 席位。无效、关闭、过期、名额用尽为 403；席位满为 409。关闭优先于过期。
 - 加入尝试按门禁码哈希、调用者身份和来源 IP 限流（默认每分钟 30 / 12 / 30 次），超限 429。库里只存哈希，不把明文码写入事件、日志或公开目录。
 - `GET /v1/relay/teams/<sid>/gate?role=`：仅 owner。省略 `role` 时返回 `{gates:[...]}`（worker 与 mentor 各自最新一道）；指定角色返回 `{gate:...}`。状态里没有 `code` / `join_hint`。已加入的 worker 调用返回 403。
@@ -35,7 +35,7 @@
 - `POST .../gate/rotate`：仅 owner。新短码，剩余名额和过期时间不变，旧码立即失效。已关闭、已过期或会话已结束时返回 409。
 - 撤销席位不退还已消耗的名额。门禁没有匿名查询页，也不会出现在 `/relay/join/<码>` 里。
 
-MCP：`diaodu_relay_team_gate_open` / `gate_join` / `gate_get` / `gate_close` / `gate_rotate`。
+MCP：`diaodu_relay_team_gate_open` / `gate_join` / `gate_get` / `gate_close` / `gate_rotate` / `gate_expand`。
 
 创建者：`diaodu_connect` → `diaodu_relay_team_create` → `diaodu_relay_team_gate_open`（`session`、`role=worker`、`max_joins`）。把返回的一行 `join_hint` 交给执行端。
 
@@ -63,7 +63,7 @@ worker 的 result 用 `reply_to` 指回指令；mentor 按 `reply_to` 分组即�
 
 ## MCP 工具
 
-`diaodu_relay_team_create` / `join` / `list` / `get` / `read` / `send` / `ack` / `heartbeat` / `state` / `revoke` / `invite` / `invites` / `invite_revoke` / `invite_reset` / `gate_open` / `gate_join` / `gate_get` / `gate_close` / `gate_rotate` / `upload` / `download`。工作面另有 `who_is_leader` / `list_online` / `elect` / `vote` / `leader_heartbeat` / `appoint` / `task_create` / `task_list` / `task_claim` / `task_assign` / `task_update`。MCP 只需配置地址，`diaodu_connect` 后同一会话自动复用身份，无需 Bearer。多名执行端优先用门禁短码，不必逐个复制长邀请。三种协作方式见 [relay-work.md](relay-work.md)。
+`diaodu_relay_team_create` / `join` / `list` / `get` / `read` / `send` / `ack` / `heartbeat` / `state` / `revoke` / `invite` / `invites` / `invite_revoke` / `invite_reset` / `gate_open` / `gate_join` / `gate_get` / `gate_close` / `gate_rotate` / `gate_expand` / `upload` / `download`。工作面另有 `who_is_leader` / `list_online` / `elect` / `vote` / `leader_heartbeat` / `appoint` / `task_create` / `task_list` / `task_claim` / `task_assign` / `task_update`。MCP 只需配置地址，`diaodu_connect` 后同一会话自动复用身份，无需 Bearer。多名执行端优先用门禁短码，不必逐个复制长邀请。三种协作方式见 [relay-work.md](relay-work.md)。
 
 ## 在页面上加入团队
 
