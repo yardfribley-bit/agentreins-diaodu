@@ -170,6 +170,7 @@ button:focus-visible, a:focus-visible {
 }
 
 .chip.mode, .badge.mode { background: var(--tint); color: var(--primary); }
+.chip.leader, .badge.leader { background: var(--warn-tint); color: var(--warn); }
 .chip.active, .badge.active { background: var(--ok-tint); color: var(--ok); }
 .chip.paused, .badge.paused { background: var(--warn-tint); color: var(--warn); }
 .chip.closed, .badge.closed { background: var(--bg); color: var(--muted); }
@@ -236,6 +237,46 @@ button:focus-visible, a:focus-visible {
   height: 22px;
   font-size: 11px;
 }
+
+.participant.is-leader { border-color: var(--primary); }
+.leader-mark { color: var(--primary); font-weight: var(--weight-title); }
+
+.term-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.term-kicker, .term-chip, .task-state, .task-progress, .task-term {
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+
+.term-chip, .task-row {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+.task-board { margin: 8px 0 4px; }
+.task-board h2 {
+  margin: 0 0 8px;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-title);
+}
+.task-list { display: flex; flex-direction: column; gap: 6px; }
+.task-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  border-radius: 12px;
+  padding: 8px 12px;
+}
+.task-title { font-weight: var(--weight-title); color: var(--ink); }
 
 .read-only {
   margin: 16px 0 4px;

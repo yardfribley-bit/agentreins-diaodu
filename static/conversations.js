@@ -126,6 +126,9 @@
       chips.append(node('span', modes[item.mode] || '对话', 'chip mode'));
       const status = text(item.status);
       chips.append(node('span', states[item.status] || '状态待确认', 'chip status' + (states[status] ? ' ' + status : '')));
+      if (item.leader && item.leader.name) {
+        chips.append(node('span', '领导者 ' + text(item.leader.name), 'chip leader'));
+      }
       const participants = Array.isArray(item.participants) ? item.participants : [];
       for (const person of participants.slice(0, 3)) chips.append(node('span', personLabel(person), 'chip who'));
       const last = item.last_message;
@@ -179,17 +182,39 @@
     const meta = node('div', null, 'thread-meta');
     const goal = node('p', '', 'goal');
     const people = node('div', null, 'participant-row');
-    header.append(back, title, meta, goal, people);
+    const termsBox = node('div', null, 'term-list');
+    termsBox.hidden = true;
+    header.append(back, title, meta, goal, people, termsBox);
     const banner = node('p', '此页只读，不能在这里发送或加入。', 'read-only');
+    const tasksBox = node('section', null, 'task-board');
+    tasksBox.hidden = true;
+    tasksBox.append(node('h2', '任务板'));
+    const tasksList = node('div', null, 'task-list');
+    tasksBox.append(tasksList);
     const feed = node('div', null, 'thread');
     feed.setAttribute('role', 'log');
     feed.setAttribute('aria-live', 'polite');
     feed.setAttribute('aria-label', '对话记录');
     const statusLine = node('p', '正在读取…', 'muted');
     statusLine.setAttribute('role', 'status');
-    app.append(header, banner, feed, statusLine);
-    let cursor = 0, stopped = false;
+    app.append(header, banner, tasksBox, feed, statusLine);
+    let cursor = 0, stopped = false, leaderTerms = [];
 
+    function termAt(created) {
+      let current = null;
+      const stamp = text(created);
+      for (const term of leaderTerms) {
+        if (text(term.started_at) && text(term.started_at) <= stamp) current = term;
+      }
+      return current;
+    }
+    function termLabel(term) {
+      if (!term || !term.name) return '';
+      const seat = Number(term.seat);
+      const who = term.role === 'worker' && Number.isInteger(seat) && seat > 0
+        ? seat + ' 号席 ' + text(term.name) : text(term.name);
+      return '第' + text(term.term) + '任期 · ' + who;
+    }
     function paintConversation(conversation) {
       if (!conversation) return;
       title.textContent = text(conversation.title) || '未命名对话';
@@ -198,18 +223,55 @@
         node('span', modes[conversation.mode] || '对话', 'badge mode'),
         node('span', states[conversation.status] || '状态待确认', 'badge ' + text(conversation.status))
       );
-      if (conversation.leader && conversation.leader.name) {
-        meta.append(node('span', '领导者 ' + text(conversation.leader.name), 'badge'));
+      const leader = conversation.leader;
+      if (leader && leader.name) {
+        const seat = Number(leader.seat);
+        const seatText = leader.role === 'worker' && Number.isInteger(seat) && seat > 0
+          ? seat + ' 号席 · ' : (leader.role === 'mentor' ? '指导 · ' : '');
+        const termText = leader.term ? ' · 第' + text(leader.term) + '任期' : '';
+        meta.append(node('span', '领导者 ' + seatText + text(leader.name) + termText, 'badge leader'));
       }
       goal.textContent = text(conversation.goal);
       people.replaceChildren();
       const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
       for (const person of participants) {
-        const chip = node('span', null, 'participant');
+        const leading = leader && person.role === leader.role && Number(person.seat) === Number(leader.seat);
+        const chip = node('span', null, 'participant' + (leading ? ' is-leader' : ''));
         const mark = node('span', initial(person.name || roles[person.role]), 'avatar avatar-' + (person.role || 'member'));
         mark.setAttribute('aria-hidden', 'true');
         chip.append(mark, node('span', personLabel(person)));
+        if (leading) chip.append(node('span', '领导者', 'leader-mark'));
         people.append(chip);
+      }
+      leaderTerms = Array.isArray(conversation.leader_terms) ? conversation.leader_terms : [];
+      termsBox.replaceChildren();
+      if (!leaderTerms.length) termsBox.hidden = true;
+      else {
+        termsBox.hidden = false;
+        termsBox.append(node('span', '任期', 'term-kicker'));
+        for (const term of leaderTerms) {
+          const label = termLabel(term);
+          if (label) termsBox.append(node('span', label, 'term-chip'));
+        }
+      }
+      const tasks = Array.isArray(conversation.tasks) ? conversation.tasks : [];
+      tasksList.replaceChildren();
+      tasksBox.hidden = !tasks.length;
+      const taskState = {open:'待认领', in_progress:'进行中', done:'已完成'};
+      for (const task of tasks) {
+        const row = node('div', null, 'task-row');
+        const assignee = task.assignee;
+        const seat = assignee ? Number(assignee.seat) : NaN;
+        const who = assignee
+          ? (assignee.role === 'worker' && Number.isInteger(seat) && seat > 0 ? seat + ' 号席 ' : '') + text(assignee.name)
+          : '未认领';
+        row.append(node('span', text(task.title) || '未命名任务', 'task-title'));
+        row.append(node('span', taskState[task.status] || text(task.status), 'task-state'));
+        row.append(node('span', who + ' · ' + (Number(task.progress) || 0) + '%', 'task-progress'));
+        const led = termAt(task.updated_at || task.created_at);
+        const ledLabel = termLabel(led);
+        if (ledLabel) row.append(node('span', ledLabel, 'task-term'));
+        tasksList.append(row);
       }
     }
     function senderKey(event) {
@@ -221,7 +283,13 @@
       if (event.kind === 'task') {
         const task = event.task || {};
         const taskState = {open:'待认领', in_progress:'进行中', done:'已完成'}[task.status] || text(task.status);
-        const taskLabel = '任务「' + text(task.title) + '」' + taskState;
+        const assignee = task.assignee;
+        const seat = assignee ? Number(assignee.seat) : NaN;
+        const who = assignee && assignee.name
+          ? ' · ' + (assignee.role === 'worker' && Number.isInteger(seat) && seat > 0 ? seat + ' 号席 ' : '') + text(assignee.name)
+          : '';
+        const led = termLabel(termAt(event.created_at));
+        const taskLabel = '任务「' + text(task.title) + '」' + taskState + who + (led ? ' · ' + led : '');
         const line = node('div', null, 'system-turn');
         line.append(node('span', taskLabel), node('time', when(event.created_at)));
         feed.append(line);

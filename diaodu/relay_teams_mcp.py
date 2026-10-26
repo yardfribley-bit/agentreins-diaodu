@@ -9,19 +9,19 @@ TOOLS = [
     ('relay_team_join', '用团队配对码加入：mentor 占指导席，worker 自动分配最小空闲执行席（需真实 environment）。', {'code': S, 'role': ROLE, 'environment': ENV}, ['code']),
     ('relay_team_list', '列出本人参与的团队会话。', {}, []),
     ('relay_team_get', '读取团队会话快照：指导席、各执行席在线/确认进度。', {'session': S}, ['session']),
-    ('relay_team_read', '按序号增量读取工作流（指令、结果、任务、成员事件）。默认 stream=work，不含 ELECT/LEADER/HB 与环境。stream=system 用另一条游标读取选举变更。会话字段含 leader、members、online、tasks。', {'session': S, 'after': {'type': 'integer', 'minimum': 0}, 'wait': {'type': 'integer', 'minimum': 0, 'maximum': 20}, 'stream': {'type': 'string', 'enum': ['work', 'system']}}, ['session']),
+    ('relay_team_read', '按序号增量读取工作流（指令、结果、任务、成员事件）。默认 stream=work，不含 ELECT/LEADER/HB 与环境。stream=system 用另一条游标读取选举变更。默认附带完整会话（leader、members、online、tasks）；view=0 只返回游标、身份和 leader，便于长轮询。', {'session': S, 'after': {'type': 'integer', 'minimum': 0}, 'wait': {'type': 'integer', 'minimum': 0, 'maximum': 20}, 'stream': {'type': 'string', 'enum': ['work', 'system']}, 'view': {'type': 'integer', 'minimum': 0, 'maximum': 1}}, ['session']),
     ('relay_team_send', '发送指令/进度/结果/问题/备注。可带 task_id 挂到任务板。mentor、owner 与现任领导者可用 to="worker:N"；其他 worker 只能默认或 to="all"。以 ELECT、LEADER、HB、VOTE 开头的 note 不进入工作流，转交选举侧信道。可带 attachments（≤20）。', {'session': S, 'kind': KIND, 'text': S, 'request_id': S, 'reply_to': {'type': 'integer', 'minimum': 1}, 'to': S, 'task_id': S, 'attachments': {'type': 'array', 'items': S, 'maxItems': 20}}, ['session', 'kind', 'text', 'request_id']),
     ('relay_team_who_is_leader', '查询现任领导者、任期与选举是否进行中。不要从备注正文里找 ELECT/LEADER。', {'session': S}, ['session']),
     ('relay_team_list_online', '查询成员与当前在线名单（role、seat、name、online）。不含环境与邀请码。', {'session': S}, ['session']),
     ('relay_team_elect', '发起或加入 Raft-lite 选举并给自己投票。已有未过期领导者时拒绝，避免双主。过半数后服务端写入唯一领导者。', {'session': S}, ['session']),
-    ('relay_team_vote', '在进行中的选举里投票。同一任期每人一票，先投的有效。达到过半数即产生唯一领导者。', {'session': S, 'role': ROLE, 'seat': {'type': 'integer', 'minimum': 0, 'maximum': 8}, 'term': {'type': 'integer', 'minimum': 0}}, ['session', 'role', 'seat']),
+    ('relay_team_vote', '在进行中的选举里投票。同一任期每人一票，先投的有效，重复投票返回 already_voted。达到在线成员过半数即产生唯一领导者，响应里的 elected 为该领导者；未当选时 elected 为 null。', {'session': S, 'role': ROLE, 'seat': {'type': 'integer', 'minimum': 0, 'maximum': 10000}, 'term': {'type': 'integer', 'minimum': 0}}, ['session', 'role', 'seat']),
     ('relay_team_leader_heartbeat', '现任领导者续约。不是工作消息，也不会出现在 relay_team_read 的默认流里。', {'session': S}, ['session']),
-    ('relay_team_appoint', '创建者、指导端或现任领导者直接指定领导者（智能体带队时用）。新任期替换旧领导者。', {'session': S, 'role': ROLE, 'seat': {'type': 'integer', 'minimum': 0, 'maximum': 8}}, ['session', 'role', 'seat']),
+    ('relay_team_appoint', '创建者、指导端或现任领导者直接指定领导者（智能体带队时用）。新任期替换旧领导者。席位号不会复用。', {'session': S, 'role': ROLE, 'seat': {'type': 'integer', 'minimum': 0, 'maximum': 10000}}, ['session', 'role', 'seat']),
     ('relay_team_task_create', '在团队任务板发布任务。status 从 open 开始。parent_id 用来把一个任务拆成步骤。', {'session': S, 'title': S, 'detail': S, 'request_id': S, 'parent_id': S}, ['session', 'title', 'request_id']),
     ('relay_team_task_list', '列出任务板。status 可省略，或为 open、in_progress、done。', {'session': S, 'status': {'type': 'string', 'enum': ['open', 'in_progress', 'done']}}, ['session']),
     ('relay_team_task_claim', '指导端或执行端认领未分配任务，状态变为 in_progress。', {'session': S, 'task_id': S}, ['session', 'task_id']),
-    ('relay_team_task_assign', '创建者、指导端或现任领导者把任务指派给某个席位。', {'session': S, 'task_id': S, 'role': ROLE, 'seat': {'type': 'integer', 'minimum': 0, 'maximum': 8}}, ['session', 'task_id', 'role', 'seat']),
-    ('relay_team_task_update', '认领者、领导者或创建者更新进度、状态或说明。done 会把进度记为 100（除非另行给出）。', {'session': S, 'task_id': S, 'progress': {'type': 'integer', 'minimum': 0, 'maximum': 100}, 'status': {'type': 'string', 'enum': ['open', 'in_progress', 'done']}, 'detail': S}, ['session', 'task_id']),
+    ('relay_team_task_assign', '创建者、指导端或现任领导者把任务指派给某个席位。席位号不会复用。', {'session': S, 'task_id': S, 'role': ROLE, 'seat': {'type': 'integer', 'minimum': 0, 'maximum': 10000}}, ['session', 'task_id', 'role', 'seat']),
+    ('relay_team_task_update', '认领者、领导者或创建者更新进度、状态或说明。done 会把进度记为 100（除非另行给出）。只改 progress 时写入任务板，不往工作流追加事件。', {'session': S, 'task_id': S, 'progress': {'type': 'integer', 'minimum': 0, 'maximum': 100}, 'status': {'type': 'string', 'enum': ['open', 'in_progress', 'done']}, 'detail': S}, ['session', 'task_id']),
     ('relay_team_ack', '确认已接收至指定全局 seq（不等于执行完成）。', {'session': S, 'seq': {'type': 'integer', 'minimum': 0}}, ['session', 'seq']),
     ('relay_team_heartbeat', '刷新在线状态；执行端可更新系统环境。', {'session': S, 'environment': ENV}, ['session']),
     ('relay_team_state', '仅创建者：暂停、继续或结束团队会话。', {'session': S, 'status': {'type': 'string', 'enum': ['active', 'paused', 'closed']}}, ['session', 'status']),
@@ -35,6 +35,7 @@ TOOLS = [
     ('relay_team_gate_get', '仅创建者：查看加入门禁状态（剩余名额与使用者）。不返回门禁码；省略 role 时返回 worker 与 mentor 各自最新一道。', {'session': S, 'role': ROLE}, ['session']),
     ('relay_team_gate_close', '仅创建者：关闭该角色当前门禁，旧码立即不能再加入。省略 role 时关闭 worker 门禁。', {'session': S, 'role': ROLE}, ['session']),
     ('relay_team_gate_rotate', '仅创建者：更换短门禁码，剩余名额和过期时间不变，旧码立即失效。省略 role 时更换 worker 门禁。', {'session': S, 'role': ROLE}, ['session']),
+    ('relay_team_gate_expand', '仅创建者：提高当前 worker 门禁的 max_joins，短码不变，响应不返回门禁码。只能调高，上限 64。同时在席人数仍受席位上限约束。', {'session': S, 'role': ROLE, 'max_joins': {'type': 'integer', 'minimum': 1, 'maximum': 64}}, ['session', 'max_joins']),
     ('relay_team_upload', '上传团队附件（base64，最大10MB），发送消息时在 attachments 引用。', {'session': S, 'name': S, 'content_base64': S}, ['session', 'name', 'content_base64']),
     ('relay_team_download', '下载团队附件：≤5MB 返回 base64，更大的返回签名链接（15分钟有效，无需请求头）。', {'session': S, 'file_id': S}, ['session', 'file_id']),
 ]
@@ -56,7 +57,7 @@ def call(name, args, actor, teams, identity, client_ip=None):
         return teams.get(actor, sid)
     if name == 'relay_team_read':
         result = teams.events(actor, sid, args.get('after', 0), args.get('wait', 0),
-                              stream=args.get('stream') or 'work')
+                              stream=args.get('stream') or 'work', view=args.get('view', 1))
         validate_actor(actor, identity)
         teams.get(actor, sid)
         return result
@@ -98,6 +99,8 @@ def call(name, args, actor, teams, identity, client_ip=None):
         return teams.close_gate(actor, sid, body)
     if name == 'relay_team_gate_rotate':
         return teams.rotate_gate(actor, sid, body)
+    if name == 'relay_team_gate_expand':
+        return teams.expand_gate(actor, sid, body)
     if name == 'relay_team_upload':
         raw = args.get('content_base64')
         if not isinstance(raw, str) or len(raw) > 14 * 1024 * 1024:

@@ -45,8 +45,11 @@
                            ' · ' + workers.length + ' 位执行';
     }
     if (session.leader && session.leader.name) {
+      const seat = Number(session.leader.seat);
+      const seatText = session.leader.role === 'worker' && Number.isInteger(seat) && seat > 0
+        ? seat + ' 号席 ' : '';
       status.textContent = (status.textContent ? status.textContent + ' · ' : '') +
-        '领导者 ' + text(session.leader.name);
+        '领导者 ' + seatText + text(session.leader.name);
     }
   }
   function senderLabel(event) {

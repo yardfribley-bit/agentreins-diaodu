@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -268,6 +269,159 @@ class WorkSurfaceTest(unittest.TestCase):
         self.assertNotIn("environment", [event["kind"] for event in events["events"]])
         self.assertNotIn("protocol", [event["kind"] for event in events["events"]])
 
+    def _age(self, role, seat, last_seen):
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("UPDATE team_members SET last_seen=? WHERE session_id=? AND role=? AND seat=?",
+                       (last_seen, self.sid, role, seat))
+
+    def test_dead_leader_is_dropped_from_quorum_and_a_new_leader_is_elected(self):
+        seat3 = self.join_invite(self.agent("worker3"), "worker")["seat"]
+        self.teams.campaign(self.worker1, self.sid)
+        self.teams.vote(self.worker2, self.sid, {"role": "worker", "seat": self.seat1})
+        seated = self.teams.vote(self.mentor, self.sid, {"role": "worker", "seat": self.seat1})
+        self.assertEqual(seated["elected"]["seat"], self.seat1)
+        self.assertFalse(seated["already_voted"])
+        held = self.teams.who_is_leader(self.owner, self.sid)
+        self.assertGreaterEqual(held["votes"], held["needed"])
+        self.assertFalse(held["open"])
+        eligible_while_leading = held["eligible"]
+        self._age("worker", seat3, time.time() - 100)
+        # A seated worker going quiet must not change the tally of a live lease.
+        still = self.teams.who_is_leader(self.owner, self.sid)
+        self.assertEqual(still["eligible"], eligible_while_leading)
+        self.assertGreaterEqual(still["votes"], still["needed"])
+        self._age("worker", seat3, time.time())
+        now = time.time()
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("UPDATE team_sessions SET leader_lease=? WHERE id=?", (now - 1, self.sid))
+        # Last seen 5s ago: inside the 60s roster window and the 20s lease window,
+        # but the lease itself has ended, so this seat is not online and not a voter.
+        self._age("worker", self.seat1, now - 5)
+        self._age("mentor", 0, now - 30)
+        roster = self.teams.list_online(self.worker2, self.sid)
+        dead = next(item for item in roster["members"] if item["role"] == "worker" and item["seat"] == self.seat1)
+        mentor = next(item for item in roster["members"] if item["role"] == "mentor")
+        self.assertFalse(dead["online"])
+        self.assertTrue(mentor["online"])
+        opened = self.teams.campaign(self.worker2, self.sid)
+        self.assertEqual(opened["election"]["term"], held["term"] + 1)
+        self.assertEqual(opened["election"]["eligible"], 2)
+        self.assertIsNone(opened["elected"])
+        duplicate = self.teams.vote(self.worker2, self.sid, {"role": "worker", "seat": self.seat2})
+        self.assertTrue(duplicate["already_voted"])
+        self.assertIsNone(duplicate["elected"])
+        finished = self.teams.vote(self.agent("worker3"), self.sid, {"role": "worker", "seat": self.seat2})
+        self.assertEqual(finished["elected"]["seat"], self.seat2)
+        self.assertEqual(finished["election"]["leader"]["name"], "worker2")
+        self.assertGreaterEqual(finished["election"]["votes"], finished["election"]["needed"])
+        self.assertFalse(finished["election"]["open"])
+        system = self.teams.events(self.worker2, self.sid, after=0, wait=0, stream="system")
+        elected_terms = [event["term"] for event in system["events"] if event["op"] == "elected"]
+        self.assertEqual(elected_terms, [held["term"], held["term"] + 1])
+
+    def test_lone_survivor_becomes_leader_without_the_offline_majority(self):
+        self.teams.appoint(self.owner, self.sid, {"role": "worker", "seat": self.seat1})
+        now = time.time()
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("UPDATE team_sessions SET leader_lease=? WHERE id=?", (now - 1, self.sid))
+        self._age("worker", self.seat1, now - 5)
+        self._age("mentor", 0, now - 100)
+        self._age("worker", self.seat2, now - 100)
+        elected = self.teams.campaign(self.worker2, self.sid)
+        self.assertEqual(elected["elected"]["seat"], self.seat2)
+        self.assertEqual(self.teams.who_is_leader(self.owner, self.sid)["leader"]["seat"], self.seat2)
+
+    def test_stalled_election_backs_off_instead_of_opening_terms(self):
+        opened = self.teams.campaign(self.worker1, self.sid)
+        term = opened["election"]["term"]
+        self.assertTrue(opened["election"]["open"])
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("UPDATE team_sessions SET election_until=? WHERE id=?", (time.time() - 1, self.sid))
+        before = self.teams.events(self.mentor, self.sid, after=0, wait=0, stream="system")["events"]
+        for _ in range(4):
+            stalled = self.teams.campaign(self.worker1, self.sid)
+            self.assertGreaterEqual(stalled["retry_after"], 1)
+            self.assertEqual(stalled["election"]["term"], term)
+            self.assertIsNone(stalled["elected"])
+        after = self.teams.events(self.mentor, self.sid, after=0, wait=0, stream="system")["events"]
+        self.assertEqual([event["op"] for event in after], [event["op"] for event in before])
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("UPDATE team_sessions SET election_backoff_until=? WHERE id=?", (time.time() - 1, self.sid))
+        resumed = self.teams.campaign(self.worker2, self.sid)
+        self.assertEqual(resumed["election"]["term"], term + 1)
+        self.assertNotIn("retry_after", resumed)
+
+    def test_progress_ticks_stay_off_the_work_stream(self):
+        task = self.teams.create_task(self.owner, self.sid, {
+            "title": "报进度", "request_id": "prog-task"})["task"]
+        self.teams.claim_task(self.worker1, self.sid, task["id"])
+        before = [event for event in self.teams.events(self.worker2, self.sid, after=0, wait=0)["events"]
+                  if event["kind"] == "task"]
+        for progress in (10, 40, 70):
+            moved = self.teams.update_task(self.worker1, self.sid, task["id"], {"progress": progress})
+            self.assertTrue(moved["coalesced"])
+            self.assertEqual(moved["task"]["progress"], progress)
+        middle = [event for event in self.teams.events(self.worker2, self.sid, after=0, wait=0)["events"]
+                  if event["kind"] == "task"]
+        self.assertEqual(len(middle), len(before))
+        self.assertNotIn("updated", [event.get("action") for event in middle])
+        done = self.teams.update_task(self.worker1, self.sid, task["id"], {"status": "done"})
+        self.assertFalse(done["coalesced"])
+        after = [event for event in self.teams.events(self.worker2, self.sid, after=0, wait=0)["events"]
+                 if event["kind"] == "task"]
+        self.assertEqual([event.get("action") for event in after], ["created", "claimed", "updated"])
+        board = self.teams.list_tasks(self.owner, self.sid)["tasks"]
+        self.assertEqual(board[0]["progress"], 100)
+
+    def test_events_can_omit_the_session_view(self):
+        self.teams.create_task(self.owner, self.sid, {"title": "视图", "request_id": "view-task"})
+        full = self.teams.events(self.worker1, self.sid, after=0, wait=0, view=1)
+        slim = self.teams.events(self.worker1, self.sid, after=0, wait=0, view=0)
+        self.assertIn("tasks", full["session"])
+        self.assertIn("members", full["session"])
+        self.assertNotIn("tasks", slim["session"])
+        self.assertNotIn("members", slim["session"])
+        self.assertNotIn("workers", slim["session"])
+        self.assertEqual(slim["session"]["last_seq"], full["session"]["last_seq"])
+        self.assertEqual(slim["session"]["role"], "worker")
+        titles = [event.get("task", {}).get("title") for event in slim["events"]]
+        self.assertIn("视图", titles)
+        self.assertNotIn("environment", json.dumps(slim["session"]))
+        with self.assertRaises(ValueError):
+            self.teams.events(self.worker1, self.sid, after=0, wait=0, view=2)
+
+    def test_public_page_lists_leader_terms_without_secrets(self):
+        appointed = self.teams.appoint(self.owner, self.sid, {"role": "worker", "seat": self.seat1})
+        self.assertEqual(appointed["elected"]["seat"], self.seat1)
+        detail = self.teams.directory_conversation(self.public_id)
+        self.assertEqual(detail["leader"]["seat"], self.seat1)
+        self.assertEqual(detail["leader"]["name"], "worker1")
+        self.assertGreaterEqual(detail["leader"]["term"], 1)
+        self.assertEqual(detail["leader_terms"][-1]["seat"], self.seat1)
+        self.assertEqual(detail["leader_terms"][-1]["term"], detail["leader"]["term"])
+        blob = json.dumps(detail, ensure_ascii=False)
+        self.assertNotIn("actor_key", blob)
+        self.assertNotIn("leader_key", blob)
+        self.assertNotIn("environment", blob)
+        script = Path(__file__).resolve().parent.parent.joinpath("static", "conversations.js").read_text()
+        self.assertIn("badge leader", script)
+        self.assertIn("leader_terms", script)
+        self.assertNotIn("innerHTML", script)
+
+    def test_owner_read_of_leader_or_tasks_counts_as_online(self):
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("UPDATE team_members SET last_seen=0 WHERE session_id=? AND role='owner'", (self.sid,))
+        quiet = self.teams.list_online(self.worker1, self.sid)
+        self.assertNotIn("owner", [item["name"] for item in quiet["online"]])
+        self.teams.who_is_leader(self.owner, self.sid)
+        seen = self.teams.list_online(self.worker1, self.sid)
+        self.assertIn("owner", [item["name"] for item in seen["online"]])
+        with sqlite3.connect(self.teams.path) as db:
+            db.execute("UPDATE team_members SET last_seen=0 WHERE session_id=? AND role='owner'", (self.sid,))
+        self.teams.list_tasks(self.owner, self.sid)
+        seen = self.teams.list_online(self.worker1, self.sid)
+        self.assertIn("owner", [item["name"] for item in seen["online"]])
+
     def test_old_team_database_gains_work_columns(self):
         fresh = Path(self.temporary.name) / "legacy"
         fresh.mkdir()
@@ -286,6 +440,8 @@ class WorkSurfaceTest(unittest.TestCase):
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertIn("leader_term", columns)
         self.assertIn("protocol_seq", columns)
+        self.assertIn("election_backoff_until", columns)
+        self.assertIn("election_needed", columns)
         self.assertIn("team_tasks", tables)
         self.assertIn("team_protocol", tables)
         created = reloaded.create(self.owner, {"title": "迁移", "goal": "仍可建队"})
@@ -395,6 +551,13 @@ class WorkSurfaceHTTP(unittest.TestCase):
         self.assertNotIn("\"text\": \"ELECT\"", blob)
         self.assertEqual(page["session"]["leader"]["seat"], 1)
         self.assertNotIn(self.code, blob)
+        status, slim = self.req("GET", f"/v1/relay/teams/{self.sid}/events?after=0&wait=0&view=0", role="w1")
+        self.assertEqual(status, 200)
+        self.assertNotIn("tasks", slim["session"])
+        self.assertNotIn("members", slim["session"])
+        self.assertEqual(slim["session"]["last_seq"], page["session"]["last_seq"])
+        self.assertNotIn(self.code, json.dumps(slim))
+        self.assertEqual(self.req("GET", f"/v1/relay/teams/{self.sid}/events?view=2", role="w1")[0], 400)
         status, public = self.req("GET", f"/v1/relay/public/conversations/{self.public_id}/events?after=0&limit=50")
         self.assertEqual(status, 200)
         public_blob = json.dumps(public, ensure_ascii=False)
