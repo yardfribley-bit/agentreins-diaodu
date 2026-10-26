@@ -1550,7 +1550,8 @@ class RelayTeams:
         if leader is None:
             return None
         return {"role": leader["role"], "seat": leader["seat"], "name": leader["name"],
-                "online": leader["online"], "term": leader["term"]}
+                "online": leader["online"], "live": leader["live"],
+                "last_seen_age_s": leader["last_seen_age_s"], "term": leader["term"]}
 
     def _leader_terms(self, db, sid):
         """Public history of who held each term. Protocol rows stay off the work stream."""

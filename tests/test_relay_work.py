@@ -400,6 +400,10 @@ class WorkSurfaceTest(unittest.TestCase):
         self.assertEqual(detail["leader"]["seat"], self.seat1)
         self.assertEqual(detail["leader"]["name"], "worker1")
         self.assertGreaterEqual(detail["leader"]["term"], 1)
+        self.assertTrue(detail["leader"]["live"])
+        self.assertGreaterEqual(detail["leader"]["last_seen_age_s"], 0)
+        self.assertLess(detail["leader"]["last_seen_age_s"], 20)
+        self.assertNotIn("lease_until", detail["leader"])
         self.assertEqual(detail["leader_terms"][-1]["seat"], self.seat1)
         self.assertEqual(detail["leader_terms"][-1]["term"], detail["leader"]["term"])
         worker = next(person for person in detail["participants"]
@@ -417,14 +421,37 @@ class WorkSurfaceTest(unittest.TestCase):
                       if item["public_id"] == self.public_id)
         self.assertEqual(listed["tasks_total"], detail["tasks_total"])
         self.assertEqual(listed["tasks_done"], detail["tasks_done"])
-        blob = json.dumps({"detail": detail, "listed": listed}, ensure_ascii=False)
+        self._age("worker", self.seat1, time.time() - 25)
+        stale = self.teams.directory_conversation(self.public_id)
+        self.assertEqual(stale["leader"]["name"], "worker1")
+        self.assertFalse(stale["leader"]["live"])
+        self.assertGreaterEqual(stale["leader"]["last_seen_age_s"], 25)
+        self.assertEqual(set(detail["leader"]),
+                         {"role", "seat", "name", "online", "live", "last_seen_age_s", "term"})
+        public_people = detail["participants"] + listed["participants"] + stale["participants"]
+        for person in public_people:
+            self.assertEqual(set(person), {"role", "seat", "name", "online", "live", "last_seen_age_s"})
+        stale_worker = next(person for person in stale["participants"]
+                            if person["role"] == "worker" and person["seat"] == self.seat1)
+        self.assertFalse(stale_worker["live"])
+        self.assertGreaterEqual(stale_worker["last_seen_age_s"], 25)
+        blob = json.dumps({"detail": detail, "listed": listed, "stale": stale}, ensure_ascii=False)
         self.assertNotIn("actor_key", blob)
         self.assertNotIn("leader_key", blob)
         self.assertNotIn("environment", blob)
         self.assertNotIn("lease_until", blob)
+        self.assertNotIn("never-store-", blob)
+        with sqlite3.connect(self.teams.path) as db:
+            secrets = [row[0] for row in db.execute("SELECT code_hash FROM team_invites")]
+            secrets += [row[0] for row in db.execute("SELECT code_hash FROM team_gates")]
+            secrets += [row[0] for row in db.execute("SELECT actor_key FROM team_members")]
+        for secret in secrets:
+            self.assertTrue(secret)
+            self.assertNotIn(secret, blob)
         script = Path(__file__).resolve().parent.parent.joinpath("static", "conversations.js").read_text()
         self.assertIn("badge leader", script)
         self.assertIn("leader.live", script)
+        self.assertIn("live-dot", script)
         self.assertIn("leader_terms", script)
         self.assertIn("task-tree", script)
         self.assertIn("roster-card", script)

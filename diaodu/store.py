@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,8 +59,29 @@ class Store:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def save(self, job: dict) -> None:
-        path = self.job_dir(job["id"]) / "job.json"
-        path.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        """Publish job.json by replacing the whole file.
+
+        write_text truncates in place, so a reader on another thread (stop
+        reloads after releasing the service lock) can observe an empty file
+        and raise JSONDecodeError. A temp file in the same directory plus
+        os.replace is atomic on this filesystem.
+        """
+        directory = self.job_dir(job["id"])
+        path = directory / "job.json"
+        fd, name = tempfile.mkstemp(prefix=".job-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(job, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(name, path)
+        except BaseException:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+            raise
 
     def list_jobs(self) -> list[dict]:
         jobs = []
