@@ -125,6 +125,46 @@ class FlowTest(unittest.TestCase):
         self.assertIsNone(job["running"])
 
 
+class StoreAtomicTest(unittest.TestCase):
+    def test_concurrent_readers_never_see_a_partial_job_file(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = Store(Path(temporary.name))
+        job = store.create("同时读")
+        stop = threading.Event()
+        errors = []
+
+        def read() -> None:
+            while not stop.is_set():
+                try:
+                    loaded = store.load(job["id"])
+                except Exception as exc:
+                    errors.append(exc)
+                    stop.set()
+                    return
+                if loaded["id"] != job["id"] or not isinstance(loaded["messages"], list):
+                    errors.append(AssertionError(loaded))
+                    stop.set()
+                    return
+
+        threads = [threading.Thread(target=read) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        try:
+            for index in range(200):
+                job["tick"] = index
+                job["messages"] = [{"text": "x" * 80, "n": index} for _ in range(6)]
+                store.save(job)
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(2)
+        self.assertEqual(errors, [])
+        self.assertEqual(store.load(job["id"])["tick"], 199)
+        leftovers = list(Path(temporary.name, job["id"]).glob(".job-*.tmp"))
+        self.assertEqual(leftovers, [])
+
+
 class PathTest(unittest.TestCase):
     def test_codex_uses_the_proxy_and_ignores_the_broken_model_config(self):
         runners = LiveRunners(load_config(Path("/no/config.toml")))

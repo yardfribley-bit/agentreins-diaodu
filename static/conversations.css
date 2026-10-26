@@ -170,7 +170,16 @@ button:focus-visible, a:focus-visible {
 }
 
 .chip.mode, .badge.mode { background: var(--tint); color: var(--primary); }
-.chip.leader, .badge.leader { background: var(--warn-tint); color: var(--warn); }
+.chip.leader, .badge.leader { background: var(--warn-tint); color: var(--warn); gap: 6px; }
+.badge.leader.is-away, .chip.leader.is-away { color: var(--muted); background: var(--bg); }
+.live-dot, .away-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+.live-dot { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-tint); }
+.away-dot { background: var(--muted); }
 .chip.active, .badge.active { background: var(--ok-tint); color: var(--ok); }
 .chip.paused, .badge.paused { background: var(--warn-tint); color: var(--warn); }
 .chip.closed, .badge.closed { background: var(--bg); color: var(--muted); }
