@@ -88,6 +88,244 @@
     dot.setAttribute('aria-hidden', 'true');
     return dot;
   }
+  function splitRow(line) {
+    let value = line.trim();
+    if (value.startsWith('|')) value = value.slice(1);
+    if (value.endsWith('|')) value = value.slice(0, -1);
+    return value.split('|').map(cell => cell.trim());
+  }
+  function isSeparator(line) {
+    const cells = splitRow(line);
+    return cells.length >= 2 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+  }
+  function isTable(lines, index) {
+    return index + 1 < lines.length && lines[index].includes('|') && isSeparator(lines[index + 1]);
+  }
+  function markdownish(raw) {
+    const lines = String(raw).split('\n');
+    if (lines.some(line => /^#{1,6}\s+\S/.test(line))) return true;
+    for (let index = 0; index + 1 < lines.length; index += 1) {
+      if (isTable(lines, index)) return true;
+    }
+    if (lines.some(line => /^\s*[-*+]\s+\S/.test(line))) return true;
+    if (lines.some(line => /^\s*\d+[.)]\s+\S/.test(line))) return true;
+    if (lines.some(line => /^\s*>\s?\S/.test(line))) return true;
+    if (/\*\*[^*\n]+\*\*/.test(raw) || /__[^_\n]+__/.test(raw)) return true;
+    return false;
+  }
+  function isCodeDump(raw) {
+    const trimmed = raw.trim();
+    const fenced = trimmed.match(/^(```|~~~)[^\n]*\n([\s\S]*)\n\1\s*$/);
+    if (fenced && !markdownish(fenced[2])) return true;
+    const lines = raw.split('\n').map(line => line.trim()).filter(Boolean);
+    return lines.length > 0 && lines.every(line => line.startsWith('$'));
+  }
+  function safeLink(value) {
+    if (typeof value !== 'string') return '';
+    const href = value.trim();
+    if (!href || href.length > 2000 || href.startsWith('//') || /[\s"<>\\]/.test(href)) return '';
+    let url;
+    try { url = new URL(href); } catch (error) { return ''; }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+    return url.href;
+  }
+  function appendInline(parent, source) {
+    const value = String(source);
+    let index = 0;
+    while (index < value.length) {
+      if (value[index] === '\\' && index + 1 < value.length) {
+        parent.append(document.createTextNode(value[index + 1]));
+        index += 2;
+        continue;
+      }
+      if (value[index] === '\n') {
+        parent.append(document.createElement('br'));
+        index += 1;
+        continue;
+      }
+      if (value[index] === '`') {
+        const end = value.indexOf('`', index + 1);
+        if (end > index) {
+          parent.append(node('code', value.slice(index + 1, end), 'md-code'));
+          index = end + 1;
+          continue;
+        }
+      }
+      if (value.startsWith('**', index) || value.startsWith('__', index)) {
+        const mark = value.slice(index, index + 2);
+        const end = value.indexOf(mark, index + 2);
+        if (end > index + 2) {
+          const strong = document.createElement('strong');
+          appendInline(strong, value.slice(index + 2, end));
+          parent.append(strong);
+          index = end + 2;
+          continue;
+        }
+      }
+      if (value[index] === '[') {
+        const close = value.indexOf(']', index + 1);
+        if (close > index && value[close + 1] === '(') {
+          const end = value.indexOf(')', close + 2);
+          if (end > close) {
+            const href = safeLink(value.slice(close + 2, end));
+            const label = value.slice(index + 1, close);
+            if (href) {
+              const anchor = document.createElement('a');
+              anchor.href = href;
+              anchor.rel = 'noopener noreferrer';
+              anchor.target = '_blank';
+              appendInline(anchor, label);
+              parent.append(anchor);
+            } else appendInline(parent, label);
+            index = end + 1;
+            continue;
+          }
+        }
+      }
+      if (value[index] === '*') {
+        const end = value.indexOf('*', index + 1);
+        if (end > index + 1 && !value.slice(index + 1, end).includes('\n')) {
+          const em = document.createElement('em');
+          appendInline(em, value.slice(index + 1, end));
+          parent.append(em);
+          index = end + 1;
+          continue;
+        }
+      }
+      let next = index + 1;
+      while (next < value.length && '\\\n`*['.indexOf(value[next]) === -1) next += 1;
+      parent.append(document.createTextNode(value.slice(index, next)));
+      index = next;
+    }
+  }
+  function renderMarkdown(parent, source, depth) {
+    const raw = text(source).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    if (!raw.trim()) return;
+    if ((depth || 0) > 6) {
+      parent.append(document.createTextNode(raw));
+      return;
+    }
+    const lines = raw.split('\n');
+    let index = 0;
+    while (index < lines.length) {
+      const line = lines[index];
+      if (!line.trim()) { index += 1; continue; }
+      const fence = /^(```+|~~~+)/.exec(line);
+      if (fence) {
+        const mark = fence[1][0];
+        const opener = fence[1].length;
+        const body = [];
+        index += 1;
+        while (index < lines.length && !(lines[index].trim().length >= opener && lines[index].trim().split('').every(ch => ch === mark))) {
+          body.push(lines[index]);
+          index += 1;
+        }
+        if (index < lines.length) index += 1;
+        const pre = document.createElement('pre');
+        pre.className = 'md-pre';
+        pre.append(node('code', body.join('\n')));
+        parent.append(pre);
+        continue;
+      }
+      if (isTable(lines, index)) {
+        const header = splitRow(lines[index]);
+        index += 2;
+        const rows = [];
+        while (index < lines.length && lines[index].trim() && lines[index].includes('|') && !isTable(lines, index)
+               && !/^#{1,6}\s+\S/.test(lines[index]) && !/^(```|~~~)/.test(lines[index])) {
+          rows.push(splitRow(lines[index]));
+          index += 1;
+        }
+        const wrap = node('div', null, 'md-table-wrap');
+        const table = document.createElement('table');
+        const thead = document.createElement('thead');
+        const headRow = document.createElement('tr');
+        header.forEach(cell => {
+          const th = document.createElement('th');
+          appendInline(th, cell);
+          headRow.append(th);
+        });
+        thead.append(headRow);
+        const tbody = document.createElement('tbody');
+        rows.forEach(cells => {
+          const tr = document.createElement('tr');
+          header.forEach((_, cellIndex) => {
+            const td = document.createElement('td');
+            appendInline(td, cells[cellIndex] || '');
+            tr.append(td);
+          });
+          tbody.append(tr);
+        });
+        table.append(thead, tbody);
+        wrap.append(table);
+        parent.append(wrap);
+        continue;
+      }
+      const heading = /^(#{1,6})\s+(\S.*?)\s*#*$/.exec(line);
+      if (heading) {
+        const level = heading[1].length;
+        const element = document.createElement('h' + level);
+        appendInline(element, heading[2].trim());
+        parent.append(element);
+        index += 1;
+        continue;
+      }
+      if (/^(\*\s*){3,}$|^(-+\s*){3,}$|^(_\s*){3,}$/.test(line.trim())) {
+        parent.append(document.createElement('hr'));
+        index += 1;
+        continue;
+      }
+      if (/^\s*>/.test(line)) {
+        const quoted = [];
+        while (index < lines.length && /^\s*>/.test(lines[index])) {
+          quoted.push(lines[index].replace(/^\s*>\s?/, ''));
+          index += 1;
+        }
+        const quote = document.createElement('blockquote');
+        renderMarkdown(quote, quoted.join('\n'), (depth || 0) + 1);
+        parent.append(quote);
+        continue;
+      }
+      const unordered = /^\s*[-*+]\s+\S/.test(line);
+      const ordered = /^\s*\d+[.)]\s+\S/.test(line);
+      if (unordered || ordered) {
+        const list = document.createElement(ordered ? 'ol' : 'ul');
+        const pattern = ordered ? /^\s*\d+[.)]\s+(\S.*)$/ : /^\s*[-*+]\s+(\S.*)$/;
+        while (index < lines.length && pattern.test(lines[index])) {
+          const item = document.createElement('li');
+          appendInline(item, lines[index].match(pattern)[1]);
+          list.append(item);
+          index += 1;
+        }
+        parent.append(list);
+        continue;
+      }
+      const paragraph = [line];
+      index += 1;
+      while (index < lines.length && lines[index].trim() && !/^(#{1,6}\s+\S|```|~~~)/.test(lines[index])
+             && !/^\s*>/.test(lines[index]) && !/^\s*[-*+]\s+\S/.test(lines[index])
+             && !/^\s*\d+[.)]\s+\S/.test(lines[index]) && !isTable(lines, index)
+             && !/^(\*\s*){3,}$|^(-+\s*){3,}$|^(_\s*){3,}$/.test(lines[index].trim())) {
+        paragraph.push(lines[index]);
+        index += 1;
+      }
+      const block = document.createElement('p');
+      appendInline(block, paragraph.join('\n'));
+      parent.append(block);
+    }
+  }
+  function outcomeOf(message) {
+    const declared = text(message && message.outcome);
+    if (declared === 'failed' || declared === 'empty' || declared === 'draft') return declared;
+    if (declared === 'final') return 'ok';
+    const raw = text(message && message.text).trim();
+    if (!raw || /^(无|空|（空）|\(空\)|无结果|n\/a|none|null|[-—.]{1,3})$/i.test(raw)) return 'empty';
+    if (raw.length <= 80 && /^(失败|未成功|error\b|failed\b|exception\b|超时|无法完成|出错)/i.test(raw)) return 'failed';
+    return 'ok';
+  }
+  function resultLabel(state) {
+    return {superseded: '已被后续结果取代', failed: '未成功', empty: '空结果', draft: '草稿'}[state] || '已折叠';
+  }
 
   if (!isThread) renderDirectory();
   else renderThread();
@@ -159,6 +397,11 @@
       meta.append(node('span', states[item.status] || '状态待确认', 'chip status' + (states[status] ? ' ' + status : '')));
       const leader = item.leader && item.leader.name ? withLive(item.leader, participants) : null;
       if (leader) meta.append(leaderBadge(leader, true));
+      if (item.report_available || (item.report && item.report.available)) {
+        const badge = node('span', '有报告', 'chip report-available');
+        badge.title = 'report available';
+        meta.append(badge);
+      }
       meta.append(node('span', participants.length + ' 位成员', 'chip who'));
       body.append(head, meta);
       const faces = node('div', null, 'face-row');
@@ -231,6 +474,26 @@
     const title = node('h1', '正在读取…');
     const meta = node('div', null, 'thread-meta');
     const goal = node('p', '', 'goal');
+    const reportCard = document.createElement('details');
+    reportCard.className = 'final-report';
+    reportCard.open = true;
+    reportCard.hidden = true;
+    const reportSummary = document.createElement('summary');
+    const reportKicker = node('span', '最终报告', 'final-kicker');
+    const reportTitle = node('span', '最终报告', 'final-title');
+    reportSummary.append(reportKicker, reportTitle);
+    const reportMeta = node('p', '', 'final-meta');
+    const reportActions = node('div', null, 'final-actions');
+    const reportPdf = node('a', '下载 PDF', 'report-button');
+    reportPdf.href = root + '/v1/relay/public/conversations/' + publicId + '/report.pdf';
+    reportPdf.setAttribute('download', 'report.pdf');
+    const reportMd = node('a', '查看 MD', 'report-button secondary');
+    reportMd.href = root + '/v1/relay/public/conversations/' + publicId + '/report.md';
+    reportMd.target = '_blank';
+    reportMd.rel = 'noopener';
+    reportActions.append(reportPdf, reportMd);
+    const reportBody = node('div', null, 'report-body md');
+    reportCard.append(reportSummary, reportMeta, reportActions, reportBody);
     const rosterTitle = node('h2', '参与者', 'section-title');
     const people = node('div', null, 'roster');
     const termsBox = node('div', null, 'term-row');
@@ -245,12 +508,14 @@
     feed.setAttribute('aria-live', 'polite');
     const statusLine = node('p', '正在读取…', 'read-only');
     statusLine.setAttribute('role', 'status');
-    app.append(kicker, title, meta, goal, rosterTitle, people, termsBox, tasksBox, talkTitle, feed, statusLine);
+    app.append(kicker, title, meta, goal, reportCard, rosterTitle, people, termsBox, tasksBox, talkTitle, feed, statusLine);
 
     let cursor = 0;
     let stopped = false;
     let leader = null;
     let leaderTerms = [];
+    let reportKey = '';
+    let reportToken = 0;
     const spoken = [];
     const titles = new Map();
 
@@ -326,6 +591,7 @@
         card.append(meter);
         const preview = resultPreview(id);
         if (preview) card.append(node('p', preview, 'task-preview'));
+        if (task.report && task.report.title) card.append(node('p', '最终报告', 'task-report'));
         const led = termLabel(termAt(task.updated_at || task.created_at));
         if (led) card.append(node('p', led, 'task-term'));
         tasksList.append(card);
@@ -377,11 +643,63 @@
         }
       }
       paintTasks(Array.isArray(conversation.tasks) ? conversation.tasks : []);
+      paintReport(conversation);
     }
-    function messageBody(value) {
-      const raw = text(value);
+    function paintReport(conversation) {
+      const report = conversation && conversation.report;
+      if (!report || report.available === false) {
+        reportCard.hidden = true;
+        return;
+      }
+      reportCard.hidden = false;
+      if (reportCard.open !== true && reportCard.open !== false) reportCard.open = true;
+      reportTitle.textContent = text(report.title) || '最终报告';
+      const bits = [];
+      const chars = Number(report.chars);
+      if (Number.isFinite(chars) && chars > 0) bits.push(chars.toLocaleString('zh-CN') + ' 字');
+      if (report.author && report.author.name) bits.push(personLabel(report.author));
+      if (report.updated_at) bits.push(when(report.updated_at));
+      reportMeta.textContent = bits.join(' · ');
+      const key = [text(report.revision), text(report.updated_at), text(report.chars)].join(':');
+      if (key === reportKey) return;
+      reportKey = key;
+      const token = ++reportToken;
+      reportBody.replaceChildren(node('p', '正在读取报告…', 'muted'));
+      const reportMdUrl = root + '/v1/relay/public/conversations/' + publicId + '/report.md';
+      fetch(reportMdUrl, {headers: {'Accept': 'text/markdown, text/plain'}, cache: 'no-store'})
+        .then(response => {
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          return response.text();
+        })
+        .then(markdown => {
+          if (token !== reportToken) return;
+          reportBody.replaceChildren();
+          renderMarkdown(reportBody, markdown);
+        })
+        .catch(() => {
+          if (token !== reportToken) return;
+          reportBody.replaceChildren(node('p', '报告暂时读不到，可先下载 PDF 或查看 Markdown。', 'muted'));
+        });
+    }
+    function foldAround(body, label) {
+      const details = document.createElement('details');
+      details.className = 'fold result-fold';
+      const summary = document.createElement('summary');
+      summary.textContent = label;
+      details.append(summary, body);
+      return details;
+    }
+    function messageBody(message) {
+      const raw = text(message && message.text);
+      const kind = message && message.kind;
+      if (kind === 'result' || markdownish(raw)) {
+        const host = node('div', null, kind === 'result' ? 'md result-body' : 'md');
+        renderMarkdown(host, raw);
+        if (kind === 'result' && outcomeOf(message) !== 'ok') return foldAround(host, resultLabel(outcomeOf(message)));
+        return host;
+      }
       const lines = raw.split('\n');
-      const code = raw.includes('```') || lines.some(line => line.startsWith('$ ') || line.startsWith('$'));
+      const code = isCodeDump(raw);
       const long = raw.length > 360 || lines.length > 8;
       if (!long && !code) return node('p', raw, 'bubble-text');
       const details = document.createElement('details');
@@ -394,6 +712,47 @@
       body.textContent = raw;
       details.append(summary, body);
       return details;
+    }
+    function applyResultState(article, state) {
+      const body = article.querySelector('.result-body');
+      if (!body) return;
+      article.classList.remove('is-superseded', 'is-failed', 'is-empty', 'is-draft', 'is-muted');
+      const fold = body.parentElement && body.parentElement.classList.contains('result-fold') ? body.parentElement : null;
+      if (state && state !== 'ok') {
+        article.classList.add('is-' + state, 'is-muted');
+        if (!fold) {
+          const details = document.createElement('details');
+          details.className = 'fold result-fold';
+          const summary = document.createElement('summary');
+          summary.textContent = resultLabel(state);
+          body.replaceWith(details);
+          details.append(summary, body);
+        } else {
+          const summary = fold.querySelector('summary');
+          if (summary) summary.textContent = resultLabel(state);
+        }
+        return;
+      }
+      article.classList.remove('is-muted');
+      if (fold) fold.replaceWith(body);
+    }
+    function markResults() {
+      const groups = new Map();
+      for (const article of feed.querySelectorAll('article.turn.kind-result')) {
+        const key = article.dataset.resultKey || '';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(article);
+      }
+      for (const group of groups.values()) {
+        let current = null;
+        for (const article of group) {
+          if (article.dataset.outcome === 'ok') current = article;
+        }
+        for (const article of group) {
+          const outcome = article.dataset.outcome || 'ok';
+          applyResultState(article, outcome === 'ok' && article !== current ? 'superseded' : outcome);
+        }
+      }
     }
     function taskLink(taskId) {
       const id = text(taskId);
@@ -477,7 +836,12 @@
       if (to === 'all') notes.push('发给全体');
       else if (to.startsWith('worker:')) notes.push('发给 ' + to.slice(7) + ' 号席');
       if (notes.length) bubble.append(node('p', notes.join(' · '), 'bubble-note'));
-      bubble.append(messageBody(message.text));
+      if (kind === 'result') {
+        const taskKey = text(message.task_id);
+        article.dataset.resultKey = taskKey || ('sender:' + senderKey(event));
+        article.dataset.outcome = outcomeOf(message);
+      }
+      bubble.append(messageBody(message));
       const attachments = Array.isArray(message.attachments) ? message.attachments : [];
       for (const attachment of attachments) {
         const line = node('div', null, 'attachment');
@@ -514,6 +878,7 @@
         }
         paintConversation(data.conversation);
         for (const event of incoming) renderEvent(event);
+        markResults();
         cursor = Number(data.next_cursor) || cursor;
         const closed = data.conversation && data.conversation.status === 'closed';
         statusLine.textContent = closed ? '会话已结束。这里保留已公开的记录。' : '只读';

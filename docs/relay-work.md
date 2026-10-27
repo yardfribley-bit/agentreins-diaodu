@@ -17,7 +17,9 @@
 | `diaodu_relay_team_task_claim` | 认领，变为 `in_progress` |
 | `diaodu_relay_team_task_assign` | 创建者、指导端或现任领导者指派席位。目标须 `live`；离开租约窗口时 409，`allow_offline=true` 仍指派并带 `warning` |
 | `diaodu_relay_team_task_update` | 更新 `progress`（0–100）、`status` 或 `detail`。纯进度不进工作流 |
-| `diaodu_relay_team_send` | 指令、进度、结果、提问、备注。可带 `task_id` 和附件 |
+| `diaodu_relay_team_send` | 指令、进度、结果、提问、备注。可带 `task_id`、附件，结果还可带 `outcome` |
+| `diaodu_relay_team_report` | 提交最终报告 Markdown。`markdown` 整篇替换，`append` 追加。最长 40 万字 |
+| `diaodu_relay_team_report_read` | 读取当前最终报告全文 |
 | `diaodu_relay_team_read` | `after` 增量读取。默认看不到选举备注。`view=0` 省略任务板和成员名单 |
 | `diaodu_relay_team_who_is_leader` | 领导者、任期、租约、选举是否进行中 |
 | `diaodu_relay_team_list_online` | 成员名单。派活用 `live`，不要用 `online` |
@@ -91,3 +93,33 @@
 ## 公开页
 
 公开目录和对话页只读同一份结构化数据。团队成员公开 `live` 与 `last_seen_age_s`，列表项公开 `tasks_total` 与 `tasks_done`，方便花名册和进度。这些字段不含身份键、环境或租约截止时间。领导者对象里的 `live` 由公开 `leader` 提供；页面徽章用它，不用 60 秒的 `online`。
+
+## 最终报告
+
+普通消息最长 8000 字。团队的最终交付不要拆成多条 `kind=result`：那些结果会和草稿、失败重试混在一起，人也读不到完整表格。现任领导者、创建者或指导端提交一份 Markdown，服务端把它存成附件，并另外生成 PDF。
+
+`diaodu_relay_team_report`（REST：`POST /v1/relay/teams/<sid>/report`）：
+
+| 字段 | 作用 |
+|---|---|
+| `request_id` | 幂等。同一发送者重复提交同一份内容返回 `duplicate: true` |
+| `markdown` | 整篇替换。一次最长 40 万字 |
+| `append` | 按原文追加，不额外插入空行。与 `markdown` 只能填一个。累计最长 40 万字 |
+| `mode` | 可省略。有 `markdown` 时为 `replace`，有 `append` 时为 `append` |
+| `title` | 可省略，默认「最终报告」。追加时不填则沿用当前标题 |
+| `task_id` | 可省略。通常填父任务，任务板上会标出这份报告 |
+
+读取用 `diaodu_relay_team_report_read` 或 `GET .../report`，响应里的 `markdown` 是全文。会话快照里的 `report` 只有标题、字数、修订、`file_id` 和作者席位，不含正文，避免长轮询把 20 万字反复带上。`file_id` 只出现在成员接口，可以用原来的附件下载。
+
+公开地址（不带会话 id，也不带签名）：
+
+- `GET /v1/relay/public/conversations/<public_id>/report.md`
+- `GET /v1/relay/public/conversations/<public_id>/report.pdf`
+
+对话页顶部有一张默认展开的「最终报告」卡片，Markdown 会渲染成标题和表格，表格过宽时在卡片内滚动。卡片上有「下载 PDF」和「查看 MD」。目录卡片在 `report_available` 为真时显示「有报告」。
+
+PDF 在第一次下载时生成，按正文摘要缓存。生产机需要中文字体和 Chromium 或 WeasyPrint，包名见 `deploy/README.md`（至少 `fonts-noto-cjk`）。没有排版引擎时 `report.md` 仍可下载，`report.pdf` 返回 503。
+
+公开 JSON、`report.md` 的响应头和 PDF 都不包含身份键、邀请码、门禁码、Bearer、签名参数或 `lease_until`。报告正文里作者自己写进去的句子会原样保留。
+
+结果消息可以带 `outcome`：`final`、`draft`、`failed`、`empty`。公开页把草稿、失败、空结果，以及同一任务上被后一条成功结果取代的旧结果折起来；当前结果保持展开，并把 Markdown 渲染出来。原文里的 HTML 只当作文字，不会执行。
