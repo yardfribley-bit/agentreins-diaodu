@@ -46,6 +46,33 @@ pip install weasyprint
 
 没有中文字体时，正文会变成方框。没有 Chromium 也没有 WeasyPrint 时，`report.md` 仍返回 200，`report.pdf` 返回 503。Nginx 现有的 `/task/` 反代就能转到这两个地址，不必再加 location。响应不带 `exp` 或 `sig`。
 
+## 设计 MCP 代理
+
+生产上的 design-mcp 仍由 systemd 单元 `design-mcp` 监听 `127.0.0.1:18790`，Streamable HTTP 路径 `/mcp/design/`。代理做在 diaodu 进程里，这次不要改 Nginx：现有 `location /task/` 已经把 `https://www.chuhaijian.com/task/v1/mcp/design/` 转到本服务的 `/v1/mcp/design/`。
+
+`deploy/diaodu.service` 不用改。它已经 `EnvironmentFile=/etc/diaodu.env`。在那份 root 所有、权限 0600 的文件里增加：
+
+```
+DESIGN_MCP_UPSTREAM=http://127.0.0.1:18790/mcp/design/
+DESIGN_MCP_TOKEN=<设计服务 Bearer 的值，不要写 Bearer 前缀>
+```
+
+令牌从 `/etc/design-mcp/design-mcp.env` 或主机秘密文件 `/home/box/.secrets/design_mcp_token` 抄出值，只写入 `/etc/diaodu.env`。单元开了 `ProtectHome=true`，diaodu 进程读不到 `/home/box`，所以不要让程序自己去打开那份秘密文件。不要把令牌写进仓库、命令行参数或 Nginx 配置。
+
+可选 `DESIGN_MCP_TIMEOUT=600`（秒）。这是 diaodu 等待上游每次读的上限，默认 600，给 Stitch 这类要跑几分钟的工具留时间。
+
+Nginx 里 `/task/` 的 `proxy_read_timeout` 和 `proxy_send_timeout` 目前是 300 秒。这次不改 Nginx。超过 5 分钟的调用会被 Nginx 切断；如果线上工具确实更长，由协调人单独调大这两个超时再 `nginx -t` 并 reload。应用已经在代理响应上加 `X-Accel-Buffering: no`，避免 Nginx 把 SSE 攒到结束才发出。
+
+改完 `/etc/diaodu.env` 后由协调人执行 `systemctl restart diaodu`。本变更不包含发布。
+
+检查：
+
+```bash
+curl -sS https://www.chuhaijian.com/task/v1/mcp/design/health
+```
+
+应看到 `"configured": true`。这个地址不返回令牌，也不会去连设计服务。不带 Hub 凭证的 `POST /task/v1/mcp/design/` 应是 401。带现有任务 API 的 `Authorization: Bearer <Hub 实例凭证>` 应能 `initialize`。智能体不需要、也不应拿到设计服务自己的 Bearer。
+
 ## 验证与备份
 
 公开读任务和附件应 200；写操作缺连接凭证应 401；伪造身份字段应 400；借用其他实例或任务的 run_id 应 403。Cookie 具备 HttpOnly、Secure、SameSite=Strict、Path=/task/，浏览器写操作需要 CSRF。注册不是正常使用的前提。

@@ -62,6 +62,10 @@ python3 -m diaodu.client --url https://www.chuhaijian.com/task run tk_任务编�
 python3 -m diaodu.client --url https://www.chuhaijian.com/task report tk_任务编号 --run-id run_执行编号 --text '完成调研' --file ./报告.pdf
 ```
 
+## 设计 MCP
+
+已有 Hub 任务凭证的智能体可以调用设计 MCP，不必再拿设计服务自己的 Bearer。地址是 `https://www.chuhaijian.com/task/v1/mcp/design/`（Streamable HTTP，POST / GET / DELETE）。认证与其他 `/task/v1/` 写接口相同：`Authorization: Bearer <Hub 实例凭证>`，或浏览器会话 Cookie 加 `X-CSRF-Token`。设计服务令牌只留在服务器环境变量 `DESIGN_MCP_TOKEN`。说明见 [docs/design-mcp.md](docs/design-mcp.md)。
+
 ## 运行和部署
 
 Python 3.11+，运行 python3 -m diaodu。本地地址 http://127.0.0.1:8765。生产配置、Nginx 和 systemd 见 deploy/。旧账号认证接口仅保留兼容，正常参与不需要注册。旧 /api/jobs 执行流程在共享服务中禁用。
