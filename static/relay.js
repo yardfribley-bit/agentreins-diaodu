@@ -24,8 +24,72 @@
   let pendingFiles = [], joinLookup = null, joinTimer = null;
   const events = new Map();
   const PUBLIC_ID = /^C-[pt][0-9a-f]{8}$/;
+  const WORK_KINDS = new Set(['joined', 'revoked', 'state', 'task', 'report']);
 
   for (const id of ['protocol-link','pair-guide-link']) $(id).href = guideURL;
+
+  function isProtocolNoise(message) {
+    const raw = text(message && message.text).trim();
+    if (!raw) return false;
+    const token = raw.split(/\s+/)[0];
+    return token === 'ELECT' || token === 'LEADER' || token === 'HB' || token === 'VOTE';
+  }
+  function visibleWorkEvent(event) {
+    if (!event || typeof event !== 'object') return false;
+    if (event.kind === 'environment' || event.kind === 'heartbeat' || event.kind === 'election') return false;
+    if (event.kind === 'message') return !isProtocolNoise(event.message);
+    return WORK_KINDS.has(event.kind);
+  }
+  function occupiedSeatCount(session) {
+    if (!session) return 0;
+    if (session.mode === 'team') return (session.mentor ? 1 : 0) + array(session.workers).length;
+    return array(session.peers).filter(person => (person.role === 'mentor' || person.role === 'worker') && text(person.name)).length;
+  }
+  function joinedPeople(session) {
+    if (!session) return [];
+    if (session.mode === 'team') {
+      const people = [];
+      const ownerRow = array(session.members).find(item => item.role === 'owner');
+      if (ownerRow) people.push(ownerRow);
+      if (session.mentor) people.push(session.mentor);
+      people.push(...array(session.workers));
+      return people;
+    }
+    return array(session.peers).filter(person => text(person.name));
+  }
+  function showWorkbenchPanel(name) {
+    if (!['sessions', 'thread', 'rail'].includes(name)) return;
+    document.body.dataset.panel = name;
+    document.querySelectorAll('[data-panel-tab]').forEach(button => {
+      const on = button.dataset.panelTab === name;
+      button.setAttribute('aria-selected', String(on));
+    });
+  }
+  function syncFilterChips() {
+    const value = $('session-filter') ? $('session-filter').value : 'all';
+    document.querySelectorAll('[data-filter]').forEach(button => {
+      button.setAttribute('aria-pressed', String(button.dataset.filter === value));
+    });
+  }
+  function environmentLine(environment) {
+    if (!environment || !text(environment.os_name)) return '';
+    const os = [text(environment.os_name), text(environment.os_version)].filter(Boolean).join(' ');
+    const shells = array(environment.shells).filter(value => typeof value === 'string').join(' / ');
+    return [os, text(environment.architecture), shells ? 'Shell ' + shells : '', text(environment.python_version) ? 'Python ' + text(environment.python_version) : ''].filter(Boolean).join(' · ');
+  }
+  function presenceOf(member) {
+    if (!member) return {label: '等待接入', tone: 'wait'};
+    if (member.live === true) return {label: '在席', tone: 'online'};
+    if (member.live === false && member.online === true) return {label: '刚离开', tone: 'away'};
+    if (member.live === false) return {label: '离席', tone: 'offline'};
+    if (member.online === true) return {label: '在线', tone: 'online'};
+    return {label: '离线', tone: 'offline'};
+  }
+  function isLeader(member) {
+    const leader = current && current.leader;
+    if (!leader || !member) return false;
+    return leader.role === member.role && Number(leader.seat) === Number(member.seat);
+  }
 
   function timestamp(value) {
     if (value == null || value === '') return null;
@@ -49,6 +113,30 @@
     $('connection').className = 'connection ' + state;
     $('connection-text').textContent = label;
     $('reconnect').hidden = state !== 'error';
+    renderConnectionFacts();
+  }
+  function renderConnectionFacts() {
+    const list = $('connection-facts');
+    if (!list) return;
+    if (!current) {
+      list.replaceChildren(element('p', '选择一场对话后，这里显示连接和身份。', 'rail-empty'));
+      return;
+    }
+    const people = joinedPeople(current);
+    const online = people.filter(person => person.online === true).length;
+    const rows = [
+      ['页面连接', $('connection-text').textContent || '尚未连接'],
+      ['会话状态', states[current.status] || '状态待确认'],
+      ['当前身份', roles[current.role] || '成员'],
+      ['公开围观', current.public_read ? '已开启' : '未开启']
+    ];
+    if (text(current.public_id)) rows.push(['公开编号', current.public_id]);
+    if (people.length) rows.push(['席位在线', online + '/' + people.length]);
+    list.replaceChildren(...rows.map(([label, value]) => {
+      const row = element('div');
+      row.append(element('dt', label), element('dd', value));
+      return row;
+    }));
   }
   class APIError extends Error {constructor(message,status) {super(message); this.status = status;}}
   async function api(path, body, signal, timeout = 30000) {
@@ -123,8 +211,33 @@
   }
   function updateIdentity() {
     $('identity-panel').hidden = !!identity;
-    $('identity').textContent = identity ? (identity.agent_name || identity.display_name || identity.user_name || identity.username || '管理身份') + ' · 当前身份' : '尚未连接管理身份';
+    const label = identity ? (identity.agent_name || identity.display_name || identity.user_name || identity.username || '管理身份') + ' · 当前身份' : '尚未连接管理身份';
+    $('identity').textContent = label;
+    $('identity').title = label;
     $('refresh-sessions').disabled = !identity;
+  }
+  function exportTranscript() {
+    if (!current) return;
+    const lines = [current.title || '未命名会话'];
+    if (current.goal) lines.push(current.goal);
+    lines.push('');
+    for (const event of [...events.values()].sort((left, right) => Number(left.seq) - Number(right.seq))) {
+      if (!visibleWorkEvent(event)) continue;
+      if (event.kind !== 'message') continue;
+      const message = event.message || {};
+      const who = text(event.sender?.name) || roles[event.sender?.role] || '成员';
+      lines.push('#' + event.seq + ' ' + (kinds[message.kind] || '消息') + ' ' + who + ' ' + date(event.created_at));
+      if (message.reply_to) lines.push('回复 #' + message.reply_to);
+      lines.push(text(message.text));
+      lines.push('');
+    }
+    const blob = new Blob([lines.join('\n')], {type: 'text/plain;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = (current.title || 'transcript').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80) + '.txt';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   function clearPairing() {$('pair-codes').replaceChildren(); formError('pair-error');}
   function closeDialog(id) {$(id).close(); if (id === 'pair-dialog') clearPairing(); if (id === 'join-dialog') clearJoinForm();}
@@ -132,11 +245,33 @@
     ++generation; pollController?.abort(); pollController = null;
     if (retryTimer) clearTimeout(retryTimer); retryTimer = null;
   }
+  function resetTopicChrome() {
+    $('session-title').textContent = '通信工作台';
+    $('session-title').title = '通信工作台';
+    $('session-goal').textContent = '';
+    $('session-goal').hidden = true;
+    $('topic-meta').hidden = true;
+    $('session-status').replaceChildren();
+    $('session-role').textContent = '';
+    $('seat-online').hidden = true;
+    $('owner-actions').hidden = true;
+    $('danger-zone').hidden = true;
+    $('export-transcript').hidden = true;
+    $('state-banner').hidden = true;
+    $('public-panel').hidden = true;
+    $('peer-cards').replaceChildren();
+    $('team-summary-list').replaceChildren();
+    $('task-board-list').replaceChildren();
+    if ($('pending-count')) $('pending-count').textContent = '按 reply_to 汇总';
+    if ($('seat-count')) $('seat-count').textContent = '';
+    setConnection('', '尚未选择对话');
+  }
   function forgetPrivateView() {
     stopPolling(); events.clear(); current = null; cursor = 0; replyTo = null; outgoing = null;
     clearPending();
     $('events').replaceChildren(); $('workspace').hidden = true; $('workspace-empty').hidden = false;
-    $('pair-dialog').close(); clearPairing(); $('team-dialog').close(); writeLocation('', ''); renderSessions();
+    $('pair-dialog').close(); clearPairing(); $('team-dialog').close(); writeLocation('', '');
+    resetTopicChrome(); showWorkbenchPanel('sessions'); renderSessions();
   }
   function lostIdentity() {
     identity = null; csrf = ''; sessions = []; forgetPrivateView(); updateIdentity();
@@ -155,16 +290,34 @@
   }
   function renderSessions() {
     const filter = $('session-filter').value;
-    const shown = sessions.filter(session => filter === 'all' || session.status === filter);
+    const query = text($('session-search') && $('session-search').value).trim().toLowerCase();
+    const shown = sessions.filter(session => {
+      if (filter !== 'all' && session.status !== filter) return false;
+      if (!query) return true;
+      return [session.title, session.goal, session.public_id].map(text).join('\n').toLowerCase().includes(query);
+    });
     $('session-count').textContent = String(shown.length);
+    syncFilterChips();
     $('session-list').replaceChildren(...shown.map(session => {
-      const button = element('button',null,'session-item' + (current?.id === session.id ? ' active' : ''));
-      button.type = 'button'; button.setAttribute('aria-current',String(current?.id === session.id));
-      const top = element('div',null,'session-item-top'); top.append(element('span',null,'session-dot ' + session.status),element('strong',session.title || '未命名会话'));
-      const modeLabel = session.mode === 'team' ? '团队 · ' : '一对一 · ';
-      const bottom = element('div',null,'session-item-bottom'); bottom.append(element('span',modeLabel + (states[session.status] || '状态待确认') + ' · ' + (roles[session.role] || '成员')),element('time',date(session.updated_at)));
-      button.append(top,element('p',session.goal || '尚未填写目标'),bottom);
-      button.addEventListener('click',() => selectSession(session.id)); return button;
+      const active = current?.id === session.id;
+      const titleText = session.title || '未命名会话';
+      const button = element('button', null, 'session-item' + (active ? ' active' : ''));
+      button.type = 'button';
+      button.title = titleText;
+      button.setAttribute('aria-current', active ? 'true' : 'false');
+      const top = element('div', null, 'session-kicker');
+      if (PUBLIC_ID.test(text(session.public_id))) top.append(element('span', session.public_id, 'session-id'));
+      else top.append(element('span', session.mode === 'team' ? '团队' : '一对一', 'session-id'));
+      const status = element('span', null, 'status-pill ' + (session.status || ''));
+      status.append(element('span', '', 'status-dot ' + (session.status || '')), element('span', states[session.status] || '状态待确认'));
+      top.append(status);
+      const bottom = element('div', null, 'session-meta');
+      bottom.append(element('span', session.mode === 'team' ? '团队' : '一对一'));
+      bottom.append(element('span', occupiedSeatCount(session) + ' 席'));
+      bottom.append(element('time', date(session.updated_at)));
+      button.append(top, element('p', titleText, 'session-name'), bottom);
+      button.addEventListener('click', () => selectSession(session.id));
+      return button;
     }));
     $('session-list-empty').hidden = shown.length > 0;
     if (!shown.length) $('session-list-empty').textContent = !identity ? '连接身份后，可查看属于你的对话。' : sessions.length ? '此状态下没有对话。' : '还没有对话。可以创建一对一 Topic 或团队会话，也可以用配对码加入。';
@@ -196,110 +349,94 @@
       $('session-list-empty').hidden = false; $('session-list-empty').textContent = '会话列表读取失败，可点击刷新重试。'; notify(error.message,true);
     } finally {if (thisGeneration === listGeneration) $('refresh-sessions').disabled = !identity;}
   }
-  function environmentCard(environment) {
-    const box = element('div',null,'environment');
-    box.append(element('div','执行环境 · 执行端自报','environment-label'));
-    if (!environment || !text(environment.os_name)) {
-      box.classList.add('missing'); box.append(element('p','尚未上报操作系统。执行端需携带 environment 信息接入。')); return box;
-    }
-    box.append(element('div',[text(environment.os_name),text(environment.os_version)].filter(Boolean).join(' '),'environment-os'));
-    const list = element('dl');
-    for (const [label,value] of [['架构',text(environment.architecture)],['Shell',array(environment.shells).filter(v => typeof v === 'string').join(' / ')],['Python',text(environment.python_version)]]) {
-      const row = element('div'); row.append(element('dt',label),element('dd',value || '未上报')); list.append(row);
-    }
-    box.append(list); return box;
+  function canSeeEnvironment(role, seat) {
+    if (role !== 'worker') return false;
+    if (!isTeam()) return true;
+    return current.role !== 'worker' || Number(current.seat) === Number(seat);
   }
-  function visibleTo(event, seat) {
-    if (!event || event.kind !== 'message') return true;
-    const message = event.message || {}, to = message.to;
-    if (to === 'all') return true;
-    if (typeof to === 'string' && to.startsWith('worker:')) {
-      return Number(to.slice(7)) === Number(seat) || Number(event.sender?.seat) === Number(seat);
-    }
-    if (message.kind === 'instruction') return true;
-    if (event.sender?.role === 'worker' &&
-        ['result','progress','question','note'].includes(message.kind)) {
-      return Number(event.sender?.seat) === Number(seat);
-    }
-    return true;
-  }
-  function unackedCount(member, seat) {
-    const ack = Number(member?.ack_seq) || 0;
-    if (!isTeam()) return Math.max(0, Number(current?.last_seq || 0) - ack);
-    if (seat === 0) return [...events.values()].filter(event => Number(event.seq) > ack).length;
-    return [...events.values()].filter(event => Number(event.seq) > ack && visibleTo(event, seat)).length;
-  }
-  function peerCard(role, member, seat) {
+  function seatActions(role, member, seat) {
+    const actions = element('div', null, 'seat-actions');
     const team = isTeam();
     const numbered = role === 'worker' && team && Number.isInteger(Number(seat)) && Number(seat) > 0;
-    const label = role === 'mentor' ? '指导端' : numbered ? '执行端 · ' + seat + ' 号席' : team ? '执行端 · 新席位' : '执行端';
-    const card = element('article',null,'peer-card ' + role), top = element('div',null,'peer-card-top');
-    top.append(element('span',role === 'mentor' ? '导' : numbered ? String(seat) : team ? '新' : '执','peer-avatar'),element('h4',label));
-    const leader = current && current.leader;
-    if (leader && member && leader.role === role && Number(leader.seat) === Number(seat)) {
-      top.append(element('span','领导者','peer-leader'));
+    if (team && owner() && member) {
+      const button = element('button', role === 'mentor' ? '撤销指导端' : '撤销该席', 'text-button danger-quiet');
+      button.type = 'button';
+      button.disabled = mutationBusy;
+      button.addEventListener('click', () => confirmRevokeSeat(role, seat));
+      actions.append(button);
     }
-    const presence = !member ? ['等待接入', '']
-      : member.live === true ? ['在席', ' live']
-      : member.live === false && member.online === true ? ['刚离开', ' away']
-      : member.live === false ? ['离席', '']
-      : member.online === true ? ['在线', ' online']
-      : ['离线', ''];
-    top.append(element('span', presence[0], 'peer-presence' + presence[1]));
-    card.append(top);
-    card.append(element('p',member?.name || '尚未接入','peer-name'));
+    if (owner() && (team || role !== 'worker' || seat === undefined)) {
+      if (team && !member) {
+        const button = element('button', numbered ? '生成该席邀请' : (role === 'mentor' ? '生成指导端邀请' : '生成新席邀请'), 'text-button');
+        button.type = 'button';
+        button.disabled = mutationBusy || current.status === 'closed';
+        button.addEventListener('click', () => inviteTeam(role, numbered ? seat : undefined));
+        actions.append(button);
+      } else if (!team) {
+        const button = element('button', member ? '撤销访问' : '生成 / 重发配对码', member ? 'text-button danger-quiet' : 'text-button');
+        button.type = 'button';
+        button.disabled = mutationBusy || (!member && current.status === 'closed');
+        button.addEventListener('click', () => member ? confirmRevoke([role]) : invite(role));
+        actions.append(button);
+      }
+    }
+    return actions.childElementCount ? actions : null;
+  }
+  function seatRow(role, member, seat) {
+    const team = isTeam();
+    const numbered = role === 'worker' && team && Number.isInteger(Number(seat)) && Number(seat) > 0;
+    const roleLabel = role === 'owner' ? '管理者' : role === 'mentor' ? '指导端' : numbered ? '执行端 · ' + seat + ' 号席' : '执行端';
+    const presence = presenceOf(member);
+    const row = element('div', null, 'seat-row');
+    row.append(element('span', '', 'status-dot ' + presence.tone));
+    const copy = element('div', null, 'seat-copy');
+    copy.append(element('p', member?.name || '尚未接入', 'seat-name'));
+    const meta = element('div', null, 'seat-meta');
+    meta.append(element('span', roleLabel, 'role-chip'));
+    if (isLeader(member)) meta.append(element('span', '领导者', 'leader-chip'));
+    meta.append(element('span', presence.label));
+    copy.append(meta);
+    if (member && canSeeEnvironment(role, seat)) {
+      const line = environmentLine(member.environment);
+      copy.append(element('p', line || '尚未上报操作系统', 'seat-env'));
+    } else if (member && role !== 'worker') {
+      const line = environmentLine(member.environment);
+      if (line) copy.append(element('p', line, 'seat-env'));
+    }
     if (member) {
-      const ack = Number(member.ack_seq) || 0, last = Number(current?.last_seq) || 0;
-      const unacked = unackedCount(member, seat);
-      card.append(element('p','最后活动：' + date(member.last_seen),'peer-info'));
-      card.append(element('p','已确认收到 #' + ack + ' · 不代表执行完成','peer-info'));
-      if (unacked) card.append(element('p','未确认 ' + unacked + ' 条（最新 #' + last + '）','peer-info pending'));
       const working = latestMessage(role, role === 'worker' ? seat : undefined);
       const reply = working?.message?.kind === 'progress' ? working.message.reply_to : null;
-      if (reply) card.append(element('p','正在处理 #' + text(reply),'peer-info working'));
-      if (role === 'worker' && (!isTeam() || current.role !== 'worker' || Number(current.seat) === Number(seat))) card.append(environmentCard(member.environment));
-      if (isTeam() && current?.owner) {
-        const actions = element('div',null,'peer-actions');
-        const button = element('button',role === 'mentor' ? '撤销指导端' : '撤销该席','danger-quiet');
-        button.type = 'button'; button.disabled = mutationBusy;
-        button.addEventListener('click', () => confirmRevokeSeat(role, seat));
-        actions.append(button); card.append(actions);
-      }
-    } else {
-      card.append(element('p',role === 'mentor'
-        ? (team ? '生成一条指导端邀请，交给负责分析、指挥的 Agent。'
-                : '将指导端配对码交给负责分析、指导的 Agent。')
-        : (team ? '生成一条新执行端邀请。席位号由服务端分配，已撤销的号码不会再用。'
-                : '将执行端配对码交给负责操作的 Agent；接入时必须自报系统环境。'),'peer-vacant'));
+      if (reply) copy.append(element('p', '正在处理 #' + text(reply), 'seat-note'));
+    } else if (role === 'worker') {
+      copy.append(element('p', team ? '席位号由服务端分配，已撤销的号码不会再用。' : '接入时必须自报系统环境。', 'seat-note'));
     }
-    if (owner() && (isTeam() || role !== 'worker' || seat === undefined)) {
-      const actions = element('div',null,'peer-actions');
-      if (isTeam() && !member) {
-        const button = element('button', numbered ? '生成该席邀请' : '生成新席邀请');
-        button.type = 'button'; button.disabled = mutationBusy || current.status === 'closed';
-        button.addEventListener('click',() => inviteTeam(role, numbered ? seat : undefined));
-        actions.append(button);
-      } else if (!isTeam()) {
-        const button = element('button',member ? '撤销访问' : '生成 / 重发配对码',member ? 'danger-quiet' : '');
-        button.type = 'button'; button.disabled = mutationBusy || (!member && current.status === 'closed');
-        button.addEventListener('click',() => member ? confirmRevoke([role]) : invite(role));
-        actions.append(button);
-      }
-      if (actions.children.length) card.append(actions);
-    }
-    return card;
+    const actions = role === 'owner' ? null : seatActions(role, member, seat);
+    if (actions) copy.append(actions);
+    row.append(copy);
+    return row;
   }
   function renderPeers() {
+    if (!current) { $('peer-cards').replaceChildren(); return; }
+    const people = joinedPeople(current);
+    const online = people.filter(person => person.online === true).length;
+    if ($('seat-count')) $('seat-count').textContent = people.length ? (online + '/' + people.length + ' 在线') : '';
     if (isTeam()) {
-      const cards = [peerCard('mentor', current?.mentor || null, 0)];
+      const rows = [];
+      const ownerRow = array(current.members).find(item => item.role === 'owner');
+      if (ownerRow) rows.push(seatRow('owner', ownerRow, ownerRow.seat));
+      rows.push(seatRow('mentor', current.mentor || null, 0));
       const workers = teamWorkers().slice().sort((left, right) => Number(left.seat) - Number(right.seat));
-      for (const worker of workers) cards.push(peerCard('worker', worker, Number(worker.seat)));
-      const max = Number(current?.max_workers) || 8;
-      if (workers.length < max) cards.push(peerCard('worker', null, null));
-      $('peer-cards').replaceChildren(...cards);
+      for (const worker of workers) rows.push(seatRow('worker', worker, Number(worker.seat)));
+      const max = Number(current.max_workers) || 8;
+      if (workers.length < max) rows.push(seatRow('worker', null, null));
+      $('peer-cards').replaceChildren(...rows);
       return;
     }
-    $('peer-cards').replaceChildren(...['mentor','worker'].map(role => peerCard(role, peer(role), undefined)));
+    const ownerPeer = peer('owner');
+    const rows = [];
+    if (ownerPeer && text(ownerPeer.name)) rows.push(seatRow('owner', ownerPeer, undefined));
+    rows.push(seatRow('mentor', peer('mentor'), undefined), seatRow('worker', peer('worker'), undefined));
+    $('peer-cards').replaceChildren(...rows);
   }
   function renderComposer() {
     if (!current) return;
@@ -336,93 +473,180 @@
     }
     $('reply-preview').hidden = !replyTo;
     $('reply-text').textContent = replyTo ? '回复 #' + replyTo.seq + ' · ' + replyTo.preview : '';
+    renderKindPills();
+  }
+  function renderKindPills() {
+    const host = $('kind-pills');
+    const select = $('message-kind');
+    if (!host || !select) return;
+    host.replaceChildren(...[...select.options].map(option => {
+      const button = element('button', option.textContent);
+      button.type = 'button';
+      button.disabled = option.disabled || select.disabled;
+      button.setAttribute('aria-pressed', String(option.value === select.value));
+      button.addEventListener('click', () => {
+        if (button.disabled) return;
+        select.value = option.value;
+        select.dispatchEvent(new Event('change', {bubbles: true}));
+      });
+      return button;
+    }));
+  }
+  function workMessages() {
+    return [...events.values()].filter(event => event.kind === 'message' && event.message && !isProtocolNoise(event.message));
+  }
+  function managerPending() {
+    const messages = workMessages();
+    return messages.filter(event => {
+      if (event.message.kind !== 'question' || event.sender?.role !== 'worker') return false;
+      const seq = Number(event.seq);
+      return !messages.some(reply => Number(reply.seq) > seq
+        && Number(reply.message.reply_to) === seq
+        && (reply.sender?.role === 'owner' || reply.sender?.role === 'mentor'));
+    }).sort((left, right) => Number(right.seq) - Number(left.seq));
+  }
+  function answerQuestion(event) {
+    if (!current || current.status === 'closed') return;
+    replyTo = {seq: Number(event.seq), preview: text(event.message?.text).slice(0, 60)};
+    renderComposer();
+    showWorkbenchPanel('thread');
+    $('message-text').focus();
   }
   function renderTaskBoard() {
     const box = $('task-board'), list = $('task-board-list');
     if (!box || !list) return;
-    if (!isTeam()) { box.hidden = true; list.replaceChildren(); return; }
-    const tasks = Array.isArray(current.tasks) ? current.tasks : [];
+    if (!current) { box.hidden = true; list.replaceChildren(); return; }
     box.hidden = false;
-    if (!tasks.length) {
-      list.replaceChildren(element('p','还没有任务。任务板和下面的消息是同一份记录。','peer-vacant'));
+    const tasks = isTeam() && Array.isArray(current.tasks) ? current.tasks : [];
+    if (tasks.length) {
+      const ids = new Set(tasks.map(task => text(task.id)));
+      const children = new Map();
+      for (const task of tasks) {
+        const parent = text(task.parent_id);
+        if (parent && ids.has(parent)) {
+          if (!children.has(parent)) children.set(parent, []);
+          children.get(parent).push(task);
+        }
+      }
+      const ordered = [];
+      const walk = (task, depth) => {
+        ordered.push([task, depth]);
+        for (const child of children.get(text(task.id)) || []) walk(child, depth + 1);
+      };
+      for (const task of tasks) {
+        const parent = text(task.parent_id);
+        if (!parent || !ids.has(parent)) walk(task, 0);
+      }
+      list.replaceChildren(...ordered.slice(0, 16).map(([task, depth]) => {
+        const item = element('div', null, 'task-row' + (depth ? ' depth-' + Math.min(depth, 3) : ''));
+        const assignee = task.assignee;
+        const who = assignee ? (text(assignee.name) || '成员') + ' · ' + (assignee.seat ?? '') + '号席' : '未认领';
+        const line = element('div', null, 'task-line');
+        line.append(element('p', (text(task.title) || '未命名任务') + ' · ' + (taskStatuses[task.status] || '')));
+        const progress = task.progress;
+        if (typeof progress === 'number' && Number.isFinite(progress)) line.append(element('span', Math.max(0, Math.min(100, progress)) + '%', 'task-progress'));
+        item.append(line, element('p', who, 'seat-note'));
+        if (typeof progress === 'number' && Number.isFinite(progress)) {
+          const meter = element('div', null, 'task-meter');
+          const fill = element('span', '', 'task-meter-fill');
+          fill.style.width = Math.max(0, Math.min(100, progress)) + '%';
+          meter.append(fill);
+          item.append(meter);
+        }
+        return item;
+      }));
       return;
     }
-    const ids = new Set(tasks.map(task => text(task.id)));
-    const children = new Map();
-    for (const task of tasks) {
-      const parent = text(task.parent_id);
-      if (parent && ids.has(parent)) {
-        if (!children.has(parent)) children.set(parent, []);
-        children.get(parent).push(task);
-      }
+    const instructions = workMessages().filter(event => event.message.kind === 'instruction')
+      .sort((left, right) => Number(left.seq) - Number(right.seq)).slice(-8);
+    if (!instructions.length) {
+      list.replaceChildren(element('p', '还没有任务。任务板和消息是同一份记录。', 'rail-empty'));
+      return;
     }
-    const ordered = [];
-    const walk = (task, depth) => {
-      ordered.push([task, depth]);
-      for (const child of children.get(text(task.id)) || []) walk(child, depth + 1);
-    };
-    for (const task of tasks) {
-      const parent = text(task.parent_id);
-      if (!parent || !ids.has(parent)) walk(task, 0);
-    }
-    list.replaceChildren(...ordered.slice(0, 16).map(([task, depth]) => {
-      const item = element('article', null, 'summary-item' + (depth ? ' task-child' : ''));
-      if (depth) item.style.marginLeft = Math.min(depth, 3) * 14 + 'px';
-      const assignee = task.assignee;
-      const who = assignee ? (text(assignee.name) || '成员') + ' · ' + (assignee.seat ?? '') + '号席' : '未认领';
-      item.append(element('p', (text(task.title) || '未命名任务') + ' · ' + (taskStatuses[task.status] || ''), 'summary-instruction'));
-      item.append(element('p', who + ' · ' + (Number(task.progress) || 0) + '%', 'summary-seat'));
-      const meter = element('div', null, 'task-meter');
-      const fill = element('span', '', 'task-meter-fill');
-      fill.style.width = Math.max(0, Math.min(100, Number(task.progress) || 0)) + '%';
-      meter.append(fill);
-      item.append(meter);
+    const replies = workMessages();
+    list.replaceChildren(...instructions.map(event => {
+      const related = replies.filter(reply => Number(reply.message.reply_to) === Number(event.seq));
+      const state = related.some(reply => reply.message.kind === 'result') ? '已完成'
+        : related.some(reply => reply.message.kind === 'progress') ? '进行中' : '待回报';
+      const item = element('div', null, 'task-row');
+      const line = element('div', null, 'task-line');
+      line.append(element('p', '#' + event.seq + ' · ' + (text(event.message.text) || '（空指令）')));
+      line.append(element('span', state, 'task-progress'));
+      item.append(line);
       return item;
     }));
   }
   function renderTeamSummary() {
     const box = $('team-summary'), list = $('team-summary-list');
-    if (!isTeam()) {
-      box.hidden = true; list.replaceChildren(); return;
-    }
+    if (!box || !list) return;
+    if (!current) { box.hidden = true; list.replaceChildren(); return; }
     box.hidden = false;
-    const occupied = teamWorkers().map(item => Number(item.seat)).filter(Number.isInteger);
-    const instructions = [...events.values()]
-      .filter(event => event.kind === 'message' && event.message?.kind === 'instruction')
-      .sort((left,right) => Number(right.seq) - Number(left.seq)).slice(0, 6);
-    if (!instructions.length) {
-      list.replaceChildren(element('p','还没有指令。派活后可在这里按 reply_to 查看各席回报。','peer-vacant'));
+    const pending = managerPending();
+    if ($('pending-count')) $('pending-count').textContent = pending.length ? (pending.length + ' 项待答复') : '按 reply_to 汇总';
+    const nodes = [];
+    for (const event of pending.slice(0, 3)) {
+      const block = element('div', null, 'awaiting');
+      const who = text(event.sender?.name) || '执行端';
+      block.append(element('p', '待答复 · #' + event.seq + ' · ' + who, 'awaiting-kicker'));
+      block.append(element('p', text(event.message.text).replace(/\s+/g, ' ').slice(0, 120), 'awaiting-text'));
+      if (current.status !== 'closed') {
+        const button = element('button', '答复');
+        button.type = 'button';
+        button.addEventListener('click', () => answerQuestion(event));
+        block.append(button);
+      }
+      nodes.push(block);
+    }
+    const instructions = workMessages().filter(event => event.message.kind === 'instruction')
+      .sort((left, right) => Number(right.seq) - Number(left.seq)).slice(0, 6);
+    if (!instructions.length && !nodes.length) {
+      list.replaceChildren(element('p', '还没有指令。派活后可在这里按 reply_to 查看各席回报。', 'rail-empty'));
       return;
     }
-    const replies = [...events.values()].filter(event => event.kind === 'message');
-    list.replaceChildren(...instructions.map(event => {
-      const message = event.message || {}, to = text(message.to);
-      const targets = to.startsWith('worker:') ? [Number(to.slice(7))] : occupied;
-      const item = element('article',null,'summary-item');
-      item.append(element('p','#' + event.seq + ' · ' + (text(message.text) || '（空指令）'),'summary-instruction'));
-      if (!targets.length) item.append(element('p','尚无执行端席位','peer-vacant'));
-      for (const seat of targets) {
-        const result = replies.find(reply => reply.message?.kind === 'result'
-          && Number(reply.message.reply_to) === Number(event.seq)
-          && Number(reply.sender?.seat) === seat);
-        const progress = replies.find(reply => reply.message?.kind === 'progress'
-          && Number(reply.message.reply_to) === Number(event.seq)
-          && Number(reply.sender?.seat) === seat);
-        const row = element('div',null,'summary-seat');
-        row.append(element('strong',seat + ' 号席'));
-        if (result) row.append(element('span','已回报 #' + result.seq,'done'));
-        else if (progress) row.append(element('span','处理中 #' + progress.seq,'working'));
-        else row.append(element('span','未回报','missing'));
+    const replies = workMessages();
+    for (const event of instructions) {
+      const message = event.message || {};
+      const to = text(message.to);
+      const item = element('div', null, 'summary-item');
+      item.append(element('p', '#' + event.seq + ' · ' + (text(message.text) || '（空指令）'), 'summary-instruction'));
+      const targets = isTeam()
+        ? (to.startsWith('worker:') ? [{key: Number(to.slice(7)), label: to.slice(7) + ' 号席'}]
+          : teamWorkers().map(worker => ({key: Number(worker.seat), label: worker.seat + ' 号席'})))
+        : [{key: 'worker', label: '执行端'}];
+      if (!targets.length) item.append(element('p', '尚无执行端席位', 'rail-empty'));
+      for (const target of targets) {
+        const match = reply => {
+          if (Number(reply.message.reply_to) !== Number(event.seq)) return false;
+          if (!isTeam()) return reply.sender?.role === 'worker';
+          return Number(reply.sender?.seat) === target.key;
+        };
+        const result = replies.find(reply => reply.message.kind === 'result' && match(reply));
+        const progress = replies.find(reply => reply.message.kind === 'progress' && match(reply));
+        const row = element('div', null, 'summary-seat');
+        row.append(element('strong', target.label));
+        if (result) row.append(element('span', '已回报 #' + result.seq, 'done'));
+        else if (progress) row.append(element('span', '处理中 #' + progress.seq, 'working'));
+        else row.append(element('span', '未回报', 'missing'));
         item.append(row);
       }
-      return item;
-    }));
+      nodes.push(item);
+    }
+    list.replaceChildren(...nodes);
   }
   function renderCurrent() {
     if (!current) return;
     $('workspace-empty').hidden = true; $('workspace').hidden = false;
-    $('session-title').textContent = current.title || '未命名会话'; $('session-goal').textContent = current.goal || '尚未填写目标';
-    $('session-status').textContent = states[current.status] || '状态待确认'; $('session-status').className = 'status-badge ' + current.status;
+    const titleText = current.title || '未命名会话';
+    $('session-title').textContent = titleText;
+    $('session-title').title = titleText;
+    const goalText = current.goal || '';
+    $('session-goal').textContent = goalText;
+    $('session-goal').title = goalText;
+    $('session-goal').hidden = !goalText;
+    $('topic-meta').hidden = false;
+    const status = $('session-status');
+    status.className = 'status-pill ' + (current.status || '');
+    status.replaceChildren(element('span', '', 'status-dot ' + (current.status || '')), element('span', states[current.status] || '状态待确认'));
     let roleLabel = '当前身份：' + (roles[current.role] || '成员');
     if (isTeam()) {
       const leader = current.leader;
@@ -431,31 +655,79 @@
         : ' · 尚无领导者';
     }
     $('session-role').textContent = roleLabel;
-    $('owner-actions').hidden = !owner(); $('management').hidden = !owner() || isTeam();
-    $('manage-invites').hidden = !owner() || !isTeam(); $('manage-invites').disabled = mutationBusy || current.status === 'closed';
-    $('rotate-topic-code').hidden = !!isTeam();
+    $('session-role').title = roleLabel;
+    const people = joinedPeople(current);
+    const online = people.filter(person => person.online === true).length;
+    $('seat-online').hidden = !people.length;
+    $('seat-online').textContent = people.length ? ('在线 ' + online + '/' + people.length) : '';
+    $('owner-actions').hidden = !owner();
+    $('danger-zone').hidden = !owner();
+    $('export-transcript').hidden = false;
+    $('export-transcript').disabled = events.size === 0;
+    $('manage-invites').hidden = !owner() || !isTeam();
+    $('manage-invites').disabled = mutationBusy || current.status === 'closed';
+    $('rotate-topic-code').hidden = !owner() || !!isTeam();
+    $('rotate-topic-code').disabled = mutationBusy || current.status === 'closed';
+    if ($('danger-note')) $('danger-note').hidden = !isTeam();
+    $('revoke-all').hidden = !!isTeam();
     const directory = $('directory-link');
     const directoryHref = publicConversationHref(current);
     directory.hidden = !directoryHref;
     if (directoryHref) {directory.href = directoryHref; directory.title = '在公开目录中查看此对话。公开页不含配对码、邀请码或环境信息。';}
     else {directory.removeAttribute('href');}
     $('toggle-public').textContent = current.public_read ? '关闭公开围观' : '开启公开围观';
+    $('toggle-public').setAttribute('aria-pressed', String(!!current.public_read));
     $('toggle-public').disabled = mutationBusy;
     $('public-panel').hidden = !current.public_read;
-    if (current.public_read) $('public-link').value = localStorage.getItem('relay-public-' + current.id) || '';
+    const storedLink = current.public_read ? (localStorage.getItem('relay-public-' + current.id) || '') : '';
+    $('public-link').value = storedLink;
+    $('public-link').placeholder = storedLink ? '' : '此浏览器未保存公开链接';
+    if ($('copy-public')) $('copy-public').disabled = !storedLink;
     $('toggle-state').textContent = current.status === 'paused' ? '继续协作' : '暂停指令';
-    $('toggle-state').disabled = mutationBusy || current.status === 'closed'; $('close-session').disabled = mutationBusy || current.status === 'closed'; $('rotate-topic-code').disabled = mutationBusy || current.status === 'closed';
-    $('revoke-all').disabled = mutationBusy || !array(current.peers).length;
-    $('state-banner').hidden = current.status === 'active'; $('state-banner').className = 'state-banner ' + current.status;
+    $('toggle-state').disabled = mutationBusy || current.status === 'closed';
+    $('close-session').disabled = mutationBusy || current.status === 'closed';
+    $('revoke-all').disabled = mutationBusy || !array(current.peers).some(person => person.role === 'mentor' || person.role === 'worker');
+    $('state-banner').hidden = current.status === 'active';
+    $('state-banner').className = 'state-banner ' + current.status;
     $('state-banner').textContent = current.status === 'closed' ? '会话已结束。历史记录仍可阅读，不再接受新消息或新成员。' : '新的指令已暂停，仍可发送进度、结果与备注。暂停不会强制停止远端已经启动的操作。';
-    renderPeers(); renderComposer(); renderTeamSummary(); renderTaskBoard();
+    renderPeers(); renderComposer(); renderTeamSummary(); renderTaskBoard(); renderConnectionFacts();
+  }
+  function ackRoster() {
+    if (!current) return [];
+    if (isTeam()) return [current.mentor, ...teamWorkers()].filter(person => person && text(person.name));
+    return array(current.peers).filter(person => (person.role === 'mentor' || person.role === 'worker') && text(person.name));
+  }
+  function sameSender(member, event) {
+    const sender = event.sender || {};
+    if (member.role !== sender.role) return false;
+    if (!isTeam()) return true;
+    return Number(member.seat) === Number(sender.seat);
+  }
+  function ackText(event) {
+    const seq = Number(event.seq);
+    if (!Number.isInteger(seq)) return '';
+    const roster = ackRoster().filter(member => !sameSender(member, event));
+    if (!roster.length) return '';
+    const acked = roster.filter(member => Number(member.ack_seq) >= seq).length;
+    if (acked === roster.length) return '已确认 ' + acked + '/' + roster.length;
+    if (!acked) return '待确认 0/' + roster.length;
+    return '已确认 ' + acked + '/' + roster.length;
+  }
+  function replyQuote(message) {
+    const seq = Number(message && message.reply_to);
+    if (!Number.isInteger(seq) || seq < 1) return null;
+    const target = events.get(seq);
+    const who = target ? (text(target.sender?.name) || roles[target.sender?.role] || '消息') : '';
+    const quoted = target && target.message ? text(target.message.text).replace(/\s+/g, ' ').trim() : '';
+    const preview = quoted.length > 80 ? quoted.slice(0, 80) + '…' : quoted;
+    return element('blockquote', '回复 #' + seq + (who ? ' · ' + who : '') + (preview ? '：「' + preview + '」' : ''), 'reply-quote');
   }
   function eventNode(event) {
     const sender = event.sender || {};
     const seat = Number(sender.seat);
     const seatLabel = isTeam() && Number.isInteger(seat) && seat > 0 ? ' · ' + seat + ' 号席' : '';
     if (event.kind !== 'message') {
-      let label = '会话状态已更新';
+      let label = '会话有更新';
       if (event.kind === 'joined') label = (roles[event.role || sender.role] || '成员') + seatLabel + '已接入会话';
       if (event.kind === 'revoked') label = (roles[event.role] || '成员') + seatLabel + '的访问权限已撤销';
       if (event.kind === 'state') label = '会话' + (states[event.status] || '状态已更新');
@@ -463,51 +735,72 @@
         const task = event.task || {};
         label = '任务「' + (text(task.title) || '未命名') + '」' + (taskStatuses[task.status] || '');
       }
-      const row = element('div',null,'system-event'); row.append(element('span',label),element('time',date(event.created_at))); return row;
+      if (event.kind === 'report') {
+        const report = event.report || {};
+        label = '已提交报告' + (text(report.title) ? '「' + text(report.title) + '」' : '');
+      }
+      const row = element('div', null, 'system-event');
+      row.append(element('span', label), element('time', date(event.created_at)));
+      return row;
     }
     const message = event.message || {};
     const kind = Object.hasOwn(kinds, message.kind) ? message.kind : 'note';
-    const mine = isMine(event);
-    const row = element('article', null, 'event turn ' + (mine ? 'mine ' : 'theirs ') + kind);
+    const row = element('article', null, 'event turn ' + kind);
     const who = text(sender.name) || roles[sender.role] || '成员';
-    row.dataset.who = [text(sender.role), String(sender.seat ?? ''), who, kind].join('|');
+    row.dataset.who = [text(sender.role), String(sender.seat ?? ''), who].join('|');
     const avatar = element('span', who.trim().slice(0, 1) || '·', 'avatar avatar-' + (sender.role || 'member'));
     avatar.setAttribute('aria-hidden', 'true');
-    const stack = element('div', null, 'turn-body');
-    const meta = element('div', null, 'event-meta turn-head');
-    meta.append(element('span', who + seatLabel, 'event-author'));
+    const meta = element('div', null, 'turn-head');
+    meta.append(avatar, element('span', who + seatLabel, 'speaker'));
     if (roles[sender.role]) meta.append(element('span', roles[sender.role], 'role-chip'));
-    meta.append(element('span', kinds[kind] || '消息', 'event-kind'));
+    if (isLeader(sender)) meta.append(element('span', '领导者', 'leader-chip'));
     const stamp = element('time', date(event.created_at));
     stamp.dateTime = text(event.created_at);
     stamp.title = '第 ' + event.seq + ' 条';
     meta.append(stamp);
-    stack.append(meta);
-    const bubble = element('div', null, 'event-body bubble');
-    const context = [];
-    if (message.reply_to) context.push('回复 #' + text(message.reply_to));
+    const tags = element('div', null, 'turn-tags');
+    tags.append(element('span', kinds[kind] || '消息', 'kind-chip ' + kind));
+    const receipt = ackText(event);
+    if (receipt) {
+      const parts = receipt.split('/');
+      const acked = Number((parts[0] || '').replace(/\D/g, ''));
+      const total = Number(parts[1]);
+      const ackClass = acked === total ? 'done' : acked === 0 ? 'wait' : 'partial';
+      tags.append(element('span', receipt, 'ack-chip ' + ackClass));
+    }
+    tags.append(element('span', '#' + event.seq, 'seq-label'));
     const to = text(message.to);
-    if (to === 'all') context.push('发给全体');
-    else if (to.startsWith('worker:')) context.push('发给 ' + to.slice(7) + ' 号席');
-    if (context.length) bubble.append(element('div', context.join(' · '), 'event-reply'));
-    bubble.append(element('div', text(message.text), 'bubble-text'));
+    if (to === 'all') tags.append(element('span', '发给全体', 'role-chip'));
+    else if (to.startsWith('worker:')) tags.append(element('span', '发给 ' + to.slice(7) + ' 号席', 'role-chip'));
+    const quote = replyQuote(message);
+    const body = element('div', text(message.text), 'bubble-text');
+    const foot = element('div', null, 'event-foot');
+    const reply = element('button', '回复');
+    reply.type = 'button';
+    reply.addEventListener('click', () => {
+      if (!current || current.status === 'closed') return;
+      replyTo = {seq: Number(event.seq), preview: text(message.text).slice(0, 60)};
+      renderComposer();
+      $('message-text').focus();
+    });
+    foot.append(reply);
+    row.append(meta, tags);
+    if (quote) row.append(quote);
+    row.append(body);
     const attachments = array(message.attachments).filter(item => item && typeof item === 'object');
     for (const attachment of attachments) {
       const line = element('div', null, 'event-attachment');
       line.append(element('span', text(attachment.name) + (attachment.size ? ' · ' + sizeLabel(attachment.size) : '')));
       if (text(attachment.url)) {
-        const link = element('a', '下载'); link.href = attachment.url; link.target = '_blank'; link.rel = 'noopener';
+        const link = element('a', '下载');
+        link.href = attachment.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
         line.append(link);
       }
-      bubble.append(line);
+      row.append(line);
     }
-    stack.append(bubble);
-    const foot = element('div', null, 'event-foot');
-    const reply = element('button', '回复'); reply.type = 'button';
-    reply.addEventListener('click', () => {if (!current || current.status === 'closed') return; replyTo = {seq:Number(event.seq), preview:text(message.text).slice(0, 60)}; renderComposer(); $('message-text').focus();});
-    foot.append(reply);
-    stack.append(foot);
-    row.append(avatar, stack);
+    row.append(foot);
     return row;
   }
   function sizeLabel(size) {
@@ -531,7 +824,7 @@
     let added = 0;
     for (const event of array(items).sort((a,b) => Number(a.seq) - Number(b.seq))) {
       const seq = Number(event.seq);
-      if (!Number.isInteger(seq) || seq < 1 || events.has(seq)) continue;
+      if (!Number.isInteger(seq) || seq < 1 || events.has(seq) || !visibleWorkEvent(event)) continue;
       events.set(seq,event); ++added;
       const node = eventNode(event); node.dataset.seq = String(seq);
       const next = [...$('events').children].find(item => Number(item.dataset.seq) > seq);
@@ -541,7 +834,8 @@
     $('event-count').textContent = events.size + ' 条'; $('feed-empty').hidden = events.size > 0;
     if (follow) {feed.scrollTop = feed.scrollHeight; unread = 0; $('new-events').hidden = true;}
     else if (added) {unread += added; $('new-events').textContent = unread + ' 条新消息 ↓'; $('new-events').hidden = false;}
-    if (added) {renderPeers(); renderTeamSummary();}
+    if ($('export-transcript')) $('export-transcript').disabled = events.size === 0;
+    if (added) {renderPeers(); renderTeamSummary(); renderTaskBoard();}
   }
   async function poll(id, mode, view, signal) {
     let failures = 0, more = false;
@@ -590,6 +884,7 @@
     const mode = known?.mode === 'team' || known?.mode === 'pair' ? known.mode : (String(id).startsWith('tm_') ? 'team' : 'pair');
     writeLocation(id, mode);
     current = known || {id,peers:[],workers:[],status:'active',role:'owner',mode};
+    showWorkbenchPanel('thread');
     renderCurrent(); renderSessions(); setConnection('','正在读取会话…');
     try {
       const data = await api(sessionPath(id,'',mode),undefined,signal);
@@ -617,7 +912,7 @@
       ['mentor','worker'].filter(role => text(pairing?.[role]?.code)).map(role => ({role, ...pairing[role]}));
     for (const value of entries) {
       const card = element('article',null,'pair-code-card');
-      card.append(element('h3',isTopicCode ? 'Topic 配对码 · ' + topicTitle : roles[value.role] + '配对码 · ' + topicTitle));
+      card.append(element('p',isTopicCode ? 'Topic 配对码 · ' + topicTitle : roles[value.role] + '配对码 · ' + topicTitle,'pair-heading'));
       card.append(element('p',isTopicCode ? '同一个 Topic 码可交给任意 Agent；复制对应角色的接入指令。角色尚空缺时即可加入。' : value.role === 'worker' ? '复制完整指令发给执行端；它会在加入时提交真实操作系统环境。' : '复制完整指令发给负责指导的 Agent。'));
       const code = element('code',value.code,'pair-code'); code.tabIndex = 0; card.append(code);
       const actions = element('div');
@@ -686,7 +981,7 @@
   function showNewInvite(invite) {
     const box = $('new-invite'), role = invite.role, seat = invite.seat;
     box.replaceChildren();
-    box.append(element('h3','新邀请 · ' + (role === 'mentor' ? '指导端' : (seat ? seat + ' 号席' : '任意空席'))));
+    box.append(element('p','新邀请 · ' + (role === 'mentor' ? '指导端' : (seat ? seat + ' 号席' : '任意空席')),'invite-heading'));
     if (invite.note) box.append(element('p', '备注：' + invite.note));
     box.append(element('p','有效期至 ' + date(invite.expires_at) + '。使用一次后立即失效。'));
     const code = element('code', invite.code); box.append(code);
@@ -1176,6 +1471,21 @@
   $('dismiss-notice').addEventListener('click',() => notify(''));
   $('refresh-sessions').addEventListener('click',loadSessions);
   $('session-filter').addEventListener('change',renderSessions);
+  if ($('session-search')) $('session-search').addEventListener('input', renderSessions);
+  document.querySelectorAll('[data-filter]').forEach(button => {
+    button.addEventListener('click', () => {
+      if ($('session-filter').value === button.dataset.filter) return;
+      $('session-filter').value = button.dataset.filter;
+      $('session-filter').dispatchEvent(new Event('change'));
+    });
+  });
+  document.querySelectorAll('[data-panel-tab]').forEach(button => {
+    button.addEventListener('click', () => showWorkbenchPanel(button.dataset.panelTab));
+  });
+  document.querySelectorAll('#site-nav a').forEach(link => {
+    link.addEventListener('click', () => { const box = $('nav-toggle'); if (box) box.checked = false; });
+  });
+  $('export-transcript').addEventListener('click', exportTranscript);
   $('reconnect').addEventListener('click',() => {if (current) selectSession(current.id);});
   $('new-events').addEventListener('click',() => {$('feed').scrollTop = $('feed').scrollHeight; unread = 0; $('new-events').hidden = true;});
   $('feed').addEventListener('scroll',() => {const feed = $('feed'); if (feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80) {unread = 0; $('new-events').hidden = true;}});
@@ -1185,7 +1495,7 @@
     const leaked = stripSecretQuery();
     try {identity = await api('me'); csrf = text(identity.csrf);}
     catch (error) {if (error.status !== 401) notify('身份暂未确认：' + error.message,true);}
-    updateIdentity(); renderSessions(); if (identity) await loadSessions();
+    updateIdentity(); renderSessions(); renderConnectionFacts(); if (identity) await loadSessions();
     if (leaked) notify('地址栏中的配对信息已移除。请使用「加入已有对话」粘贴配对码，不要把配对码放进链接。', true);
   })();
 })();
