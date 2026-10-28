@@ -36,6 +36,96 @@
       hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
     }).format(date);
   }
+  function clock(value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+    }).format(date);
+  }
+  function stamp(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+    }).formatToParts(date);
+    const pick = type => {
+      const found = parts.find(part => part.type === type);
+      return found ? found.value : '';
+    };
+    const year = pick('year');
+    const month = pick('month');
+    const day = pick('day');
+    if (!year || !month || !day) return '';
+    return year + '-' + month + '-' + day + ' ' + pick('hour') + ':' + pick('minute');
+  }
+  function copyText(value, button) {
+    const label = button.querySelector('.btn-label');
+    const original = label ? label.textContent : button.textContent;
+    const finish = () => {
+      if (label) label.textContent = '已复制';
+      else button.textContent = '已复制';
+      setTimeout(() => {
+        if (label) label.textContent = original;
+        else button.textContent = original;
+      }, 1600);
+    };
+    const fallback = () => {
+      const input = document.createElement('textarea');
+      input.value = value;
+      input.setAttribute('readonly', '');
+      input.style.position = 'fixed';
+      input.style.left = '-9999px';
+      document.body.append(input);
+      input.select();
+      try { document.execCommand('copy'); finish(); } catch (error) { /* clipboard unavailable */ }
+      input.remove();
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(value).then(finish).catch(fallback);
+    } else fallback();
+  }
+  function isProtocolNoise(message) {
+    const raw = text(message && message.text).trim();
+    if (!raw) return false;
+    const token = raw.split(/\s+/)[0];
+    return token === 'ELECT' || token === 'LEADER' || token === 'HB' || token === 'VOTE';
+  }
+  function plainLead(source) {
+    const lines = String(source || '').replace(/\r\n/g, '\n').split('\n');
+    const buf = [];
+    let started = false;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        if (started) break;
+        continue;
+      }
+      if (/^#{1,6}\s/.test(trimmed) || /^(```|~~~)/.test(trimmed) || /^\|/.test(trimmed)
+          || /^[-*+]\s/.test(trimmed) || /^\d+[.)]\s/.test(trimmed) || /^>\s?/.test(trimmed)) {
+        if (started) break;
+        continue;
+      }
+      started = true;
+      buf.push(trimmed);
+    }
+    return buf.join(' ')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/[*_`]/g, '')
+      .trim();
+  }
+  function summaryText(source) {
+    const lead = plainLead(source);
+    if (!lead) return '';
+    if (lead.length <= 400) return lead;
+    return lead.slice(0, 400).trim() + '…';
+  }
+  function modelName(person) {
+    if (!person) return '';
+    const value = person.model || person.agent_type;
+    return typeof value === 'string' ? value.trim() : '';
+  }
   function safeFileUrl(value) {
     if (typeof value !== 'string' || !value) return '';
     let url;
@@ -198,6 +288,26 @@
       index = next;
     }
   }
+  function codeBlock(info, code) {
+    const block = node('div', null, 'code-block');
+    const bar = node('div', null, 'code-block-bar');
+    bar.append(node('span', info || '代码', 'code-block-label'));
+    const pre = document.createElement('pre');
+    pre.className = 'md-pre';
+    pre.append(node('code', code));
+    block.append(bar, pre);
+    return block;
+  }
+  function standaloneCode(raw) {
+    const trimmed = String(raw || '').trim();
+    const fenced = trimmed.match(/^(```|~~~)([^\n]*)\n([\s\S]*)\n\1\s*$/);
+    if (fenced) {
+      if (markdownish(fenced[3])) return null;
+      return {info: fenced[2].trim(), code: fenced[3]};
+    }
+    if (isCodeDump(trimmed)) return {info: '', code: trimmed};
+    return null;
+  }
   function renderMarkdown(parent, source, depth) {
     const raw = text(source).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     if (!raw.trim()) return;
@@ -214,6 +324,7 @@
       if (fence) {
         const mark = fence[1][0];
         const opener = fence[1].length;
+        const info = line.slice(fence[0].length).trim();
         const body = [];
         index += 1;
         while (index < lines.length && !(lines[index].trim().length >= opener && lines[index].trim().split('').every(ch => ch === mark))) {
@@ -221,10 +332,7 @@
           index += 1;
         }
         if (index < lines.length) index += 1;
-        const pre = document.createElement('pre');
-        pre.className = 'md-pre';
-        pre.append(node('code', body.join('\n')));
-        parent.append(pre);
+        parent.append(codeBlock(info, body.join('\n')));
         continue;
       }
       if (isTable(lines, index)) {
@@ -467,51 +575,144 @@
   }
 
   function renderThread() {
-    const back = node('a', '全部对话');
+    const crumbBar = node('div', null, 'crumb-bar');
+    const crumb = node('div', null, 'crumb');
+    const back = node('a', '公开对话');
     back.href = '../';
-    const kicker = node('p', null, 'page-kicker');
-    kicker.append(back);
+    const crumbId = node('span', publicId, 'id-text');
+    crumb.append(back, node('span', '/'), crumbId);
+    const crumbActions = node('div', null, 'crumb-actions');
+    crumbActions.append(node('span', '公开只读', 'quiet-pill'));
+    const copyId = node('button', null, 'text-button');
+    copyId.type = 'button';
+    copyId.append(node('span', '复制 ID', 'btn-label'));
+    copyId.addEventListener('click', () => copyText(crumbId.textContent || publicId, copyId));
+    crumbActions.append(copyId);
+    crumbBar.append(crumb, crumbActions);
+
+    const wrap = node('div', null, 'thread-wrap');
+    const hero = node('section', null, 'task-hero');
+    const heroTop = node('div', null, 'hero-top');
+    const heroCopy = node('div', null, 'hero-copy');
+    const titleRow = node('div', null, 'title-row');
     const title = node('h1', '正在读取…');
+    const statusPill = node('span', '', 'status-pill');
+    statusPill.hidden = true;
+    const idPill = node('span', publicId, 'id-text');
+    titleRow.append(title, statusPill, idPill);
     const meta = node('div', null, 'thread-meta');
     const goal = node('p', '', 'goal');
-    const reportCard = document.createElement('details');
-    reportCard.className = 'final-report';
-    reportCard.open = true;
-    reportCard.hidden = true;
-    const reportSummary = document.createElement('summary');
-    const reportKicker = node('span', '最终报告', 'final-kicker');
-    const reportTitle = node('span', '最终报告', 'final-title');
-    reportSummary.append(reportKicker, reportTitle);
-    const reportMeta = node('p', '', 'final-meta');
-    const reportActions = node('div', null, 'final-actions');
-    const reportPdf = node('a', '下载 PDF', 'report-button');
-    reportPdf.href = root + '/v1/relay/public/conversations/' + publicId + '/report.pdf';
-    reportPdf.setAttribute('download', 'report.pdf');
-    const reportMd = node('a', '查看 MD', 'report-button secondary');
-    reportMd.href = root + '/v1/relay/public/conversations/' + publicId + '/report.md';
-    reportMd.target = '_blank';
-    reportMd.rel = 'noopener';
-    reportActions.append(reportPdf, reportMd);
-    const reportBody = node('div', null, 'report-body md');
-    reportCard.append(reportSummary, reportMeta, reportActions, reportBody);
-    const rosterTitle = node('h2', '参与者', 'section-title');
+    goal.hidden = true;
+    heroCopy.append(titleRow, meta, goal);
+    const heroActions = node('div', null, 'hero-actions');
+    const share = node('button', null, 'btn');
+    share.type = 'button';
+    share.append(node('span', '分享', 'btn-label'));
+    share.addEventListener('click', () => copyText(location.href.split('#')[0], share));
+    heroActions.append(share);
+    heroTop.append(heroCopy, heroActions);
+    const metaRow = node('div', null, 'meta-row');
+    const teamBlock = node('div', null, 'team-block');
+    const teamHead = node('div', null, 'team-head');
+    const teamTitle = node('h2', '参与成员', 'section-title');
+    const teamNote = node('span', '', 'team-note');
+    teamHead.append(teamTitle, teamNote);
     const people = node('div', null, 'roster');
     const termsBox = node('div', null, 'term-row');
     termsBox.hidden = true;
-    const tasksTitle = node('h2', '任务', 'section-title');
+    teamBlock.append(teamHead, people, termsBox);
     const tasksBox = node('section', null, 'task-board');
+    const tasksTitle = node('h2', '任务', 'section-title');
     const tasksList = node('div', null, 'task-tree');
     tasksBox.append(tasksTitle, tasksList);
     tasksBox.hidden = true;
-    const talkTitle = node('h2', '对话', 'section-title');
+    hero.append(heroTop, metaRow, teamBlock, tasksBox);
+
+    const split = node('div', null, 'split');
+    const transcript = node('section', null, 'transcript');
+    transcript.setAttribute('aria-labelledby', 'transcript-title');
+    const transcriptHead = node('div', null, 'panel-head');
+    const transcriptLead = node('div', null, 'panel-lead');
+    const transcriptTitle = node('h2', '智能体协作交流纪实', 'section-title');
+    transcriptTitle.id = 'transcript-title';
+    const countPill = node('span', '0 条会话', 'count-pill');
+    transcriptLead.append(transcriptTitle, countPill);
+    const transcriptTools = node('div', null, 'panel-tools');
+    transcriptTools.append(node('span', '时间基准：UTC+8'));
+    transcriptHead.append(transcriptLead, transcriptTools);
     const feed = node('div', null, 'thread');
     feed.setAttribute('aria-live', 'polite');
+    const emptyTalk = node('p', '还没有公开的协作消息。', 'empty-talk');
+    emptyTalk.hidden = true;
+    const systemLog = document.createElement('details');
+    systemLog.className = 'system-log';
+    systemLog.hidden = true;
+    const systemSummary = document.createElement('summary');
+    systemSummary.textContent = '系统记录';
+    const systemList = node('div', null, 'system-list');
+    systemLog.append(systemSummary, systemList);
     const statusLine = node('p', '正在读取…', 'read-only');
     statusLine.setAttribute('role', 'status');
-    app.append(kicker, title, meta, goal, reportCard, rosterTitle, people, termsBox, tasksBox, talkTitle, feed, statusLine);
+    transcript.append(transcriptHead, feed, emptyTalk, systemLog, statusLine);
+
+    const reportSide = node('aside', null, 'report-side');
+    const reportCard = node('section', null, 'final-report');
+    reportCard.hidden = true;
+    const reportHead = node('div', null, 'panel-head');
+    const reportHeading = node('h2', '最终报告', 'section-title');
+    const reportState = node('span', '已提交', 'status-pill active');
+    reportHead.append(reportHeading, reportState);
+    const reportDocTitle = node('p', '', 'report-doc-title');
+    reportDocTitle.hidden = true;
+    const reportStats = node('div', null, 'report-stats');
+    reportStats.hidden = true;
+    const reportLeadBlock = node('div', null, 'report-lead-block');
+    reportLeadBlock.hidden = true;
+    const reportLead = node('p', '', 'report-lead');
+    reportLeadBlock.append(node('h3', '摘要'), reportLead);
+    const reportTocWrap = node('div', null, 'report-lead-block');
+    reportTocWrap.hidden = true;
+    const reportToc = node('nav', null, 'report-toc');
+    reportToc.setAttribute('aria-label', '报告目录');
+    reportTocWrap.append(node('h3', '目录'), reportToc);
+    const reportActions = node('div', null, 'final-actions');
+    const reportMd = node('a', null, 'report-button');
+    reportMd.href = root + '/v1/relay/public/conversations/' + publicId + '/report.md';
+    reportMd.setAttribute('download', 'report.md');
+    reportMd.title = '查看 MD';
+    reportMd.append(node('span', '下载 Markdown 报告', 'btn-label'));
+    const reportMdSize = node('span', '', 'report-size');
+    reportMd.append(reportMdSize);
+    const reportPdf = node('a', null, 'report-button secondary');
+    reportPdf.href = root + '/v1/relay/public/conversations/' + publicId + '/report.pdf';
+    reportPdf.setAttribute('download', 'report.pdf');
+    reportPdf.append(node('span', '下载 PDF', 'btn-label'));
+    reportActions.append(reportMd, reportPdf);
+    const reportByline = node('p', '', 'report-byline');
+    const reportMeta = node('span', '');
+    const reportJump = node('a', '在线预览全文');
+    reportJump.href = '#report-full';
+    reportByline.append(reportMeta, reportJump);
+    reportCard.append(reportHead, reportDocTitle, reportStats, reportLeadBlock, reportTocWrap, reportActions, reportByline);
+    const reportPending = node('section', null, 'report-pending');
+    reportPending.hidden = true;
+    reportPending.append(node('h2', '最终报告'), node('p', '尚未提交最终报告'));
+    reportSide.append(reportCard, reportPending);
+
+    const reportFull = node('section', null, 'report-full');
+    reportFull.id = 'report-full';
+    reportFull.hidden = true;
+    const reportFullTitle = node('h2', '报告全文');
+    const reportBody = node('div', null, 'report-body md');
+    reportFull.append(reportFullTitle, reportBody);
+
+    split.append(transcript, reportSide);
+    wrap.append(hero, split, reportFull);
+    app.append(crumbBar, wrap);
 
     let cursor = 0;
     let stopped = false;
+    let booted = false;
     let leader = null;
     let leaderTerms = [];
     let reportKey = '';
@@ -519,6 +720,17 @@
     const spoken = [];
     const titles = new Map();
 
+    function metaItem(label, value) {
+      if (!value) return null;
+      const item = node('div', null, 'meta-item');
+      item.append(node('span', label, 'meta-label'), node('span', value, 'meta-value'));
+      return item;
+    }
+    function stat(value, label) {
+      const item = node('div', null, 'report-stat');
+      item.append(node('strong', value), node('span', label));
+      return item;
+    }
     function termAt(iso) {
       const at = Date.parse(iso);
       if (!Number.isFinite(at)) return null;
@@ -547,12 +759,12 @@
       let found = '';
       for (const event of spoken) {
         const message = event.message || {};
-        if (text(message.task_id) === taskId && message.kind === 'result') {
-          found = text(message.text).replace(/\s+/g, ' ').trim();
-        }
+        if (text(message.task_id) === taskId && message.kind === 'result') found = text(message.text);
       }
-      if (found.length > 96) return found.slice(0, 96) + '…';
-      return found;
+      const lead = plainLead(found);
+      const value = lead || found.replace(/\|/g, ' ').replace(/\s+/g, ' ').trim();
+      if (value.length > 96) return value.slice(0, 96) + '…';
+      return value;
     }
     function paintTasks(tasks) {
       tasksList.replaceChildren();
@@ -603,31 +815,59 @@
       if (!conversation) return;
       title.textContent = text(conversation.title) || '未命名对话';
       document.title = title.textContent + ' · AgentReins Hub';
-      meta.replaceChildren(
-        node('span', modes[conversation.mode] || '对话', 'badge mode'),
-        node('span', states[conversation.status] || '状态待确认', 'badge ' + text(conversation.status))
-      );
+      const status = text(conversation.status);
+      statusPill.hidden = false;
+      statusPill.className = 'status-pill' + (states[status] ? ' ' + status : '');
+      const dot = node('span', '', status === 'active' ? 'live-dot' : 'away-dot');
+      dot.setAttribute('aria-hidden', 'true');
+      statusPill.replaceChildren(dot, document.createTextNode(states[status] || '状态待确认'));
+      const shownId = text(conversation.public_id) || publicId;
+      crumbId.textContent = shownId;
+      idPill.textContent = shownId;
+      meta.replaceChildren(node('span', modes[conversation.mode] || '对话', 'badge mode'));
       const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
       leader = conversation.leader && conversation.leader.name ? withLive(conversation.leader, participants) : null;
       if (leader) meta.append(leaderBadge(leader, false));
-      goal.textContent = text(conversation.goal);
+      const goalText = text(conversation.goal);
+      goal.hidden = !goalText;
+      goal.textContent = goalText;
+      metaRow.replaceChildren();
+      const started = metaItem('发起时间', stamp(conversation.created_at));
+      const updated = metaItem('最近更新', stamp(conversation.updated_at));
+      const modeItem = conversation.mode ? metaItem('协作模式', modes[conversation.mode] || '对话') : null;
+      for (const item of [started, updated, modeItem]) if (item) metaRow.append(item);
+      metaRow.hidden = metaRow.childElementCount === 0;
+      const noteBits = [participants.length + ' 位'];
+      if (participants.some(person => person.live === true || person.live === false)) {
+        noteBits.push(participants.filter(person => person.live === true).length + ' 在席');
+      }
+      const total = Number(conversation.tasks_total);
+      const done = Number(conversation.tasks_done);
+      if (Number.isFinite(total) && total > 0 && Number.isFinite(done)) noteBits.push(done + '/' + total + ' 项已完成');
+      teamNote.textContent = noteBits.join(' · ');
+      teamBlock.hidden = participants.length === 0;
       people.replaceChildren();
       for (const person of participants) {
         const leading = leader && person.role === leader.role && Number(person.seat) === Number(leader.seat);
         const card = node('article', null, 'roster-card' + (leading ? ' is-leader' : '') + (person.live === false ? ' is-away' : ''));
-        const mark = node('span', initial(person.name || roles[person.role]), 'avatar avatar-' + (person.role || 'member'));
+        const mark = node('span', initial(person.name || roles[person.role]), 'avatar avatar-' + (person.role || 'member') + (person.live === false ? ' is-away' : ''));
         mark.setAttribute('aria-hidden', 'true');
         const copy = node('div', null, 'roster-copy');
-        copy.append(node('p', text(person.name) || '未命名', 'roster-name'));
+        const nameRow = node('div', null, 'roster-line');
+        nameRow.append(node('p', text(person.name) || '未命名', 'roster-name'));
+        if (leading) nameRow.append(node('span', 'LEADER', 'leader-chip'));
+        copy.append(nameRow);
         const role = node('p', null, 'roster-role');
-        const dot = presenceDot(person);
-        if (dot) role.append(dot);
+        const presence = presenceDot(person);
+        if (presence) role.append(presence);
         const seat = Number(person.seat);
         const seatText = person.role === 'worker' && Number.isInteger(seat) && seat > 0 ? ' · ' + seat + ' 号席' : '';
         const liveText = person.live === true ? '在席' : person.live === false ? '离席' : '';
         role.append(document.createTextNode((roles[person.role] || '参与者') + seatText + (liveText ? ' · ' + liveText : '')));
         copy.append(role);
-        if (leading) copy.append(node('p', '现任领导者', 'leader-mark'));
+        const model = modelName(person);
+        if (model) copy.append(node('p', model, 'roster-model'));
+        if (leading && leader.term) copy.append(node('p', '第' + text(leader.term) + '任期', 'leader-mark'));
         card.append(mark, copy);
         people.append(card);
       }
@@ -649,32 +889,71 @@
       const report = conversation && conversation.report;
       if (!report || report.available === false) {
         reportCard.hidden = true;
+        reportPending.hidden = false;
+        reportFull.hidden = true;
         return;
       }
       reportCard.hidden = false;
-      if (reportCard.open !== true && reportCard.open !== false) reportCard.open = true;
-      reportTitle.textContent = text(report.title) || '最终报告';
-      const bits = [];
+      reportPending.hidden = true;
+      reportFull.hidden = false;
+      const docTitle = text(report.title);
+      reportDocTitle.hidden = !docTitle || docTitle === '最终报告';
+      reportDocTitle.textContent = reportDocTitle.hidden ? '' : docTitle;
+      reportStats.replaceChildren();
+      const stats = [];
       const chars = Number(report.chars);
-      if (Number.isFinite(chars) && chars > 0) bits.push(chars.toLocaleString('zh-CN') + ' 字');
+      if (Number.isFinite(chars) && chars > 0) stats.push(stat(chars.toLocaleString('zh-CN'), '字'));
+      const revision = Number(report.revision);
+      if (Number.isFinite(revision) && revision > 0) stats.push(stat('第 ' + revision + ' 次', '修订'));
+      const total = Number(conversation.tasks_total);
+      const done = Number(conversation.tasks_done);
+      if (Number.isFinite(total) && total > 0 && Number.isFinite(done)) stats.push(stat(done + '/' + total, '任务完成'));
+      reportStats.hidden = stats.length === 0;
+      if (stats.length) reportStats.append(...stats);
+      const bits = [];
       if (report.author && report.author.name) bits.push(personLabel(report.author));
-      if (report.updated_at) bits.push(when(report.updated_at));
+      if (report.updated_at) bits.push(stamp(report.updated_at) || when(report.updated_at));
       reportMeta.textContent = bits.join(' · ');
       const key = [text(report.revision), text(report.updated_at), text(report.chars)].join(':');
       if (key === reportKey) return;
       reportKey = key;
       const token = ++reportToken;
+      reportLeadBlock.hidden = true;
+      reportLead.textContent = '';
+      reportTocWrap.hidden = true;
+      reportToc.replaceChildren();
+      reportMdSize.textContent = '';
       reportBody.replaceChildren(node('p', '正在读取报告…', 'muted'));
-      const reportMdUrl = root + '/v1/relay/public/conversations/' + publicId + '/report.md';
-      fetch(reportMdUrl, {headers: {'Accept': 'text/markdown, text/plain'}, cache: 'no-store'})
+      fetch(reportMd.href, {headers: {'Accept': 'text/markdown, text/plain'}, cache: 'no-store'})
         .then(response => {
           if (!response.ok) throw new Error('HTTP ' + response.status);
-          return response.text();
+          const length = Number(response.headers.get('Content-Length'));
+          return response.text().then(markdown => ({markdown, length}));
         })
-        .then(markdown => {
+        .then(payload => {
           if (token !== reportToken) return;
+          const markdown = payload.markdown;
           reportBody.replaceChildren();
           renderMarkdown(reportBody, markdown);
+          reportToc.replaceChildren();
+          let headingIndex = 0;
+          for (const heading of reportBody.querySelectorAll('h1, h2, h3')) {
+            const id = 'report-h-' + headingIndex;
+            headingIndex += 1;
+            heading.id = id;
+            const link = node('a', heading.textContent, 'level-' + heading.tagName.slice(1));
+            link.href = '#' + id;
+            reportToc.append(link);
+          }
+          reportTocWrap.hidden = reportToc.childElementCount === 0;
+          const lead = summaryText(markdown);
+          if (lead) {
+            reportLead.textContent = lead;
+            reportLeadBlock.hidden = false;
+          }
+          let bytes = Number.isFinite(payload.length) && payload.length > 0 ? payload.length : 0;
+          if (!bytes && window.TextEncoder) bytes = new TextEncoder().encode(markdown).length;
+          if (bytes > 0) reportMdSize.textContent = sizes(bytes);
         })
         .catch(() => {
           if (token !== reportToken) return;
@@ -692,6 +971,8 @@
     function messageBody(message) {
       const raw = text(message && message.text);
       const kind = message && message.kind;
+      const block = kind === 'result' ? null : standaloneCode(raw);
+      if (block) return codeBlock(block.info, block.code);
       if (kind === 'result' || markdownish(raw)) {
         const host = node('div', null, kind === 'result' ? 'md result-body' : 'md');
         renderMarkdown(host, raw);
@@ -699,16 +980,15 @@
         return host;
       }
       const lines = raw.split('\n');
-      const code = isCodeDump(raw);
       const long = raw.length > 360 || lines.length > 8;
-      if (!long && !code) return node('p', raw, 'bubble-text');
+      if (!long) return node('p', raw, 'bubble-text');
       const details = document.createElement('details');
-      details.className = code ? 'fold code' : 'fold';
+      details.className = 'fold';
       const summary = document.createElement('summary');
       const preview = raw.replace(/\s+/g, ' ').trim().slice(0, 72);
-      summary.textContent = (code ? '代码输出' : '长消息') + (preview ? ' · ' + preview : '');
-      const body = document.createElement(code ? 'pre' : 'p');
-      body.className = code ? 'bubble-code' : 'bubble-text';
+      summary.textContent = '长消息' + (preview ? ' · ' + preview : '');
+      const body = document.createElement('p');
+      body.className = 'bubble-text';
       body.textContent = raw;
       details.append(summary, body);
       return details;
@@ -762,8 +1042,25 @@
       link.href = '#' + anchor;
       return link;
     }
+    function timeNode(iso) {
+      const stampNode = node('time', clock(iso) || when(iso));
+      stampNode.dateTime = text(iso);
+      return stampNode;
+    }
+    function pushSystem(label, iso) {
+      const line = node('div', null, 'system-turn');
+      line.append(node('span', label), timeNode(iso));
+      systemList.append(line);
+      systemLog.hidden = false;
+      systemSummary.textContent = '系统记录 · ' + systemList.childElementCount + ' 条';
+    }
+    function refreshCount() {
+      countPill.textContent = feed.querySelectorAll('article.turn').length + ' 条会话';
+      emptyTalk.hidden = !booted || feed.childElementCount !== 0;
+    }
     function renderEvent(event) {
       const message = event.kind === 'message' ? event.message || null : null;
+      if (message && isProtocolNoise(message)) return;
       if (event.kind === 'task') {
         const task = event.task || {};
         const stateLabel = taskState[task.status] || text(task.status);
@@ -776,9 +1073,17 @@
         line.append(node('span', '任务「' + text(task.title) + '」' + stateLabel + who));
         const jump = taskLink(task.id);
         if (jump) line.append(jump);
-        const stamp = node('time', when(event.created_at));
-        stamp.dateTime = text(event.created_at);
-        line.append(stamp);
+        line.append(timeNode(event.created_at));
+        feed.append(line);
+        return;
+      }
+      if (event.kind === 'report') {
+        const report = event.report || {};
+        const line = node('div', null, 'system-turn');
+        line.append(node('span', '已提交最终报告「' + (text(report.title) || '最终报告') + '」'));
+        const jump = node('a', '查看报告', 'task-link');
+        jump.href = '#report-full';
+        line.append(jump, timeNode(event.created_at));
         feed.append(line);
         return;
       }
@@ -793,20 +1098,14 @@
         } else if (event.kind === 'revoked') {
           label = '一个席位已被撤销';
         }
-        const line = node('div', null, 'system-turn');
-        line.append(node('span', label));
-        const stamp = node('time', when(event.created_at));
-        stamp.dateTime = text(event.created_at);
-        line.append(stamp);
-        feed.append(line);
+        pushSystem(label, event.created_at);
         return;
       }
       const sender = event.sender || {};
       const kind = Object.prototype.hasOwnProperty.call(kinds, message.kind) ? message.kind : '';
       const role = sender.role || '';
-      const side = role === 'worker' ? 'incoming' : 'outgoing';
       const leading = leader && sender.role === leader.role && Number(sender.seat) === Number(leader.seat);
-      const article = node('article', null, 'turn ' + side + ' role-' + (roles[role] ? role : 'member')
+      const article = node('article', null, 'turn role-' + (roles[role] ? role : 'member')
         + (kind ? ' kind-' + kind : '') + (leading ? ' is-leader' : ''));
       const taskId = text(message.task_id);
       const who = senderKey(event) + '|' + kind + '|' + taskId;
@@ -822,11 +1121,9 @@
       const head = node('div', null, 'turn-head');
       head.append(node('span', name, 'speaker'));
       if (roles[role] || seatLabel) head.append(node('span', (roles[role] || '参与者') + seatLabel, 'role-chip'));
-      if (leading) head.append(node('span', '领导者', 'role-chip leader-chip'));
+      if (leading) head.append(node('span', 'LEADER', 'leader-chip'));
       if (kind) head.append(node('span', kinds[kind], 'kind-chip'));
-      const stamp = node('time', when(event.created_at));
-      stamp.dateTime = text(event.created_at);
-      head.append(stamp);
+      head.append(timeNode(event.created_at));
       const bubble = node('div', null, 'bubble');
       const linked = taskLink(taskId);
       if (linked) bubble.append(linked);
@@ -867,6 +1164,8 @@
                                      {headers:{'Accept':'application/json'}});
         if (response.status === 404) {
           stopped = true;
+          title.textContent = '没有这场对话';
+          document.title = '没有这场对话 · AgentReins Hub';
           statusLine.textContent = '这场对话不在目录里。';
           return;
         }
@@ -874,11 +1173,13 @@
         const data = await response.json();
         const incoming = Array.isArray(data.events) ? data.events : [];
         for (const event of incoming) {
-          if (event.kind === 'message' && event.message) spoken.push(event);
+          if (event.kind === 'message' && event.message && !isProtocolNoise(event.message)) spoken.push(event);
         }
         paintConversation(data.conversation);
         for (const event of incoming) renderEvent(event);
         markResults();
+        booted = true;
+        refreshCount();
         cursor = Number(data.next_cursor) || cursor;
         const closed = data.conversation && data.conversation.status === 'closed';
         statusLine.textContent = closed ? '会话已结束。这里保留已公开的记录。' : '只读';

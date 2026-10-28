@@ -1,5 +1,6 @@
 """Final report: long Markdown attachment, public md/pdf, and the conversation page."""
 import json
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -237,8 +238,22 @@ class ReportStoreTests(unittest.TestCase):
         self.assertIn("report-available", script)
         self.assertIn("renderMarkdown", script)
         self.assertIn("已被后续结果取代", script)
+        self.assertIn("智能体协作交流纪实", script)
+        self.assertIn("报告全文", script)
+        self.assertIn("尚未提交最终报告", script)
+        self.assertIn("renderMarkdown(reportBody, markdown)", script)
         self.assertNotIn("innerHTML", script)
         self.assertNotIn("lease_until", script)
+        for banned in ("142,850", "99.98", "Claude 3.5", "TASK-202505", "已归档封存", "校验通过", "v2.4.12"):
+            self.assertNotIn(banned, script)
+        css = Path(__file__).resolve().parent.parent.joinpath("static", "conversations.css").read_text()
+        sizes = [float(item) for item in re.findall(r"font-size:\s*(\d+(?:\.\d+)?)px", css)]
+        self.assertTrue(sizes)
+        self.assertGreaterEqual(min(sizes), 12)
+        self.assertIn("font-size: 32px", css)
+        self.assertIn("font-size: 25px", css)
+        self.assertIn("font-size: 20px", css)
+        self.assertIn("font-size: 16px", css)
         self.teams.state(self.owner, self.sid, {"status": "closed"})
         self.assertEqual(self.teams.public_report_path(self.public_id, "markdown")[1].read_text(encoding="utf-8"), SAMPLE)
         with self.assertRaises(AuthError) as closed:
