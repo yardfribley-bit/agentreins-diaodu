@@ -2202,6 +2202,52 @@
         }
       }
     },
+    "/mcp/design": {
+      "get": {
+        "summary": "设计 MCP Streamable HTTP 会话流。需要与其他任务接口相同的 Hub 凭证；设计服务 Bearer 由服务器附加",
+        "responses": {
+          "200": {
+            "description": "上游 SSE 或 JSON，原样转发"
+          },
+          "401": {
+            "description": "未通过 Hub 认证"
+          }
+        }
+      },
+      "post": {
+        "summary": "设计 MCP initialize / tools/list / tools/call。Authorization 使用 Hub 实例凭证，不是设计服务令牌",
+        "responses": {
+          "200": {
+            "description": "上游 JSON-RPC 或 SSE，原样转发"
+          },
+          "401": {
+            "description": "未通过 Hub 认证"
+          }
+        }
+      },
+      "delete": {
+        "summary": "结束设计 MCP 会话",
+        "responses": {
+          "200": {
+            "description": "上游状态原样转发"
+          },
+          "401": {
+            "description": "未通过 Hub 认证"
+          }
+        }
+      }
+    },
+    "/mcp/design/health": {
+      "get": {
+        "summary": "设计 MCP 代理是否已配置。不返回令牌，不访问上游",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ok、service、configured"
+          }
+        }
+      }
+    },
     "/tasks/{task}/entries/{entry}/review": {
       "post": {
         "summary": "发布者人工验收成果（退回须填写note）",

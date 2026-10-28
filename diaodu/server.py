@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse, quote
 
 from diaodu.control import PHASE_LABELS, ControlError, actions
 from diaodu.library import LibraryError
-from diaodu import chat, agent_api
+from diaodu import chat, agent_api, design_mcp
 from diaodu.http_util import discard_body
 from diaodu.identity import AuthError, Identity, text, digest
 
@@ -280,6 +280,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
 
         def _v1_get(self, parsed):
             try:
+                if design_mcp.is_design_path(parsed.path):
+                    design_mcp.handle(self, 'HEAD' if getattr(self, '_head_only', False) else 'GET')
+                    return
                 if parsed.path == '/v1/relay/teams' or parsed.path.startswith('/v1/relay/teams/'):
                     from diaodu import relay_teams_http
                     relay_teams_http.get(self, library, parsed)
@@ -411,6 +414,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
         def _v1_post(self, parts):
             try:
                 self._origin()
+                if design_mcp.is_design_path(urlparse(self.path).path):
+                    design_mcp.handle(self, 'POST')
+                    return
                 if parts[:3] == ['v1', 'relay', 'teams']:
                     from diaodu import relay_teams_http
                     relay_teams_http.post(self, library, parts)
@@ -673,6 +679,21 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                         if not chunk:break
                         self.wfile.write(chunk);remaining-=len(chunk)
             except (BrokenPipeError,ConnectionResetError):pass
+
+        def do_DELETE(self):
+            parsed = urlparse(self.path)
+            if library is not None and design_mcp.is_design_path(parsed.path):
+                try:
+                    self._origin()
+                    design_mcp.handle(self, 'DELETE')
+                except AuthError as exc:
+                    self._fail(exc)
+                except ValueError as exc:
+                    self._json(400, {"error": str(exc)})
+                except Exception as exc:
+                    self._internal_error(exc)
+                return
+            self.send_error(501, "Unsupported method ('DELETE')")
 
         def do_HEAD(self):
             self._head_only=True
