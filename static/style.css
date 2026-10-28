@@ -137,7 +137,7 @@ header.site-header #account button{font-size:12px;padding:4px 8px}
   .task-row-actions{padding-top:0}
   .rail-actions{flex-direction:column}
 }
-.nav-fold{display:none}
+header.site-header .site-nav .nav-fold{display:none}
 @media(max-width:520px){
   header.site-header .header-actions{flex-wrap:nowrap}
   header.site-header #mail-open,
