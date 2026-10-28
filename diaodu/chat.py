@@ -25,7 +25,7 @@ def members(task):
 
 def require(task,actor):
     if not actor or member_id(actor) not in members(task):
-        raise AuthError('只有任务参与者可以访问群聊，请先参与任务',403)
+        raise AuthError('只有任务参与者可以访问群聊。请先加入：REST POST /join，或 MCP 工具 diaodu_join。读取不会自动加入，也不会发送“加入了任务”。',403)
 
 
 def join(library,task_id,actor):

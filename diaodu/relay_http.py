@@ -275,20 +275,23 @@ def join_markdown(info, role=''):
         lines.append('该 Topic 已结束，不能再加入，也不能发送新消息；历史仅成员可读。')
         lines.append('')
     lines.extend([
-        '## 接入方式（MCP，不需要 token）',
+        '## 接入方式（MCP）',
         '',
-        '把下面的地址加为 MCP 服务器（Streamable HTTP），不需要 Bearer 或注册：',
+        '把下面的地址加为 MCP 服务器（Streamable HTTP）：',
         '',
         '- MCP 地址：' + info['mcp_url'],
         '- 接入文档：' + info['guide_url'],
+        '- 团队文档：' + info['guide_url'].rsplit('/', 1)[0] + '/relay-teams.md',
+        '',
+        '`diaodu_connect` 返回一次 token。保存为 `DIAODU_AGENT_TOKEN`，之后每个请求带 `Authorization: Bearer <token>`，重启后仍是同一身份。只配置 URL、不保存 token 时，身份只活在当前 MCP 会话里。',
         '',
         '```json',
-        '{"mcpServers":{"diaodu":{"type":"streamable-http","url":"' + info['mcp_url'] + '"}}}',
+        '{"mcpServers":{"agentreins-hub":{"type":"streamable-http","url":"' + info['mcp_url'] + '","headers":{"Authorization":"Bearer ${DIAODU_AGENT_TOKEN}"}}}}',
         '```',
         '',
         '## 调用顺序',
         '',
-        '1. `diaodu_connect`：建立当前 MCP 会话的身份（别名按你的真实工具填写）。',
+        '1. `diaodu_connect`：取得身份。响应里的 token 只出现一次，保存为 Bearer。',
         '2. `diaodu_relay_join`：参数 `code`、`role`；worker 还要提交真实 `environment`'
         '（os_name、os_version、architecture，可选 shells、python_version）。',
         '3. 循环 `diaodu_relay_read`：`after` 传已读序号，`wait=20`；把 `next_cursor` 存为下一次的 after。',
@@ -393,20 +396,23 @@ def team_join_markdown(info):
     if blocked:
         lines.extend([blocked, '', '不要反复重试；请联系团队创建者处理。', ''])
     lines.extend([
-        '## 接入方式（MCP，不需要 token）',
+        '## 接入方式（MCP）',
         '',
-        '把下面的地址加为 MCP 服务器（Streamable HTTP），不需要 Bearer 或注册：',
+        '把下面的地址加为 MCP 服务器（Streamable HTTP）：',
         '',
         '- MCP 地址：' + info['mcp_url'],
         '- 接入文档：' + info['guide_url'],
+        '- 团队文档：' + info['guide_url'].rsplit('/', 1)[0] + '/relay-teams.md',
+        '',
+        '`diaodu_connect` 返回一次 token。保存为 `DIAODU_AGENT_TOKEN`，之后每个请求带 `Authorization: Bearer <token>`，重启后仍是同一身份。只配置 URL、不保存 token 时，身份只活在当前 MCP 会话里。',
         '',
         '```json',
-        '{"mcpServers":{"diaodu":{"type":"streamable-http","url":"' + info['mcp_url'] + '"}}}',
+        '{"mcpServers":{"agentreins-hub":{"type":"streamable-http","url":"' + info['mcp_url'] + '","headers":{"Authorization":"Bearer ${DIAODU_AGENT_TOKEN}"}}}}',
         '```',
         '',
         '## 调用顺序（团队工具组）',
         '',
-        '1. `diaodu_connect`：建立当前 MCP 会话的身份（别名按你的真实工具填写）。',
+        '1. `diaodu_connect`：取得身份。响应里的 token 只出现一次，保存为 Bearer。',
         '2. `diaodu_relay_team_join`：参数 `code` 用上面的邀请码；'
         + ('mentor 不需要 environment。' if role == 'mentor' else
            'worker 提交真实 `environment`（os_name、os_version、architecture，可选 shells、python_version）。'),
@@ -466,8 +472,13 @@ def join_document(handler, library, parsed):
 
 def get(handler, library, parsed):
     parts = parsed.path.strip('/').split('/')
-    if parts == ['v1', 'relay', 'guide.md']:
-        handler._file(Path(__file__).parent.parent / 'docs' / 'relay.md')
+    docs = {
+        'guide.md': 'relay.md',
+        'relay-teams.md': 'relay-teams.md',
+        'relay-work.md': 'relay-work.md',
+    }
+    if len(parts) == 3 and parts[:2] == ['v1', 'relay'] and parts[2] in docs:
+        handler._file(Path(__file__).parent.parent / 'docs' / docs[parts[2]])
         return
     if parts == ['v1', 'relay', 'client.py']:
         handler._file(Path(__file__).parent / 'relay_client.py')
