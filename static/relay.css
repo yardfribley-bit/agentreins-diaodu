@@ -185,6 +185,7 @@ small { font-size: 12px; color: var(--muted); }
 }
 
 .notice.error { background: var(--bad-tint); color: var(--bad); }
+.notice.quiet { background: var(--bg); color: var(--muted); }
 .notice button { margin-left: auto; background: transparent; border: 0; padding: 0 4px; color: inherit; font-size: 20px; }
 
 .identity-panel {
@@ -604,6 +605,8 @@ small { font-size: 12px; color: var(--muted); }
 .connection.connected > span:first-child { background: var(--ok); }
 .connection.error { color: var(--warn); }
 .connection.error > span:first-child { background: var(--warn); }
+.connection.polling { color: var(--muted); font-weight: 500; white-space: normal; }
+.connection.polling > span:first-child { background: var(--muted); }
 
 .fact-list { margin: 0; }
 .fact-list div { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
@@ -768,6 +771,13 @@ dialog label input, dialog label textarea { display: block; width: 100%; margin-
   body[data-panel="rail"] #col-rail { display: flex; }
   .sessions, .rail { border: 0; }
   .keyboard-hint { display: none; }
+}
+
+@media (max-width: 520px) {
+  .topic-bar { flex-wrap: wrap; align-items: flex-start; }
+  .topic-copy { flex: 1 1 100%; }
+  .topic-title { white-space: normal; overflow: visible; text-overflow: clip; }
+  .topic-actions { flex: 1 1 100%; justify-content: flex-start; flex-wrap: wrap; }
 }
 
 @media (max-width: 720px) {

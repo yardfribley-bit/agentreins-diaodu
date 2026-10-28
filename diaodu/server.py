@@ -742,7 +742,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
 
         def _json(self, status: int, payload: dict, headers=None):
             if status >= 400:
-                payload=dict(payload,code={400:"invalid_request",401:"unauthenticated",403:"forbidden",404:"not_found",409:"conflict",429:"rate_limited"}.get(status,"server_error"),retryable=status==429 or status>=500)
+                # Keep a caller-supplied code (for example waiter_busy) so clients
+                # can tell this 429 from the generic rate limit.
+                codes = {400:"invalid_request",401:"unauthenticated",403:"forbidden",404:"not_found",409:"conflict",429:"rate_limited"}
+                payload=dict(payload,code=payload.get("code") or codes.get(status,"server_error"),retryable=status==429 or status>=500)
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -763,6 +766,8 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             payload={"error":str(exc)}
             if getattr(exc,"retry_after",None) is not None:
                 payload["retry_after"]=exc.retry_after
+            if getattr(exc,"code",None):
+                payload["code"]=exc.code
             self._json(exc.status,payload)
 
         def _internal_error(self, exc):

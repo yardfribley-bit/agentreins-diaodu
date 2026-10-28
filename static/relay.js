@@ -25,14 +25,71 @@
   const events = new Map();
   const PUBLIC_ID = /^C-[pt][0-9a-f]{8}$/;
   const WORK_KINDS = new Set(['joined', 'revoked', 'state', 'task', 'report']);
+  const WAITER_NOTE = '实时同步在另一个标签页中进行，此页按 3 秒轮询';
+  const SHORT_POLL_MS = 3000;
+  const LONG_POLL_RETRY_MS = 15000;
+  let waiterBusyUntil = 0, waiterNotePosted = false;
 
   for (const id of ['protocol-link','pair-guide-link']) $(id).href = guideURL;
 
+  function protocolTermOk(term) {
+    if (term == null) return true;
+    return typeof term === 'number' && Number.isInteger(term) && term >= 0 && term <= 1000000;
+  }
+  function protocolTarget(value) {
+    if (typeof value === 'string' && /^\d+$/.test(value)) return {role: 'worker', seat: Number(value)};
+    if (typeof value !== 'string') return null;
+    const parts = value.split(':');
+    if (parts.length !== 2) return null;
+    const role = parts[0], seat = parts[1];
+    if ((role !== 'mentor' && role !== 'worker') || !/^\d+$/.test(seat)) return null;
+    return {role, seat: Number(seat)};
+  }
+  function protocolTargetOk(role, seat, allowEmpty) {
+    if (role == null && seat == null) return allowEmpty;
+    if (role !== 'mentor' && role !== 'worker') return false;
+    return typeof seat === 'number' && Number.isInteger(seat);
+  }
+  function protocolOp(value) {
+    const body = text(value).trim();
+    if (!body || body.includes('\0')) return null;
+    const splitAt = body.search(/\s/);
+    const op = splitAt < 0 ? body : body.slice(0, splitAt);
+    if (op !== 'ELECT' && op !== 'VOTE' && op !== 'LEADER' && op !== 'HB') return null;
+    const raw = splitAt < 0 ? '' : body.slice(splitAt).trim();
+    let role = null, seat = null;
+    if (raw.startsWith('{')) {
+      let data;
+      try { data = JSON.parse(raw); } catch (error) { return null; }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+      if (Object.keys(data).some(key => !['term', 'candidate', 'role', 'seat'].includes(key))) return null;
+      if (Object.hasOwn(data, 'candidate')) {
+        const target = protocolTarget(data.candidate);
+        if (!target) return null;
+        role = target.role; seat = target.seat;
+      } else if (Object.hasOwn(data, 'role') || Object.hasOwn(data, 'seat')) {
+        role = data.role; seat = data.seat;
+      }
+      if (!protocolTermOk(data.term) || !protocolTargetOk(role, seat, op !== 'VOTE')) return null;
+      if (op === 'HB' && (role != null || seat != null)) return null;
+      return op;
+    }
+    const rest = raw ? raw.split(/\s+/) : [];
+    let index = 0, term = null;
+    if (rest[0] && /^\d+$/.test(rest[0])) { term = Number(rest[0]); index = 1; }
+    if (!protocolTermOk(term)) return null;
+    if (op === 'HB') return index === rest.length ? op : null;
+    if (rest.length - index > 1) return null;
+    if (index < rest.length) {
+      const target = protocolTarget(rest[index]);
+      if (!target) return null;
+      role = target.role; seat = target.seat;
+    }
+    if (!protocolTargetOk(role, seat, op !== 'VOTE')) return null;
+    return op;
+  }
   function isProtocolNoise(message) {
-    const raw = text(message && message.text).trim();
-    if (!raw) return false;
-    const token = raw.split(/\s+/)[0];
-    return token === 'ELECT' || token === 'LEADER' || token === 'HB' || token === 'VOTE';
+    return protocolOp(message && message.text) !== null;
   }
   function visibleWorkEvent(event) {
     if (!event || typeof event !== 'object') return false;
@@ -85,6 +142,12 @@
     if (member.online === true) return {label: '在线', tone: 'online'};
     return {label: '离线', tone: 'offline'};
   }
+  function presentCount(people) {
+    return people.filter(person => presenceOf(person).tone === 'online').length;
+  }
+  function presenceWord(people) {
+    return people.some(person => person && (person.live === true || person.live === false)) ? '在席' : '在线';
+  }
   function isLeader(member) {
     const leader = current && current.leader;
     if (!leader || !member) return false;
@@ -104,9 +167,11 @@
     const at = timestamp(value);
     return at ? new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(at) : '尚无记录';
   }
-  function notify(message, error = false) {
+  function notify(message, error = false, quiet = false) {
     $('notice-text').textContent = message;
-    $('notice').classList.toggle('error',error); $('notice').hidden = !message;
+    $('notice').classList.toggle('error', error);
+    $('notice').classList.toggle('quiet', quiet && !error && !!message);
+    $('notice').hidden = !message;
   }
   function formError(id, message = '') {$(id).textContent = message; $(id).hidden = !message;}
   function setConnection(state, label) {
@@ -123,7 +188,7 @@
       return;
     }
     const people = joinedPeople(current);
-    const online = people.filter(person => person.online === true).length;
+    const online = presentCount(people);
     const rows = [
       ['页面连接', $('connection-text').textContent || '尚未连接'],
       ['会话状态', states[current.status] || '状态待确认'],
@@ -131,14 +196,14 @@
       ['公开围观', current.public_read ? '已开启' : '未开启']
     ];
     if (text(current.public_id)) rows.push(['公开编号', current.public_id]);
-    if (people.length) rows.push(['席位在线', online + '/' + people.length]);
+    if (people.length) rows.push(['席位' + presenceWord(people), online + '/' + people.length]);
     list.replaceChildren(...rows.map(([label, value]) => {
       const row = element('div');
       row.append(element('dt', label), element('dd', value));
       return row;
     }));
   }
-  class APIError extends Error {constructor(message,status) {super(message); this.status = status;}}
+  class APIError extends Error {constructor(message, status, code) {super(message); this.status = status; this.code = code || '';}}
   async function api(path, body, signal, timeout = 30000) {
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -152,7 +217,7 @@
       });
       let value;
       try {value = await response.json();} catch (_) {throw new APIError('服务返回了无法读取的内容，请重试。',response.status);}
-      if (!response.ok) throw new APIError(text(value.error || value.message).slice(0,500) || '请求未完成（HTTP ' + response.status + '）。',response.status);
+      if (!response.ok) throw new APIError(text(value.error || value.message).slice(0,500) || '请求未完成（HTTP ' + response.status + '）。', response.status, text(value.code));
       return value;
     } catch (error) {
       if (error.name === 'AbortError' && !signal?.aborted) throw new Error('请求超时，操作结果尚未确认；可以重试。');
@@ -358,7 +423,8 @@
     const actions = element('div', null, 'seat-actions');
     const team = isTeam();
     const numbered = role === 'worker' && team && Number.isInteger(Number(seat)) && Number(seat) > 0;
-    if (team && owner() && member) {
+    const closed = current.status === 'closed';
+    if (team && owner() && member && !closed) {
       const button = element('button', role === 'mentor' ? '撤销指导端' : '撤销该席', 'text-button danger-quiet');
       button.type = 'button';
       button.disabled = mutationBusy;
@@ -366,10 +432,10 @@
       actions.append(button);
     }
     if (owner() && (team || role !== 'worker' || seat === undefined)) {
-      if (team && !member) {
+      if (team && !member && !closed) {
         const button = element('button', numbered ? '生成该席邀请' : (role === 'mentor' ? '生成指导端邀请' : '生成新席邀请'), 'text-button');
         button.type = 'button';
-        button.disabled = mutationBusy || current.status === 'closed';
+        button.disabled = mutationBusy;
         button.addEventListener('click', () => inviteTeam(role, numbered ? seat : undefined));
         actions.append(button);
       } else if (!team) {
@@ -418,8 +484,8 @@
   function renderPeers() {
     if (!current) { $('peer-cards').replaceChildren(); return; }
     const people = joinedPeople(current);
-    const online = people.filter(person => person.online === true).length;
-    if ($('seat-count')) $('seat-count').textContent = people.length ? (online + '/' + people.length + ' 在线') : '';
+    const online = presentCount(people);
+    if ($('seat-count')) $('seat-count').textContent = people.length ? (online + '/' + people.length + ' ' + presenceWord(people)) : '';
     if (isTeam()) {
       const rows = [];
       const ownerRow = array(current.members).find(item => item.role === 'owner');
@@ -540,7 +606,7 @@
       list.replaceChildren(...ordered.slice(0, 16).map(([task, depth]) => {
         const item = element('div', null, 'task-row' + (depth ? ' depth-' + Math.min(depth, 3) : ''));
         const assignee = task.assignee;
-        const who = assignee ? (text(assignee.name) || '成员') + ' · ' + (assignee.seat ?? '') + '号席' : '未认领';
+        const who = assignee ? (text(assignee.name) || '成员') + ' · ' + (assignee.seat ?? '') + ' 号席' : '未认领';
         const line = element('div', null, 'task-line');
         line.append(element('p', (text(task.title) || '未命名任务') + ' · ' + (taskStatuses[task.status] || '')));
         const progress = task.progress;
@@ -651,15 +717,15 @@
     if (isTeam()) {
       const leader = current.leader;
       roleLabel += leader && leader.name
-        ? ' · 领导者 ' + text(leader.name) + (Number.isInteger(Number(leader.seat)) ? ' · ' + leader.seat + '号席' : '')
+        ? ' · 领导者 ' + text(leader.name) + (Number.isInteger(Number(leader.seat)) ? ' · ' + leader.seat + ' 号席' : '')
         : ' · 尚无领导者';
     }
     $('session-role').textContent = roleLabel;
     $('session-role').title = roleLabel;
     const people = joinedPeople(current);
-    const online = people.filter(person => person.online === true).length;
+    const online = presentCount(people);
     $('seat-online').hidden = !people.length;
-    $('seat-online').textContent = people.length ? ('在线 ' + online + '/' + people.length) : '';
+    $('seat-online').textContent = people.length ? (presenceWord(people) + ' ' + online + '/' + people.length) : '';
     $('owner-actions').hidden = !owner();
     $('danger-zone').hidden = !owner();
     $('export-transcript').hidden = false;
@@ -837,6 +903,25 @@
     if ($('export-transcript')) $('export-transcript').disabled = events.size === 0;
     if (added) {renderPeers(); renderTeamSummary(); renderTaskBoard();}
   }
+  function pause(ms, signal) {
+    return new Promise(resolve => {
+      if (signal?.aborted) { resolve(); return; }
+      const finish = () => { clearTimeout(timer); signal?.removeEventListener('abort', finish); resolve(); };
+      const timer = setTimeout(finish, ms);
+      signal?.addEventListener('abort', finish, {once: true});
+    });
+  }
+  function waiterBusyError(error) {
+    return error?.status === 429 && (error.code === 'waiter_busy' || text(error.message).includes('该身份已有实时等待连接'));
+  }
+  function showWaiterNote() {
+    setConnection('polling', WAITER_NOTE);
+    if (!waiterNotePosted) { notify(WAITER_NOTE, false, true); waiterNotePosted = true; }
+  }
+  function clearWaiterNote() {
+    waiterNotePosted = false;
+    if ($('notice-text').textContent === WAITER_NOTE) notify('');
+  }
   async function poll(id, mode, view, signal) {
     let failures = 0, more = false;
     while (!signal.aborted && !stopped && view === generation && current?.id === id) {
@@ -846,24 +931,37 @@
           if (view !== generation) return; heartbeatAt = Date.now(); upsertSession(value.session,mode);
         }
         const previous = cursor;
-        const data = await api(sessionPath(id,'events',mode) + '?after=' + cursor + '&wait=' + (more ? '0' : '20'),undefined,signal);
+        const short = !more && waiterBusyUntil > Date.now();
+        const data = await api(sessionPath(id,'events',mode) + '?after=' + cursor + '&wait=' + (more || short ? '0' : '20'),undefined,signal);
         if (signal.aborted || view !== generation || current?.id !== id) return;
         upsertSession(data.session,mode); appendEvents(data.events);
         const next = Number(data.next_cursor);
         if (!Number.isInteger(next) || next < cursor || (data.has_more && next <= previous)) throw new Error('实时接口返回了无法推进的游标，请重新连接。');
         cursor = next; more = data.has_more === true; failures = 0;
-        setConnection('connected',more ? '正在补读历史' : '已连接 · 实时同步');
+        if (short) showWaiterNote();
+        else {
+          if (waiterBusyUntil) { waiterBusyUntil = 0; clearWaiterNote(); }
+          setConnection('connected', more ? '正在补读历史' : '已连接 · 实时同步');
+        }
         if (!owner() && current.role !== 'owner' && cursor > 0 && array(data.events).length) {
           await api(sessionPath(id,'ack',mode),{seq:cursor},signal);
           if (view !== generation) return;
         }
         if (current.status === 'closed' && !more) {setConnection('connected','历史已同步 · 会话结束'); return;}
+        if (short) await pause(SHORT_POLL_MS, signal);
       } catch (error) {
         if (signal.aborted || error.name === 'AbortError' || view !== generation) return;
         if (error.status === 401) {lostIdentity(); return;}
         if (error.status === 403 || error.status === 404) {
           sessions = sessions.filter(session => session.id !== id); forgetPrivateView();
           notify('当前身份无法继续访问此会话，权限可能已被撤销。',true); return;
+        }
+        if (waiterBusyError(error)) {
+          waiterBusyUntil = Date.now() + LONG_POLL_RETRY_MS;
+          failures = 0;
+          showWaiterNote();
+          await pause(SHORT_POLL_MS, signal);
+          continue;
         }
         const delay = Math.min(15000,1000 * 2 ** Math.min(++failures,4));
         setConnection('error','连接中断 · ' + Math.round(delay / 1000) + ' 秒后重试');
@@ -877,7 +975,7 @@
   }
   async function selectSession(id) {
     if (!id || !identity) return;
-    stopPolling(); const view = generation; pollController = new AbortController(); const signal = pollController.signal;
+    stopPolling(); waiterBusyUntil = 0; clearWaiterNote(); const view = generation; pollController = new AbortController(); const signal = pollController.signal;
     $('pair-dialog').close(); clearPairing(); $('team-dialog').close(); replyTo = null; outgoing = null; clearPending(); cursor = 0; heartbeatAt = 0; unread = 0;
     events.clear(); $('events').replaceChildren(); $('message-text').value = ''; $('new-events').hidden = true; $('feed-empty').hidden = false; $('event-count').textContent = '0 条';
     const known = sessions.find(session => session.id === id);

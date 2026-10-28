@@ -76,6 +76,30 @@ class RelayHTTP(unittest.TestCase):
             if right is not None:
                 right.close()
 
+    def test_same_identity_long_poll_returns_waiter_busy(self):
+        self.join()
+        status, caught_up = self.req("GET", f"/v1/relay/sessions/{self.sid}/events?after=0&wait=0", role="worker")
+        self.assertEqual(status, 200, caught_up)
+        path = f"/v1/relay/sessions/{self.sid}/events?after={caught_up['next_cursor']}&wait=20"
+        self.library.relay.MAX_WAITERS = 1
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            first = pool.submit(self.req, "GET", path, None, "worker")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not self.library.relay._waiters:
+                time.sleep(0.01)
+            self.assertTrue(self.library.relay._waiters, "long poll did not claim a waiter")
+            status, body = self.req("GET", path, role="worker")
+            self.assertEqual(status, 429)
+            self.assertEqual(body.get("code"), "waiter_busy")
+            self.assertIn("该身份已有实时等待连接", body.get("error", ""))
+            capped_status, capped = self.req("GET", path, role="mentor")
+            self.assertEqual(capped_status, 429)
+            self.assertEqual(capped.get("code"), "rate_limited")
+            self.assertNotIn("waiter_busy", json.dumps(capped))
+            self.clients["owner"].send(self.sid, "note", "唤醒长轮询", "wake-waiter")
+            woken = first.result(timeout=3)
+            self.assertEqual(woken[0], 200)
+
     def test_disconnected_long_poll_releases_the_waiter(self):
         self.join()
         cursor = self.clients['worker'].get(self.sid)['session']['last_seq']

@@ -12,10 +12,11 @@ from pathlib import Path
 
 
 class AuthError(Exception):
-    def __init__(self, message, status=401, retry_after=None):
+    def __init__(self, message, status=401, retry_after=None, code=None):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
+        self.code = code
 
 
 def digest(token):

@@ -50,7 +50,7 @@ MCP：`diaodu_relay_team_gate_open` / `gate_join` / `gate_get` / `gate_close` / 
 - 工作内容（instruction、progress、result、question、普通 note、任务板事件，以及 joined/state/revoked）对全体成员和公开目录可见。`to` 只表示派给谁做，不再隐藏正文。
 - 普通 worker 不能把消息定向到其他席位（403）。现任领导者、mentor、owner 可以 `to="worker:N"`。worker 不能替其他席位回报定向指令（403）。
 - `environment` 事件不进默认工作流，也不进公开目录。环境只出现在 owner、mentor 和该 worker 自己的 `workers[]`。
-- 以 `ELECT`、`LEADER`、`HB`、`VOTE` 开头的 note 不进工作流，由选举侧信道处理。详见 [relay-work.md](relay-work.md)。
+- 格式完整的 `ELECT`、`LEADER`、`HB`、`VOTE` 备注不进工作流，由选举侧信道处理。写不成协议的普通句子仍是普通备注。详见 [relay-work.md](relay-work.md)。
 - 定向给已撤销席位：409；给不存在席位：400。
 
 ## 汇总
