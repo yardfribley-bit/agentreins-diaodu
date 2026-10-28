@@ -11,11 +11,40 @@ from urllib.request import Request, urlopen
 
 from diaodu.identity import AuthError, Identity
 from diaodu.library import Library
+from diaodu.relay import parse_protocol_note, protocol_op
 from diaodu.relay_teams import RelayTeams
 from diaodu.server import make_handler
 
 ENVIRONMENT = {"os_name": "macOS", "os_version": "test", "architecture": "arm64",
                "shells": ["bash"], "python_version": "3.11.15"}
+
+
+class ProtocolParseTest(unittest.TestCase):
+    def test_only_a_parsed_remainder_is_protocol(self):
+        self.assertEqual(protocol_op("HB"), "HB")
+        self.assertEqual(protocol_op("HB 1"), "HB")
+        self.assertEqual(protocol_op("  ELECT  "), "ELECT")
+        self.assertEqual(protocol_op("LEADER worker:2"), "LEADER")
+        self.assertEqual(protocol_op("VOTE 3 worker:1"), "VOTE")
+        self.assertEqual(protocol_op("ELECT mentor:0"), "ELECT")
+        parsed = parse_protocol_note('ELECT {"term": 1, "candidate": "worker:2"}')
+        self.assertEqual(parsed["op"], "ELECT")
+        self.assertEqual(parsed["term"], 1)
+        self.assertEqual((parsed["role"], parsed["seat"]), ("worker", 2))
+        for prose in (
+            "LEADER e2e 侧信道过滤检查",
+            "HB 请看这边",
+            "HB 1 extra",
+            "HB worker:2",
+            "VOTE",
+            "VOTE later",
+            "ELECT {not json",
+            "ELECT {\"term\": -1}",
+            "hello",
+            "",
+        ):
+            self.assertIsNone(protocol_op(prose), prose)
+            self.assertIsNone(parse_protocol_note(prose), prose)
 
 
 class WorkSurfaceTest(unittest.TestCase):
@@ -204,6 +233,44 @@ class WorkSurfaceTest(unittest.TestCase):
         titles, _page = self.texts(self.worker2)
         self.assertIn("步骤甲", titles)
         self.assertIn("两步已合并", titles)
+
+    def test_non_leader_heartbeat_is_rejected_and_prose_stays_on_the_work_stream(self):
+        self.teams.appoint(self.owner, self.sid, {"role": "worker", "seat": self.seat1})
+        owner_hb = self.teams.send(self.owner, self.sid, {
+            "kind": "note", "text": "HB", "request_id": "hb-owner"})
+        self.assertFalse(owner_hb["applied"])
+        self.assertEqual(owner_hb["reason"], "not_leader")
+        self.assertEqual(owner_hb["op"], "HB")
+        self.assertNotIn("event", owner_hb)
+        other = self.teams.send(self.worker2, self.sid, {
+            "kind": "note", "text": "HB 1", "request_id": "hb-other"})
+        self.assertFalse(other["applied"])
+        self.assertEqual(other["reason"], "not_leader")
+        renewed = self.teams.send(self.worker1, self.sid, {
+            "kind": "note", "text": "HB", "request_id": "hb-lead"})
+        self.assertTrue(renewed["applied"])
+        self.assertNotIn("event", renewed)
+        prose = self.teams.send(self.worker2, self.sid, {
+            "kind": "note", "text": "LEADER e2e 侧信道过滤检查", "request_id": "prose-leader"})
+        self.assertEqual(prose["event"]["message"]["text"], "LEADER e2e 侧信道过滤检查")
+        self.assertNotIn("protocol", prose)
+        human_hb = self.teams.send(self.worker2, self.sid, {
+            "kind": "note", "text": "HB 请看这边的普通备注", "request_id": "prose-hb"})
+        self.assertEqual(human_hb["event"]["message"]["text"], "HB 请看这边的普通备注")
+        bare_vote = self.teams.send(self.worker2, self.sid, {
+            "kind": "note", "text": "VOTE", "request_id": "prose-vote"})
+        self.assertEqual(bare_vote["event"]["message"]["text"], "VOTE")
+        titles, _page = self.texts(self.owner)
+        self.assertIn("LEADER e2e 侧信道过滤检查", titles)
+        self.assertIn("HB 请看这边的普通备注", titles)
+        self.assertIn("VOTE", titles)
+        self.assertNotIn("HB", titles)
+        self.assertNotIn("HB 1", titles)
+        real = self.teams.send(self.worker2, self.sid, {
+            "kind": "note", "text": "LEADER worker:2", "request_id": "still-protocol"})
+        self.assertFalse(real["applied"])
+        self.assertEqual(real["reason"], "not_leader")
+        self.assertNotIn("event", real)
 
     def test_expired_lease_allows_a_new_term_but_not_two_leaders(self):
         self.teams.appoint(self.owner, self.sid, {"role": "worker", "seat": self.seat1})

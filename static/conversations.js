@@ -86,11 +86,58 @@
       navigator.clipboard.writeText(value).then(finish).catch(fallback);
     } else fallback();
   }
+  function protocolTermOk(term) {
+    if (term == null) return true;
+    return typeof term === 'number' && Number.isInteger(term) && term >= 0 && term <= 1000000;
+  }
+  function protocolTarget(value) {
+    if (typeof value === 'string' && /^\d+$/.test(value)) return {role: 'worker', seat: Number(value)};
+    if (typeof value !== 'string') return null;
+    const parts = value.split(':');
+    if (parts.length !== 2) return null;
+    if ((parts[0] !== 'mentor' && parts[0] !== 'worker') || !/^\d+$/.test(parts[1])) return null;
+    return {role: parts[0], seat: Number(parts[1])};
+  }
+  function protocolTargetOk(role, seat, allowEmpty) {
+    if (role == null && seat == null) return allowEmpty;
+    if (role !== 'mentor' && role !== 'worker') return false;
+    return typeof seat === 'number' && Number.isInteger(seat);
+  }
   function isProtocolNoise(message) {
-    const raw = text(message && message.text).trim();
-    if (!raw) return false;
-    const token = raw.split(/\s+/)[0];
-    return token === 'ELECT' || token === 'LEADER' || token === 'HB' || token === 'VOTE';
+    const body = text(message && message.text).trim();
+    if (!body || body.includes('\0')) return false;
+    const splitAt = body.search(/\s/);
+    const op = splitAt < 0 ? body : body.slice(0, splitAt);
+    if (op !== 'ELECT' && op !== 'VOTE' && op !== 'LEADER' && op !== 'HB') return false;
+    const raw = splitAt < 0 ? '' : body.slice(splitAt).trim();
+    let role = null, seat = null;
+    if (raw.startsWith('{')) {
+      let data;
+      try { data = JSON.parse(raw); } catch (error) { return false; }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+      if (Object.keys(data).some(key => !['term', 'candidate', 'role', 'seat'].includes(key))) return false;
+      if (Object.hasOwn(data, 'candidate')) {
+        const target = protocolTarget(data.candidate);
+        if (!target) return false;
+        role = target.role; seat = target.seat;
+      } else if (Object.hasOwn(data, 'role') || Object.hasOwn(data, 'seat')) {
+        role = data.role; seat = data.seat;
+      }
+      if (!protocolTermOk(data.term) || !protocolTargetOk(role, seat, op !== 'VOTE')) return false;
+      return !(op === 'HB' && (role != null || seat != null));
+    }
+    const rest = raw ? raw.split(/\s+/) : [];
+    let index = 0, term = null;
+    if (rest[0] && /^\d+$/.test(rest[0])) { term = Number(rest[0]); index = 1; }
+    if (!protocolTermOk(term)) return false;
+    if (op === 'HB') return index === rest.length;
+    if (rest.length - index > 1) return false;
+    if (index < rest.length) {
+      const target = protocolTarget(rest[index]);
+      if (!target) return false;
+      role = target.role; seat = target.seat;
+    }
+    return protocolTargetOk(role, seat, op !== 'VOTE');
   }
   function plainLead(source) {
     const lines = String(source || '').replace(/\r\n/g, '\n').split('\n');

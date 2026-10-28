@@ -97,6 +97,7 @@ class RelayWorkbenchSource(unittest.TestCase):
             "各席回报",
             "任务板",
             "邀请与接入",
+            ">生成邀请<",
             "暂停指令",
             "结束 Topic",
             "撤销两端访问",
@@ -116,6 +117,9 @@ class RelayWorkbenchSource(unittest.TestCase):
             "progress",
             "result",
             "isProtocolNoise",
+            "waiter_busy",
+            "实时同步在另一个标签页中进行，此页按 3 秒轮询",
+            "presentCount",
             "visibleWorkEvent",
             "待答复",
             "reply-quote",
@@ -125,6 +129,8 @@ class RelayWorkbenchSource(unittest.TestCase):
         ):
             self.assertIn(marker, JS, marker)
         self.assertNotIn("innerHTML", JS)
+        self.assertNotIn("'号席'", JS)
+        self.assertNotIn('"号席"', JS)
         self.assertNotIn("invite_code", JS)
         self.assertNotIn("join_url", JS)
         self.assertNotIn("人工指令", JS)

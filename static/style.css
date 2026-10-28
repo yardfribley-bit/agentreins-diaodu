@@ -137,4 +137,12 @@ header.site-header #account button{font-size:12px;padding:4px 8px}
   .task-row-actions{padding-top:0}
   .rail-actions{flex-direction:column}
 }
+.nav-fold{display:none}
+@media(max-width:520px){
+  header.site-header .header-actions{flex-wrap:nowrap}
+  header.site-header #mail-open,
+  header.site-header #account #set-alias{display:none}
+  header.site-header #account{max-width:28vw;overflow:hidden;text-overflow:ellipsis}
+  header.site-header .nav-check:checked~.site-nav .nav-fold{display:flex;width:100%;justify-content:flex-start}
+}
 

@@ -26,7 +26,7 @@ from diaodu.relay import (
     DEFAULT_MAX_WAITERS, DEFAULT_SESSION_WAITERS, FILE_ID_RE, PUBLIC_ID_RE, Relay,
     _actor, _body, _claim_waiter, _environment, _iso, _long_poll_ready, _mint_public_id,
     _name, _preview, _resolve_waiter_limits, _text, directory_rows, ensure_directory_columns,
-    protocol_op,
+    parse_protocol_note, protocol_op,
 )
 
 
@@ -1994,70 +1994,10 @@ class RelayTeams:
                     "session": self._session(db, session, member)}
 
     def _parse_protocol(self, text):
-        body = text.strip()
-        pieces = body.split(None, 1)
-        op = pieces[0]
-        raw = pieces[1].strip() if len(pieces) == 2 else ""
-        if raw.startswith("{"):
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError as error:
-                raise ValueError("协议备注的JSON不合法") from error
-            if not isinstance(data, dict) or set(data) - {"term", "candidate", "role", "seat"}:
-                raise ValueError("协议备注字段不合法")
-            term = data.get("term")
-            role = seat = None
-            if "candidate" in data:
-                role, seat = self._split_target(data.get("candidate"))
-            elif "role" in data or "seat" in data:
-                role, seat = data.get("role"), data.get("seat")
-            self._check_term(term)
-            self._check_target(role, seat, allow_empty=op != "VOTE")
-            return {"op": op, "term": term, "role": role, "seat": seat}
-        rest = raw.split() if raw else []
-        term = None
-        if rest and rest[0].isdigit():
-            term = int(rest[0])
-            rest = rest[1:]
-        self._check_term(term)
-        if op == "HB":
-            return {"op": op, "term": term, "role": None, "seat": None}
-        role = seat = None
-        if rest:
-            if len(rest) != 1:
-                raise ValueError("协议备注格式不合法")
-            role, seat = self._split_target(rest[0])
-        if op == "VOTE" and role is None:
-            raise ValueError("VOTE必须带候选席位")
-        self._check_target(role, seat, allow_empty=op != "VOTE")
-        return {"op": op, "term": term, "role": role, "seat": seat}
-
-    @staticmethod
-    def _check_term(term):
-        if term is None:
-            return
-        if isinstance(term, bool) or not isinstance(term, int) or term < 0 or term > 1_000_000:
-            raise ValueError("term不合法")
-
-    @staticmethod
-    def _split_target(value):
-        if isinstance(value, str) and value.isdigit():
-            return "worker", int(value)
-        if not isinstance(value, str) or value.count(":") != 1:
-            raise ValueError("候选席位须为 mentor:0 或 worker:N")
-        role, seat = value.split(":", 1)
-        if role not in ("mentor", "worker") or not seat.isdigit():
-            raise ValueError("候选席位须为 mentor:0 或 worker:N")
-        return role, int(seat)
-
-    @staticmethod
-    def _check_target(role, seat, allow_empty):
-        if role is None and seat is None:
-            if allow_empty:
-                return
-            raise ValueError("候选席位不能为空")
-        if role not in ("mentor", "worker") or isinstance(seat, bool) or not isinstance(seat, int):
-            raise ValueError("候选席位须为 mentor:0 或 worker:N")
+        parsed = parse_protocol_note(text)
+        if parsed is None:
+            raise ValueError("协议备注格式不合法")
+        return parsed
 
     def _note_outcome(self, applied, reason=None, elected=None, already_voted=False, retry_after=None):
         return {"applied": applied, "reason": reason, "elected": elected,
@@ -2086,7 +2026,8 @@ class RelayTeams:
             if self._is_leader_member(session, member, now):
                 db.execute("UPDATE team_sessions SET leader_lease=? WHERE id=?",
                            (now + self.LEASE_SECONDS, sid))
-            return self._note_outcome(True)
+                return self._note_outcome(True)
+            return self._note_outcome(False, "not_leader")
         if op == "LEADER":
             if self._is_leader_member(session, member, now):
                 db.execute("UPDATE team_sessions SET leader_lease=? WHERE id=?",

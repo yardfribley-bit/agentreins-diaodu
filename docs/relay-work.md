@@ -80,11 +80,11 @@
 以前把 `ELECT`、`LEADER`、`HB` 写进 note，再从 `relay_team_read` 里把这些 note 扫出来选主。现在不要这样做。
 
 - 默认 `relay_team_read` 不再返回这些 note，公开目录也不返回。
-- 仍会接受旧格式，但服务端说了算，不会因为有人写下 `LEADER` 就出现第二个领导者。
-- `HB`、以及可选的任期：只刷新在线时间；发送者已经是领导者时顺带续约。不产生工作事件，也不产生系统事件。
+- 仍会接受旧的协议格式，但服务端说了算，不会因为有人写下 `LEADER` 就出现第二个领导者。只有余下部分也能按协议解析时才走侧信道；`LEADER e2e 侧信道过滤检查` 或无法解析的 `HB …` 作为普通备注进入工作流。
+- `HB` 加可选任期：现任领导者续约（`applied: true`）。其他人（包括创建者）得到 `applied: false`、`reason: not_leader`，不会续约。不产生工作事件，也不产生系统事件。
 - `ELECT`、可选任期、可选 `worker:N` 或 `mentor:0`：没有有效领导者时作为参选或投票。已有领导者时 `applied` 为 false，`reason` 为 `leader_active`。
 - `LEADER`：不能用来夺权。只有现任领导者用它续约；其他人得到 `reason=not_leader`。
-- `VOTE <任期> <role:seat>`：只在已有选举时计票。
+- `VOTE <任期> <role:seat>`：只在已有选举时计票。缺少席位或夹了普通文字时，整句按普通备注投递。
 - 备注里的任期不会把服务端任期改到客户端指定的数字。
 - 这些调用的返回体是 `{protocol, op, applied, leader, election, session}`，没有工作事件的 `event`。
 - 选举变更用 `relay_team_read` 的 `stream=system`，序号从 0 另计，不要和 `last_seq` 混用。

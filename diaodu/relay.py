@@ -86,22 +86,105 @@ PREVIEW_LIMIT = 140
 _DIRECTORY_MARK = {"sessions": "p", "team_sessions": "t"}
 _MESSAGE_KINDS = ("instruction", "progress", "result", "question", "note")
 # Thin workers used to elect a leader by posting these tokens as notes.
-# They are protocol, not work content. Callers skip them in previews and
-# the team work stream; the team store applies them on a side channel.
+# They are protocol, not work content, only when the remainder parses.
+# A sentence that merely starts with one of these words stays a normal note.
 _PROTOCOL_OPS = ("ELECT", "LEADER", "HB", "VOTE")
+_PROTOCOL_FIELDS = {"term", "candidate", "role", "seat"}
+
+
+def _protocol_term_ok(term):
+    if term is None:
+        return True
+    if isinstance(term, bool) or not isinstance(term, int):
+        return False
+    return 0 <= term <= 1_000_000
+
+
+def _protocol_target(value):
+    if isinstance(value, str) and value.isdigit():
+        return "worker", int(value)
+    if not isinstance(value, str) or value.count(":") != 1:
+        raise ValueError("候选席位须为 mentor:0 或 worker:N")
+    role, seat = value.split(":", 1)
+    if role not in ("mentor", "worker") or not seat.isdigit():
+        raise ValueError("候选席位须为 mentor:0 或 worker:N")
+    return role, int(seat)
+
+
+def _protocol_target_ok(role, seat, allow_empty):
+    if role is None and seat is None:
+        return allow_empty
+    if role not in ("mentor", "worker") or isinstance(seat, bool) or not isinstance(seat, int):
+        return False
+    return True
+
+
+def parse_protocol_note(text):
+    """Return {op, term, role, seat} for a well-formed protocol note, else None.
+
+    ELECT, VOTE, LEADER, and HB are protocol only when the remainder is empty,
+    an optional term, an optional seat (mentor:0, worker:N, or N), or one JSON
+    object of those fields. HB accepts only the optional term. VOTE requires a
+    seat. Anything else, including "LEADER e2e …" or "HB 请看这边", is an ordinary note.
+    """
+    if not isinstance(text, str):
+        return None
+    body = text.strip()
+    if not body or "\x00" in body:
+        return None
+    pieces = body.split(None, 1)
+    op = pieces[0]
+    if op not in _PROTOCOL_OPS:
+        return None
+    raw = pieces[1].strip() if len(pieces) == 2 else ""
+    role = seat = None
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or set(data) - _PROTOCOL_FIELDS:
+            return None
+        try:
+            if "candidate" in data:
+                role, seat = _protocol_target(data.get("candidate"))
+            elif "role" in data or "seat" in data:
+                role, seat = data.get("role"), data.get("seat")
+        except ValueError:
+            return None
+        term = data.get("term")
+        if not _protocol_term_ok(term) or not _protocol_target_ok(role, seat, allow_empty=op != "VOTE"):
+            return None
+        if op == "HB" and (role is not None or seat is not None):
+            return None
+        return {"op": op, "term": term, "role": role, "seat": seat}
+    rest = raw.split() if raw else []
+    term = None
+    if rest and rest[0].isdigit():
+        term = int(rest[0])
+        rest = rest[1:]
+    if not _protocol_term_ok(term):
+        return None
+    if op == "HB":
+        if rest:
+            return None
+        return {"op": op, "term": term, "role": None, "seat": None}
+    if len(rest) > 1:
+        return None
+    if rest:
+        try:
+            role, seat = _protocol_target(rest[0])
+        except ValueError:
+            return None
+    if not _protocol_target_ok(role, seat, allow_empty=op != "VOTE"):
+        return None
+    return {"op": op, "term": term, "role": role, "seat": seat}
 
 
 def protocol_op(text):
-    """Return ELECT, LEADER, HB, or VOTE when text is a protocol note."""
-    if not isinstance(text, str):
-        return None
-    stripped = text.strip()
-    if not stripped or "\x00" in stripped:
-        return None
-    token = stripped.split(None, 1)[0]
-    if token in _PROTOCOL_OPS:
-        return token
-    return None
+    """Return ELECT, LEADER, HB, or VOTE when text is a well-formed protocol note."""
+    parsed = parse_protocol_note(text)
+    return parsed["op"] if parsed else None
 
 
 def _preview(value, limit=PREVIEW_LIMIT):
@@ -272,7 +355,7 @@ def _claim_waiter(waiters, token, max_waiters, max_session_waiters):
         raise AuthError(
             "该身份已有实时等待连接，请稍后重试"
             f"（本会话 {session_used}/{session_cap}，全局 {used}/{max_waiters}）",
-            429)
+            429, code="waiter_busy")
     if session_used >= session_cap:
         raise AuthError(
             "本会话实时等待已达上限，请稍后重试"

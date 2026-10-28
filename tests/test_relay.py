@@ -375,10 +375,12 @@ class RelayStoreTests(unittest.TestCase):
             with self.assertRaises(AuthError) as same:
                 self.relay.events(self.worker, self.sid, cursor, 1)
             self.assertEqual(same.exception.status, 429)
+            self.assertEqual(same.exception.code, "waiter_busy")
             self.assertIn("该身份已有实时等待连接", str(same.exception))
             with self.assertRaises(AuthError) as other:
                 self.relay.events(self.mentor, self.sid, cursor, 1)
             self.assertEqual(other.exception.status, 429)
+            self.assertIsNone(other.exception.code)
             self.assertIn("实时等待连接已达上限", str(other.exception))
             self.assertIn("全局剩余 0/1", str(other.exception))
             # A non-waiting read must not take the last slot or wait for it.
