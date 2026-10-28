@@ -20,6 +20,7 @@ from diaodu.library import LibraryError
 from diaodu import chat, agent_api, design_mcp
 from diaodu.http_util import discard_body
 from diaodu.identity import AuthError, Identity, text, digest
+from diaodu import discovery
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
 
@@ -173,6 +174,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             if parsed.path in static_files:
                 self._file(STATIC / static_files[parsed.path])
                 return
+            if parsed.path in ("/llms.txt", "/.well-known/mcp.json", "/v1/llms.txt", "/v1/.well-known/mcp.json"):
+                self._discovery(parsed.path)
+                return
             if re.fullmatch(r'/conversations/C-[pt][0-9a-f]{8}/', parsed.path):
                 self._file(STATIC / 'conversation.html')
                 return
@@ -292,16 +296,20 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     relay_http.get(self, library, parsed)
                     return
                 if parsed.path=="/v1/mcp":
-                    self._json(405,{"name":"diaodu","version":"2026.10.19","transport":"Streamable HTTP JSON","method":"POST","guide":library.public_base_path+"/v1/agent-guide.md"},{"Allow":"POST"})
+                    self._json(405,{"name":"diaodu","version":discovery.SERVER_VERSION,"transport":"Streamable HTTP JSON","method":"POST","guide":library.public_base_path+"/v1/agent-guide.md","mcp_url":discovery.HUB_MCP,"error":"MCP 请使用 POST。持久凭证：POST /v1/connect，保存 token，请求头 Authorization: Bearer。","code":"method_not_allowed"},{"Allow":"POST"})
                     return
                 base_url=(public_origin or ("http://"+self.headers.get("Host","localhost")))+library.public_base_path+"/v1"
                 if parsed.path in ("/v1/discover","/v1/tasks.md","/v1/agent-guide.md"):
                     query=parse_qs(parsed.query)
-                    discovery=agent_api.discover(library,base_url,int(query.get("offset",["0"])[0]),int(query.get("limit",["50"])[0]))
-                    if parsed.path=="/v1/discover":self._json(200,discovery)
+                    found=agent_api.discover(library,base_url,int(query.get("offset",["0"])[0]),int(query.get("limit",["50"])[0]))
+                    if parsed.path=="/v1/discover":self._json(200,found)
                     else:
-                        content=agent_api.discovery_markdown(discovery)
-                        if parsed.path=="/v1/agent-guide.md":content+="\n---\n"+(Path(__file__).parent/"agent-guide.md").read_text()
+                        hall=agent_api.discovery_markdown(found)
+                        if parsed.path=="/v1/agent-guide.md":
+                            guide=(Path(__file__).parent/"agent-guide.md").read_text()
+                            content=guide+"\n---\n"+hall
+                        else:
+                            content=hall
                         data=content.encode()
                         self.send_response(200);self.send_header("Content-Type","text/markdown; charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("Content-Length",str(len(data)));self.end_headers()
                         if not getattr(self,"_head_only",False):self.wfile.write(data)
@@ -321,6 +329,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     self._json(200,result);return
                 if parsed.path=="/v1/me/profile":
                     self._json(200,identity.profile(self._actor()))
+                    return
+                if parsed.path=="/v1/me/activity":
+                    self._json(200,identity.activity(self._actor()))
                     return
                 if parsed.path in ("/v1/client.py","/v1/openapi.json"):
                     name=parsed.path.rsplit("/",1)[-1]
@@ -436,6 +447,7 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     if length<0 or length>15*1024*1024:self._reject_oversized(length,"MCP请求最大15MB")
                     body=json.loads(self.rfile.read(length))
                     if not isinstance(body,dict):raise ValueError("JSON-RPC请求须为对象")
+                    self._rpc_id=body.get("id")
                     actor=self._actor(mutation=True) if self.headers.get("Authorization") or self.headers.get("Cookie") else None
                     base=(public_origin or ("http://"+self.headers.get("Host","localhost")))+library.public_base_path+"/v1"
                     client_ip=self.headers.get("X-Real-IP",self.client_address[0])
@@ -540,6 +552,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "tasks"] and parts[3] == "delete":
                     self._json(200,library.delete(parts[2],actor))
+                    return
+                if parts == ["v1","me","email"]:
+                    body=self._body()
+                    self._json(200,identity.bind_email(actor,body.get("email"),body.get("contact_consent",False)))
                     return
                 if parts == ["v1","me","profile"]:
                     updated=identity.update_profile(actor,self._body())
@@ -682,6 +698,11 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
 
         def do_DELETE(self):
             parsed = urlparse(self.path)
+            if library is not None and parsed.path == "/v1/mcp":
+                from diaodu import mcp
+                mcp.drop_session(self.headers.get("Mcp-Session-Id"))
+                self._json(200, {"ok": True})
+                return
             if library is not None and design_mcp.is_design_path(parsed.path):
                 try:
                     self._origin()
@@ -761,14 +782,51 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             self.end_headers()
             if not getattr(self,"_head_only",False):self.wfile.write(data)
 
+        def _discovery(self, path):
+            if path.endswith("mcp.json"):
+                self._json(200, discovery.mcp_card())
+                return
+            data = discovery.llms_text().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if not getattr(self, "_head_only", False):
+                self.wfile.write(data)
+
+        def _authenticate_header(self):
+            prefix = library.public_base_path if library else ""
+            return 'Bearer realm="agentreins-hub", resource_metadata="' + discovery.resource_metadata(public_origin, prefix) + '"'
+
         def _fail(self, exc):
-            """AuthError to JSON; 429 keeps the wait the caller needs to back off."""
-            payload={"error":str(exc)}
+            """AuthError to JSON; 429 keeps the wait the caller needs to back off.
+
+            MCP clients only surface a JSON-RPC error object, so those paths use
+            that shape and a Bearer challenge. The REST `code` field stays so
+            existing callers can still branch on unauthenticated / forbidden.
+            """
+            message=str(exc)
+            payload={"error":message}
             if getattr(exc,"retry_after",None) is not None:
                 payload["retry_after"]=exc.retry_after
             if getattr(exc,"code",None):
                 payload["code"]=exc.code
-            self._json(exc.status,payload)
+            headers={}
+            path=urlparse(self.path).path
+            mcp_path=path=="/v1/mcp" or design_mcp.is_design_path(path)
+            if mcp_path and exc.status in (401,403,429):
+                if exc.status==401:
+                    headers["WWW-Authenticate"]=self._authenticate_header()
+                    if "connect" not in message and "DIAODU_AGENT_TOKEN" not in message:
+                        message=message+" "+discovery.TOKEN_HINT
+                rpc={401:-32001,403:-32003,429:-32029}[exc.status]
+                payload={"jsonrpc":"2.0","id":getattr(self,"_rpc_id",None),"error":{"code":rpc,"message":message}}
+                if getattr(exc,"retry_after",None) is not None:
+                    payload["retry_after"]=exc.retry_after
+                if getattr(exc,"code",None):
+                    payload["code"]=exc.code
+            self._json(exc.status,payload,headers or None)
 
         def _internal_error(self, exc):
             """Log the detail server-side, return only a generic JSON error to the client."""

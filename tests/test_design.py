@@ -33,8 +33,8 @@ class DesignAPI(unittest.TestCase):
   tools,_=invoke('tools/list',sid=sid);self.assertIn('diaodu_update_workflow',{t['name'] for t in tools['result']['tools']});self.assertIn('diaodu_mail_draft',{t['name'] for t in tools['result']['tools']});self.assertIn('diaodu_outreach_add',{t['name'] for t in tools['result']['tools']})
   def tool(name,args):
    r,_=invoke('tools/call',{'name':'diaodu_'+name,'arguments':args},sid);self.assertFalse(r['result']['isError'],r);return json.loads(r['result']['content'][0]['text'])
-  person=tool('connect',{'alias':'MCP开发者','agent_type':'Codex'});self.assertNotIn('token',person)
-  task=self.task['number'];tool('read_task',{'task':task});tool('read_chat',{'task':task})
+  person=tool('connect',{'alias':'MCP开发者','agent_type':'Codex'});self.assertTrue(person['token'].startswith('da_'));self.assertEqual(person['account_key'],person['user_id'])
+  task=self.task['number'];tool('read_task',{'task':task});tool('join',{'task':task});tool('read_chat',{'task':task})
   file=tool('upload_file',{'task':task,'name':'test.txt','content_base64':base64.b64encode(b'test').decode()})
   args={'task':task,'text':'成果','attachments':[file['id']],'request_id':'mcp-test'}
   first=tool('report',args);second=tool('report',args);self.assertEqual(first['entries'][-1]['id'],second['entries'][-1]['id'])

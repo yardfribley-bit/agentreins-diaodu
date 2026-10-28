@@ -1,6 +1,7 @@
 """Credential-backed users, agent instances and execution IDs."""
 from __future__ import annotations
 import hashlib
+import json
 import math
 import re
 import hmac
@@ -17,6 +18,18 @@ class AuthError(Exception):
         self.status = status
         self.retry_after = retry_after
         self.code = code
+
+
+EMAIL_IN_USE = (
+    "该邮箱已是另一个账号的身份，本次不会合并两个账号，当前身份和历史保持不变。"
+    "未验证的邮箱不能接管他人账号。请改用那个账号已保存的 Bearer，或换一个邮箱。"
+    " This email is already an account; nothing was merged."
+)
+EMAIL_ALREADY_BOUND = (
+    "当前账号已绑定其他邮箱，不会改绑，以免拆开已有历史。"
+    "清空邮箱会把账号键恢复为原来的 id，历史仍留在该 id 上，之后才能绑定新邮箱。"
+    " This account is already bound to a different email."
+)
 
 
 def digest(token):
@@ -53,10 +66,22 @@ class Identity:
               created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS attempts (
               key TEXT PRIMARY KEY, count INTEGER NOT NULL, started REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS identity_aliases (
+              alias TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS ops (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, agent_id TEXT,
+              action TEXT NOT NULL, detail TEXT NOT NULL, created REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS ops_user ON ops(user_id, id);
             ''')
             columns={r[1] for r in db.execute('PRAGMA table_info(agents)')}
             if 'member_kind' not in columns: db.execute("ALTER TABLE agents ADD COLUMN member_kind TEXT NOT NULL DEFAULT 'agent'")
             db.execute("CREATE TABLE IF NOT EXISTS contacts (agent_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, email TEXT NOT NULL, purpose TEXT NOT NULL, consent_at REAL NOT NULL)")
+            user_columns={r[1] for r in db.execute('PRAGMA table_info(users)')}
+            if 'account_key' not in user_columns: db.execute("ALTER TABLE users ADD COLUMN account_key TEXT")
+            if 'email' not in user_columns: db.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            db.execute("UPDATE users SET account_key=id WHERE account_key IS NULL OR account_key=''")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_account_key ON users(account_key)")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email) WHERE email IS NOT NULL")
         path.chmod(0o600)
 
     @contextmanager
@@ -113,7 +138,9 @@ class Identity:
         hashed = password_hash(password, salt)
         try:
             with self.db() as db:
-                db.execute("INSERT INTO users VALUES (?,?,?,?,?,?)", (user_id, username, display_name, salt, hashed, time.time()))
+                db.execute(
+                    "INSERT INTO users (id,username,display_name,salt,password,created,account_key) VALUES (?,?,?,?,?,?,?)",
+                    (user_id, username, display_name, salt, hashed, time.time(), user_id))
         except sqlite3.IntegrityError:
             raise AuthError("用户名已被使用", 409)
         return {"user_id": user_id, "username": username, "display_name": display_name}
@@ -174,20 +201,164 @@ class Identity:
         return result
 
     def connect(self, alias, agent_type="访客", member_kind="agent", email=None, contact_consent=False):
+        """Mint a durable guest identity. The returned token is the stable key across restarts.
+
+        With no email, account_key is the new user id. With a consented email, that email
+        becomes account_key and the user id is kept as an alias. History stays on user_id.
+        """
         contact_email = validate_contact(email, contact_consent)
+        if contact_email:
+            contact_email = contact_email.lower()
         if member_kind not in ("human","agent"): raise ValueError("member_kind 必须为 human 或 agent")
         alias = text(alias, "别名", 60)
         agent_type = text(agent_type, "工具类型", 40)
         user_id = "us_" + secrets.token_hex(12)
         agent_id = "ag_" + secrets.token_hex(12)
         token = "da_" + secrets.token_urlsafe(32)
+        now = time.time()
+        try:
+            with self.db() as db:
+                if contact_email and self._email_taken(db, contact_email, None):
+                    raise AuthError(EMAIL_IN_USE, 409, code="email_in_use")
+                db.execute(
+                    "INSERT INTO users (id,username,display_name,salt,password,created,account_key) VALUES (?,?,?,?,?,?,?)",
+                    (user_id, "__guest_"+secrets.token_hex(16), alias, secrets.token_hex(16), "disabled", now, user_id))
+                db.execute(
+                    "INSERT INTO agents (id,user_id,name,type,token_hash,revoked,created,member_kind) VALUES (?,?,?,?,?,0,?,?)",
+                    (agent_id, user_id, alias, agent_type, digest(token), now, member_kind))
+                self._log(db, user_id, agent_id, "connect", {"alias": alias, "agent_type": agent_type, "member_kind": member_kind})
+                if contact_email:
+                    self._claim_email(db, user_id, agent_id, contact_email, user_id)
+        except sqlite3.IntegrityError:
+            raise AuthError(EMAIL_IN_USE, 409, code="email_in_use")
+        actor = self.agent(token)
+        status = self.account_status(actor)
+        return dict(actor, token=token, account_key=status["account_key"], email_bound=status["email_bound"])
+
+    def _email_taken(self, db, email, except_user_id):
+        row = db.execute(
+            "SELECT id FROM users WHERE (email=? OR account_key=?) AND id!=?",
+            (email, email, except_user_id or "")).fetchone()
+        return row is not None
+
+    def _log(self, db, user_id, agent_id, action, detail):
+        db.execute(
+            "INSERT INTO ops (user_id,agent_id,action,detail,created) VALUES (?,?,?,?,?)",
+            (user_id, agent_id, action, json.dumps(detail, ensure_ascii=False), time.time()))
+
+    def log_op(self, user_id, agent_id, action, detail):
         with self.db() as db:
-            db.execute("INSERT INTO users VALUES (?,?,?,?,?,?)", (user_id,"__guest_"+secrets.token_hex(16),alias,secrets.token_hex(16),"disabled",time.time()))
-            db.execute("INSERT INTO agents (id,user_id,name,type,token_hash,revoked,created) VALUES (?,?,?,?,?,0,?)", (agent_id,user_id,alias,agent_type,digest(token),time.time()))
-        with self.db() as db: db.execute("UPDATE agents SET member_kind=? WHERE id=?",(member_kind,agent_id))
-        if contact_email:
-            with self.db() as db: db.execute("INSERT INTO contacts VALUES (?,?,?,?,?)",(agent_id,user_id,contact_email,"task_followup",time.time()))
-        return dict(self.agent(token), token=token)
+            self._log(db, user_id, agent_id, action, detail)
+
+    def _claim_email(self, db, user_id, agent_id, email, prior_key):
+        """Point account_key at the email and remember the previous key. Rows stay on user_id."""
+        db.execute("UPDATE users SET email=?, account_key=? WHERE id=?", (email, email, user_id))
+        db.execute(
+            "INSERT INTO identity_aliases (alias,user_id,kind,created) VALUES (?,?,?,?) "
+            "ON CONFLICT(alias) DO UPDATE SET user_id=excluded.user_id, kind=excluded.kind, created=excluded.created",
+            (prior_key, user_id, "prior_id", time.time()))
+        if agent_id:
+            db.execute(
+                "INSERT INTO contacts VALUES (?,?,?,?,?) "
+                "ON CONFLICT(agent_id) DO UPDATE SET email=excluded.email, user_id=excluded.user_id, purpose=excluded.purpose, consent_at=excluded.consent_at",
+                (agent_id, user_id, email, "task_followup", time.time()))
+        self._log(db, user_id, agent_id, "bind_email", {"from": prior_key, "to": email, "history_kept": True})
+
+    def account_status(self, actor):
+        with self.db() as db:
+            row = db.execute("SELECT account_key, email FROM users WHERE id=?", (actor["user_id"],)).fetchone()
+        key = row["account_key"] if row and row["account_key"] else actor["user_id"]
+        return {"user_id": actor["user_id"], "agent_id": actor.get("agent_id"), "account_key": key, "email_bound": bool(row and row["email"])}
+
+    def bind_email(self, actor, email, consent):
+        """Bind email as the account key for this user. Same-account history is kept.
+
+        If the email is already another account, raise 409 and change nothing.
+        Unverified email never takes over a different account. Repeating the same
+        email is a no-op. A different email on an account that already has one is
+        also 409; clear it first so the id becomes the account key again.
+        """
+        if actor.get("kind") not in ("agent", "user"):
+            raise AuthError("需要实例凭证", 403)
+        normalized = validate_contact(email, consent)
+        if not normalized:
+            raise ValueError("绑定邮箱需要提供 email")
+        normalized = normalized.lower()
+        user_id = actor["user_id"]
+        agent_id = actor.get("agent_id")
+        try:
+            with self.db() as db:
+                row = db.execute("SELECT id, account_key, email FROM users WHERE id=?", (user_id,)).fetchone()
+                if row is None:
+                    raise AuthError("账号不存在", 404)
+                current = row["email"] or ""
+                prior = row["account_key"] or user_id
+                if current == normalized:
+                    if agent_id:
+                        db.execute(
+                            "INSERT INTO contacts VALUES (?,?,?,?,?) "
+                            "ON CONFLICT(agent_id) DO UPDATE SET email=excluded.email, user_id=excluded.user_id, purpose=excluded.purpose, consent_at=excluded.consent_at",
+                            (agent_id, user_id, normalized, "task_followup", time.time()))
+                    return self._bind_view(user_id, agent_id, normalized, prior, True)
+                if current:
+                    raise AuthError(EMAIL_ALREADY_BOUND, 409, code="email_already_bound")
+                if self._email_taken(db, normalized, user_id):
+                    raise AuthError(EMAIL_IN_USE, 409, code="email_in_use")
+                self._claim_email(db, user_id, agent_id, normalized, prior)
+                return self._bind_view(user_id, agent_id, normalized, prior, False)
+        except sqlite3.IntegrityError:
+            raise AuthError(EMAIL_IN_USE, 409, code="email_in_use")
+
+    def _bind_view(self, user_id, agent_id, account_key, prior, reused):
+        return {
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "account_key": account_key,
+            "prior_account_key": prior,
+            "email_bound": True,
+            "reused": reused,
+            "history_kept": True,
+        }
+
+    def unbind_email(self, actor):
+        """Release the email as account key and restore the user id. Ops and task rows stay."""
+        if actor.get("kind") not in ("agent", "user"):
+            raise AuthError("需要实例凭证", 403)
+        user_id = actor["user_id"]
+        agent_id = actor.get("agent_id")
+        with self.db() as db:
+            row = db.execute("SELECT email FROM users WHERE id=?", (user_id,)).fetchone()
+            previous = (row["email"] if row else "") or ""
+            if previous:
+                db.execute("UPDATE users SET email=NULL, account_key=? WHERE id=?", (user_id, user_id))
+                self._log(db, user_id, agent_id, "unbind_email", {"from": previous, "to": user_id, "history_kept": True})
+            if agent_id:
+                db.execute("DELETE FROM contacts WHERE agent_id=?", (agent_id,))
+        return {"user_id": user_id, "agent_id": agent_id, "account_key": user_id, "email_bound": False, "history_kept": True}
+
+    def activity(self, actor, limit=50):
+        if actor.get("kind") not in ("agent", "user"):
+            raise AuthError("需要实例凭证", 403)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            limit = 50
+        limit = max(1, min(limit, 100))
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT action, detail, created, agent_id FROM ops WHERE user_id=? ORDER BY id ASC LIMIT ?",
+                (actor["user_id"], limit)).fetchall()
+            account = db.execute("SELECT account_key FROM users WHERE id=?", (actor["user_id"],)).fetchone()
+        ops = []
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"])
+            except json.JSONDecodeError:
+                detail = {"text": row["detail"]}
+            ops.append({"action": row["action"], "detail": detail, "created": row["created"], "agent_id": row["agent_id"]})
+        return {
+            "user_id": actor["user_id"],
+            "account_key": account["account_key"] if account and account["account_key"] else actor["user_id"],
+            "ops": ops,
+        }
 
     def rename(self, actor, alias):
         if actor["kind"] != "agent" or not actor.get("guest"):
@@ -202,7 +373,8 @@ class Identity:
         if actor.get("kind")!="agent":raise AuthError("需要实例凭证",403)
         with self.db() as db:
             row=db.execute("SELECT email,consent_at FROM contacts WHERE agent_id=?",(actor["agent_id"],)).fetchone()
-        return {"alias":actor["agent_name"],"agent_type":actor["agent_type"],"member_kind":actor.get("member_kind","agent"),"email":row["email"] if row else "","contact_consent":bool(row),"email_verified":False,"visibility":"self_and_platform_only"}
+            account=db.execute("SELECT account_key, email FROM users WHERE id=?",(actor["user_id"],)).fetchone()
+        return {"alias":actor["agent_name"],"agent_type":actor["agent_type"],"member_kind":actor.get("member_kind","agent"),"email":row["email"] if row else "","contact_consent":bool(row),"email_verified":False,"visibility":"self_and_platform_only","user_id":actor["user_id"],"account_key":(account["account_key"] if account and account["account_key"] else actor["user_id"]),"email_bound":bool(account and account["email"])}
 
     def update_profile(self, actor, body):
         if actor.get("kind")!="agent" or not actor.get("guest"):raise AuthError("仅可修改自己的免注册实例",403)
@@ -210,13 +382,15 @@ class Identity:
         kind=body.get("member_kind",actor.get("member_kind","agent"))
         if kind not in ("human","agent"):raise ValueError("请选择人或智能体")
         tool=text(body.get("agent_type",actor["agent_type"]),"工具类型",40)
-        email=validate_contact(body.get("email"),body.get("contact_consent"))
+        if "email" in body:
+            email=validate_contact(body.get("email"),body.get("contact_consent"))
+            if email:
+                self.bind_email(actor, email, body.get("contact_consent"))
+            else:
+                self.unbind_email(actor)
         with self.db() as db:
             db.execute("UPDATE agents SET name=?,type=?,member_kind=? WHERE id=? AND user_id=?",(alias,tool,kind,actor["agent_id"],actor["user_id"]))
             db.execute("UPDATE users SET display_name=? WHERE id=?",(alias,actor["user_id"]))
-            if "email" in body:
-                if email:db.execute("INSERT INTO contacts VALUES (?,?,?,?,?) ON CONFLICT(agent_id) DO UPDATE SET email=excluded.email, consent_at=excluded.consent_at",(actor["agent_id"],actor["user_id"],email,"task_followup",time.time()))
-                else:db.execute("DELETE FROM contacts WHERE agent_id=?",(actor["agent_id"],))
         return dict(actor,agent_name=alias,user_name=alias,agent_type=tool,member_kind=kind)
 
     def start_run(self, actor, task_id):

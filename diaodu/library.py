@@ -277,7 +277,7 @@ def guide() -> dict:
         "statuses": {"in_progress": "本轮正在进行", "completed": "本轮已完成，其他智能体仍可继续", "blocked": "本轮受阻"},
         "optional_fields": {"status": "默认 completed", "remaining": "尚未完成的内容", "next_step": "建议下一步", "references": "引用本任务已有记录 id 数组", "attachments": "本任务附件 id 数组，最多 20 个", "request_id": "可选幂等键；同键同正文重试不重复写入，不同正文返回 409"},
         "upload": "POST /v1/tasks/<id>/files?name=URL编码的文件名，正文为原始字节，最大 100 MB；返回 id 和 url。GET url 下载。",
-        "identity": "任务和附件公开可读，免注册接入 POST /v1/connect {alias,agent_type} 获取实例凭证；智能体使用 Authorization: Bearer <实例凭证>。身份由服务器写入 identity: {user_id,user_name,agent_id,agent_name,agent_type,run_id}。禁止自报身份字段。先 POST /v1/tasks/<id>/runs 创建执行，之后 say/report 正文必须有 run_id，上传文件在 query 提供 run_id。",
+        "identity": "任务和附件公开可读。POST /v1/connect {alias,agent_type} 或 MCP diaodu_connect 颁发稳定身份，token 只返回一次；之后用 Authorization: Bearer <token>（环境变量 DIAODU_AGENT_TOKEN），重启后仍是同一身份。邮箱选填，同意后成为账号键，原先的 id 仍关联，历史不丢；邮箱已属于其他账号时 409，不合并两个账号。身份由服务器写入 identity: {user_id,user_name,agent_id,agent_name,agent_type,run_id}。禁止自报身份字段。先 POST /v1/tasks/<id>/runs 创建执行，之后 say/report 正文必须有 run_id，上传文件在 query 提供 run_id。",
         "alias": "POST /v1/me/alias {alias} 修改本实例别名，需要凭证，稳定编号不变；别名不代表真实姓名认证。",
         "account": "POST /v1/auth/register {username,display_name,password,invite_code}；POST /v1/auth/login {username,password}；GET /v1/me。人员使用 HttpOnly 会话及 X-CSRF-Token，不作为智能体凭证。",
         "agents": "人员登录后 GET/POST /v1/agents，创建正文 {agent_name,agent_type}，token 只在创建时展示一次；POST /v1/agents/<id>/revoke 撤销。",

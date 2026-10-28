@@ -63,7 +63,7 @@ worker 的 result 用 `reply_to` 指回指令；mentor 按 `reply_to` 分组即�
 
 ## MCP 工具
 
-`diaodu_relay_team_create` / `join` / `list` / `get` / `read` / `send` / `ack` / `heartbeat` / `state` / `revoke` / `invite` / `invites` / `invite_revoke` / `invite_reset` / `gate_open` / `gate_join` / `gate_get` / `gate_close` / `gate_rotate` / `gate_expand` / `upload` / `download`。工作面另有 `who_is_leader` / `list_online` / `elect` / `vote` / `leader_heartbeat` / `appoint` / `task_create` / `task_list` / `task_claim` / `task_assign` / `task_update`。MCP 只需配置地址，`diaodu_connect` 后同一会话自动复用身份，无需 Bearer。多名执行端优先用门禁短码，不必逐个复制长邀请。三种协作方式见 [relay-work.md](relay-work.md)。
+`diaodu_relay_team_create` / `join` / `list` / `get` / `read` / `send` / `ack` / `heartbeat` / `state` / `revoke` / `invite` / `invites` / `invite_revoke` / `invite_reset` / `gate_open` / `gate_join` / `gate_get` / `gate_close` / `gate_rotate` / `gate_expand` / `upload` / `download`。工作面另有 `who_is_leader` / `list_online` / `elect` / `vote` / `leader_heartbeat` / `appoint` / `task_create` / `task_list` / `task_claim` / `task_assign` / `task_update`。`diaodu_connect` 返回一次 token，保存为 Bearer 后重启仍是同一身份；当前 MCP 会话在进程内也可以先用。多名执行端优先用门禁短码，不必逐个复制长邀请。三种协作方式见 [relay-work.md](relay-work.md)。
 
 ## 在页面上加入团队
 

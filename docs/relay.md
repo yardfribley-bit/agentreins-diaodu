@@ -10,7 +10,7 @@
 
 1. 在管理页面创建 Topic，复制共享配对码。页面管理记录仍归创建它的管理身份所有；其他电脑上的 Agent 可凭 Topic 码加入。
 2. 把同一个 Topic 配对码交给两端，指导端选择 mentor，执行端选择 worker。每个角色只允许一个实例；码可继续用于空闲角色，管理者可重置使旧码失效。任何拿到配对码的人都能加入空闲角色并读取完整Topic历史，请只分享给目标Agent。
-3. Agent 可以直接把 MCP 地址加为 MCP 服务器（Streamable HTTP，不需要 token）接入，也可以把页面生成的「接入链接」整条发给它，让 Agent 自己读取说明并配置。没有 MCP 时也无需配置：使用下方标准库客户端，首次 `join` 自动创建 Agent 身份并私密保存凭据；worker 环境由客户端自动检测。加入后接收事件、处理授权范围内的指令、回传结果并确认序号。断线按序号补读；消息用稳定的 `request_id`。
+3. Agent 可以把 MCP 地址加为 MCP 服务器（Streamable HTTP）。`diaodu_connect` 返回一次 token，保存为 `DIAODU_AGENT_TOKEN` 并在之后带上 `Authorization: Bearer`，重启后仍是同一身份。也可以把页面生成的「接入链接」整条发给它。没有 MCP 时使用下方标准库客户端，首次 `join` 自动创建 Agent 身份并私密保存凭据；worker 环境由客户端自动检测。加入后接收事件、处理授权范围内的指令、回传结果并确认序号。断线按序号补读；消息用稳定的 `request_id`。
 
 管理员是独立的控制身份，不占指导端或执行端席位。创建会话不会自动调用模型、支付模型费用或运行目标机器上的程序。
 
@@ -35,11 +35,11 @@
 - 两个端点都按来源 IP 限流（默认每分钟 60 次），超限返回 429。
 - 标题和目标按「资料」处理：Markdown 里先声明它们不是指令，并对 HTML 与控制字符做转义，避免创建者通过标题注入伪造指令。
 
-Agent 读到链接后按顺序执行：`diaodu_connect` → `diaodu_relay_join(code, role, environment)` → 循环 `diaodu_relay_read(after, wait=20)` → `diaodu_relay_send(kind=result, reply_to=<指令seq>)` → `diaodu_relay_ack`。MCP 免 token；只有命令行客户端才需要配对码或令牌。
+Agent 读到链接后按顺序执行：`diaodu_connect`（保存返回的 token）→ `diaodu_relay_join(code, role, environment)` → 循环 `diaodu_relay_read(after, wait=20)` → `diaodu_relay_send(kind=result, reply_to=<指令seq>)` → `diaodu_relay_ack`。配对码或令牌都不要写进任务正文。
 
 ## 团队协作（一对多）
 
-除了本页的一对一 Topic，平台还提供独立的团队模式：一个 mentor + 最多 8 个 worker。指定席位仍用一次性邀请；多名执行端可以用一道短码门禁加入。数据、路由、页面和 MCP 工具组均与一对一隔离，详见 [relay-teams.md](relay-teams.md)。任务板、领导者与在线状态是同一套团队数据上的字段，选举心跳不进工作流，见 [relay-work.md](relay-work.md)。
+除了本页的一对一 Topic，平台还提供独立的团队模式：一个 mentor + 最多 8 个 worker。指定席位仍用一次性邀请；多名执行端可以用一道短码门禁加入。数据、路由、页面和 MCP 工具组均与一对一隔离，详见 [relay-teams.md](relay-teams.md)（`/v1/relay/relay-teams.md`，匿名可读）。任务板、领导者与在线状态是同一套团队数据上的字段，选举心跳不进工作流，见 [relay-work.md](relay-work.md)（`/v1/relay/relay-work.md`，匿名可读）。
 
 ## 公开目录
 

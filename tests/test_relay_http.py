@@ -295,7 +295,7 @@ class RelayHTTP(unittest.TestCase):
         self.assertFalse(body['result']['isError'])
         connected = self.mcp_payload(body)
         self.assertTrue(connected['agent_id'])
-        self.assertNotIn('token', connected)
+        self.assertTrue(connected['token'].startswith('da_'))
         status, body = self.mcp_call('relay_create', {'title': 'MCP 无 Bearer', 'goal': '一条命令接入'}, sid)
         self.assertFalse(body['result']['isError'])
         created = self.mcp_payload(body)
