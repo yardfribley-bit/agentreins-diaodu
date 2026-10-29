@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from diaodu import relay_files, report_pdf
+from diaodu import relay_files, report_pdf, report_public
 from diaodu.identity import AuthError
 from diaodu.relay import (
     DEFAULT_MAX_WAITERS, DEFAULT_SESSION_WAITERS, FILE_ID_RE, PUBLIC_ID_RE, Relay,
@@ -203,7 +203,18 @@ class RelayTeams:
                   ON team_reports(session_id, author_key, request_id);
                 CREATE INDEX IF NOT EXISTS team_reports_current
                   ON team_reports(session_id, status, revision);
+                CREATE TABLE IF NOT EXISTS publication_feed (
+                  id INTEGER PRIMARY KEY CHECK (id = 1),
+                  updated REAL NOT NULL);
             """)
+            for name, ddl in (
+                ("public_approved_at", "REAL"),
+                ("public_title", "TEXT"),
+                ("public_summary", "TEXT"),
+            ):
+                self._ensure_column(db, "team_reports", name, ddl)
+            db.execute("CREATE INDEX IF NOT EXISTS team_reports_public "
+                       "ON team_reports(status, public_approved_at)")
             for name, ddl in (
                 ("leader_role", "TEXT"),
                 ("leader_seat", "INTEGER"),
@@ -2422,12 +2433,19 @@ class RelayTeams:
     def _report_member(self, row, include_markdown=False):
         if row is None:
             return None
+        approved_at = row["public_approved_at"]
         item = {"id": row["id"], "title": row["title"], "task_id": row["task_id"],
                 "chars": row["chars"], "sha256": row["sha256"], "revision": row["revision"],
                 "file_id": row["file_id"], "created_at": _iso(row["created"]),
                 "updated_at": _iso(row["updated"]),
                 "author": {"role": row["author_role"], "seat": row["author_seat"],
-                           "name": row["author_name"]}}
+                           "name": row["author_name"]},
+                "publication": {
+                    "approved": approved_at is not None,
+                    "public_approved_at": _iso(approved_at) if approved_at is not None else None,
+                    "title": row["public_title"] or None,
+                    "summary": row["public_summary"] or None,
+                }}
         if include_markdown:
             item["markdown"] = self._report_text(row["file_id"])
         return item
@@ -2593,23 +2611,175 @@ class RelayTeams:
                 raise AuthError("还没有最终报告", 404)
             return {"report": self._report_member(row, include_markdown=True)}
 
-    def _public_report_record(self, public_id):
+    def _canonical_base(self):
+        return report_public.canonical_base(self.public_origin, self.public_base_path)
+
+    def _touch_publication(self, db, now):
+        db.execute(
+            "INSERT INTO publication_feed (id, updated) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET updated=excluded.updated",
+            (now,))
+
+    def _publication_stamp(self, db):
+        row = db.execute("SELECT updated FROM publication_feed WHERE id=1").fetchone()
+        return float(row["updated"]) if row is not None else 0.0
+
+    def _resolve_owner_session(self, db, actor, sid):
+        """Team creator only. A C-t public id resolves to that session."""
+        if isinstance(sid, str) and PUBLIC_ID_RE.fullmatch(sid) and sid[2] == self.PUBLIC_MARK:
+            found = db.execute("SELECT id FROM team_sessions WHERE public_id=?", (sid,)).fetchone()
+            if found is None:
+                raise AuthError("没有这个团队会话或无权访问", 404)
+            sid = found["id"]
+        session, member = self._access(db, actor, sid)
+        if member["role"] != "owner":
+            raise AuthError("只有创建者可以批准或撤回公开报告", 403)
+        return session, member
+
+    def _publication_payload(self, session, row, warnings=None):
+        approved_at = row["public_approved_at"]
+        approved = approved_at is not None
+        title = (row["public_title"] or "").strip() or row["title"]
+        summary = (row["public_summary"] or "").strip()
+        item = {
+            "id": session["public_id"],
+            "approved": approved,
+            "public_approved_at": _iso(approved_at) if approved else None,
+            "title": title if approved else (row["public_title"] or None),
+            "summary": summary if approved and summary else (row["public_summary"] or None),
+            "sha256": row["sha256"],
+            "warnings": list(warnings or []),
+        }
+        if approved:
+            base = self._canonical_base()
+            public_id = session["public_id"]
+            item["md_url"] = base + "/v1/public/reports/" + public_id + "/report.md"
+            item["pdf_url"] = base + "/v1/public/reports/" + public_id + "/report.pdf"
+            item["conversation_url"] = base + "/conversations/" + public_id + "/"
+        return item
+
+    def set_report_publication(self, actor, sid, body):
+        """Approve or revoke the current final report for the partner feed.
+
+        A later revision is a new row and is not public until approved again.
+        """
+        body = _body(body, {"approved", "title", "summary"})
+        if not isinstance(body.get("approved"), bool):
+            raise ValueError("approved 须为 true 或 false")
+        approved = body["approved"]
+        title_update = "title" in body
+        summary_update = "summary" in body
+        if title_update:
+            incoming_title = body.get("title")
+            if incoming_title is None:
+                incoming_title = ""
+            public_title = report_public.clean_line(incoming_title, "公开标题", 160)
+        else:
+            public_title = None
+        if summary_update:
+            incoming_summary = body.get("summary")
+            if incoming_summary is None:
+                incoming_summary = ""
+            public_summary = report_public.clean_blurb(incoming_summary, "公开摘要", 600)
+        else:
+            public_summary = None
+        with self._write() as db:
+            session, member = self._resolve_owner_session(db, actor, sid)
+            row = self._current_report_row(db, session["id"])
+            if row is None:
+                raise AuthError("还没有最终报告", 404)
+            next_title = public_title if title_update else (row["public_title"] or "")
+            next_summary = public_summary if summary_update else (row["public_summary"] or "")
+            warnings = []
+            if approved:
+                markdown = self._report_text(row["file_id"])
+                shown_title = next_title or row["title"]
+                blocking, warnings = report_public.review(
+                    "\n".join([markdown, shown_title, next_summary, row["author_name"] or ""]))
+                if blocking:
+                    raise ValueError(
+                        "报告含有不宜公开的内容（%s）。请先从正文、公开标题或摘要中删除后再批准。"
+                        % "、".join(blocking))
+            stored_title = next_title or None
+            stored_summary = next_summary or None
+            was = row["public_approved_at"]
+            same = (bool(was) == approved and (row["public_title"] or None) == stored_title
+                    and (row["public_summary"] or None) == stored_summary)
+            now = time.time()
+            if not same:
+                # Keep the original approval instant when an already-public report
+                # only changes its public title or summary. A first approval, or
+                # an approval after revoke, records now. Revoke clears the flag.
+                if approved and was is not None:
+                    approved_at = was
+                elif approved:
+                    approved_at = now
+                else:
+                    approved_at = None
+                db.execute(
+                    "UPDATE team_reports SET public_approved_at=?, public_title=?, "
+                    "public_summary=? WHERE id=?",
+                    (approved_at if approved else None, stored_title, stored_summary, row["id"]))
+                self._touch_publication(db, now)
+                row = db.execute("SELECT * FROM team_reports WHERE id=?", (row["id"],)).fetchone()
+            session = db.execute("SELECT * FROM team_sessions WHERE id=?",
+                                 (session["id"],)).fetchone()
+            publication = self._publication_payload(session, row, warnings)
+            view = self._session(db, session, member)
+        return {"publication": publication, "session": view}
+
+    def public_feed(self):
+        """Approved current reports only. Revoked and unapproved rows are absent."""
+        with self._read() as db:
+            stamp = self._publication_stamp(db)
+            rows = db.execute(
+                "SELECT r.*, s.public_id, s.title AS team_title, s.visibility "
+                "FROM team_reports r JOIN team_sessions s ON s.id=r.session_id "
+                "WHERE r.status='current' AND r.public_approved_at IS NOT NULL "
+                "AND s.visibility='public' AND s.public_id IS NOT NULL "
+                "ORDER BY r.public_approved_at DESC, s.public_id ASC").fetchall()
+        base = self._canonical_base()
+        reports = []
+        for row in rows:
+            public_id = row["public_id"]
+            title = (row["public_title"] or "").strip() or row["title"]
+            summary = (row["public_summary"] or "").strip()
+            item = {
+                "conversation_url": base + "/conversations/" + public_id + "/",
+                "created_at": _iso(row["created"]),
+                "id": public_id,
+                "md_url": base + "/v1/public/reports/" + public_id + "/report.md",
+                "pdf_url": base + "/v1/public/reports/" + public_id + "/report.pdf",
+                "public_approved_at": _iso(row["public_approved_at"]),
+                "sha256": row["sha256"],
+                "title": title,
+                "updated_at": _iso(row["updated"]),
+            }
+            if summary:
+                item["summary"] = summary
+            reports.append(item)
+        document = {"reports": reports, "updated_at": _iso(stamp) if stamp else None}
+        return document, stamp
+
+    def _public_report_record(self, public_id, *, require_approved=False):
+        denied = "没有这个公开报告" if require_approved else "没有这个公开对话"
         if (not isinstance(public_id, str) or PUBLIC_ID_RE.fullmatch(public_id) is None
                 or public_id[2] != self.PUBLIC_MARK):
-            raise AuthError("没有这个公开对话", 404)
+            raise AuthError(denied, 404)
         with self._read() as db:
             session = db.execute(
                 "SELECT * FROM team_sessions WHERE public_id=? AND visibility='public'",
                 (public_id,)).fetchone()
             if session is None:
-                raise AuthError("没有这个公开对话", 404)
+                raise AuthError(denied, 404)
             row = self._current_report_row(db, session["id"])
-            if row is None:
-                raise AuthError("还没有最终报告", 404)
+            if row is None or (require_approved and row["public_approved_at"] is None):
+                raise AuthError("没有这个公开报告" if require_approved else "还没有最终报告", 404)
             spec = {"title": row["title"], "team_title": session["title"],
                     "author_role": row["author_role"], "author_seat": row["author_seat"],
                     "author_name": row["author_name"], "updated": row["updated"],
-                    "chars": row["chars"], "sha256": row["sha256"], "file_id": row["file_id"]}
+                    "chars": row["chars"], "sha256": row["sha256"], "file_id": row["file_id"],
+                    "public_approved_at": row["public_approved_at"]}
         spec["markdown"] = self._report_text(spec["file_id"])
         return spec
 
@@ -2664,17 +2834,36 @@ class RelayTeams:
             label += " %d 号席" % seat
         return "%s · %s" % (label, name)
 
-    def public_report_path(self, public_id, kind):
-        spec = self._public_report_record(public_id)
+    def _report_download(self, spec, kind):
         if kind == "markdown":
             path = self.files_dir / spec["file_id"]
             if not path.is_file():
                 raise AuthError("报告文件已不存在", 404)
-            return {"name": "report.md", "type": "text/markdown", "size": path.stat().st_size}, path
+            return {"name": "report.md", "type": "text/markdown", "size": path.stat().st_size,
+                    "sha256": spec["sha256"], "updated": spec["updated"]}, path
         if kind != "pdf":
             raise AuthError("没有这个公开报告", 404)
         path = self._ensure_pdf(spec)
-        return {"name": "report.pdf", "type": "application/pdf", "size": path.stat().st_size}, path
+        return {"name": "report.pdf", "type": "application/pdf", "size": path.stat().st_size,
+                "sha256": spec["sha256"], "updated": spec["updated"]}, path
+
+    def public_report_path(self, public_id, kind):
+        return self._report_download(self._public_report_record(public_id), kind)
+
+    def approved_report_path(self, public_id, kind):
+        """Partner file URL. Missing, unapproved, and revoked reports are the same 404."""
+        try:
+            spec = self._public_report_record(public_id, require_approved=True)
+        except AuthError:
+            raise AuthError("没有这个公开报告", 404)
+        if kind not in ("markdown", "pdf"):
+            raise AuthError("没有这个公开报告", 404)
+        try:
+            return self._report_download(spec, kind)
+        except AuthError as exc:
+            if exc.status == 503:
+                raise
+            raise AuthError("没有这个公开报告", 404) from exc
 
 
 def _report_clock(value):

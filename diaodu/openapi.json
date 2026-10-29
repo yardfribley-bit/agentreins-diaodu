@@ -2615,6 +2615,77 @@
           }
         }
       }
+    },
+    "/public/reports.json": {
+      "get": {
+        "summary": "合作方拉取源。只含创建者已批准的团队最终报告。无需凭证。撤回后条目消失。",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "reports[]：id（C-t 公开编号）、title、summary（可省略）、created_at、updated_at、pdf_url、md_url、conversation_url、sha256（Markdown UTF-8）、public_approved_at。另有 updated_at 表示这份 feed 的变更时间。ETag 与 Last-Modified。"
+          },
+          "304": {
+            "description": "If-None-Match 或 If-Modified-Since 命中"
+          }
+        }
+      }
+    },
+    "/public/reports/{public_id}/report.md": {
+      "get": {
+        "summary": "已批准报告的 Markdown。未批准或已撤回为 404。无需凭证。",
+        "security": [],
+        "parameters": [
+          {
+            "name": "public_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {"description": "text/markdown。ETag 为文件字节的 sha256"},
+          "404": {"description": "没有这个公开报告"}
+        }
+      }
+    },
+    "/public/reports/{public_id}/report.pdf": {
+      "get": {
+        "summary": "已批准报告的 PDF。未批准或已撤回为 404。无需凭证。",
+        "security": [],
+        "parameters": [
+          {
+            "name": "public_id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {"description": "application/pdf"},
+          "404": {"description": "没有这个公开报告"},
+          "503": {"description": "PDF 排版引擎暂不可用"}
+        }
+      }
+    },
+    "/relay/teams/{session}/report/publication": {
+      "post": {
+        "summary": "仅团队创建者。批准或撤回当前最终报告。session 可为 tm_ 会话 id 或 C-t 公开编号。正文 {approved, title?, summary?}。工具名 diaodu_relay_team_report_publish。",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {"description": "publication.public_approved_at 与 session"},
+          "400": {"description": "正文含令牌、内部编号或邀请链接"},
+          "401": {"description": "需要创建者凭证"},
+          "403": {"description": "不是创建者"},
+          "404": {"description": "没有报告或无权访问该会话"}
+        }
+      }
     }
   },
   "components": {

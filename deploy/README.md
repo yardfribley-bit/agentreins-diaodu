@@ -46,6 +46,8 @@ pip install weasyprint
 
 没有中文字体时，正文会变成方框。没有 Chromium 也没有 WeasyPrint 时，`report.md` 仍返回 200，`report.pdf` 返回 503。Nginx 现有的 `/task/` 反代就能转到这两个地址，不必再加 location。响应不带 `exp` 或 `sig`。
 
+合作方拉取源同样走现有的 `/task/` 反代，不必改 Nginx：`https://www.chuhaijian.com/task/v1/public/reports.json`。只有创建者批准的团队最终报告才会出现。批准与撤回见 `docs/relay-work.md`。未批准或已撤回的 `/v1/public/reports/<public_id>/report.md` 与 `report.pdf` 返回 404。对话页原来的报告地址不变。
+
 ## 设计 MCP 代理
 
 生产上的 design-mcp 仍由 systemd 单元 `design-mcp` 监听 `127.0.0.1:18790`，Streamable HTTP 路径 `/mcp/design/`。代理做在 diaodu 进程里，这次不要改 Nginx：现有 `location /task/` 已经把 `https://www.chuhaijian.com/task/v1/mcp/design/` 转到本服务的 `/v1/mcp/design/`。

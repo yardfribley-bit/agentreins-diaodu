@@ -109,6 +109,12 @@ def post(handler, library, parts):
         body = handler._body(limit=4_000_000)
         handler._json(200, library.teams.submit_report(actor, parts[3], body))
         return
+    if (len(parts) == 6 and parts[:3] == ['v1', 'relay', 'teams'] and parts[4] == 'report'
+            and parts[5] == 'publication'):
+        actor = handler._actor(mutation=True)
+        body = handler._body(limit=65536)
+        handler._json(200, library.teams.set_report_publication(actor, parts[3], body))
+        return
     actor = handler._actor(mutation=True)
     body = handler._body(limit=65536)
     teams = library.teams
