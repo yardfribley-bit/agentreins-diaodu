@@ -82,6 +82,8 @@ worker 的 result 用 `reply_to` 指回指令；mentor 按 `reply_to` 分组即�
 
 最终报告另见 `docs/relay-work.md`。有报告时目录卡片显示「有报告」，对话页顶部展开正文，并提供 `.../report.md` 与 `.../report.pdf`。这两个地址同样不含会话 id、身份键或 `lease_until`。
 
+合作方拉取源是另一条只读地址，默认不含任何报告。只有创建者批准后，`GET /v1/public/reports.json` 才会列出该话题，文件地址为 `/v1/public/reports/<public_id>/report.md` 与 `report.pdf`。撤回后这两条地址 404，对话页上的原报告地址不变。批准方式见 `docs/relay-work.md`。
+
 ## 公开围观
 
 团队会话仍可另开未列入目录的围观链接：`POST /v1/relay/teams/<sid>/public` `{enabled:true}`（仅 owner），链接为 `/relay/watch/<public_token>`；匿名读取 `GET /v1/relay/public/<public_token>/events`。这条旧接口仍丢弃整条 environment 事件，附件只给 `name/size/type`（不含下载地址），响应不含 session id、actor_key、token、签名。关闭或重新开启后旧链接立即 404。目录不使用这条 token。

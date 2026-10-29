@@ -24,6 +24,7 @@ TOOLS = [
     ('relay_team_task_update', '认领者、领导者或创建者更新进度、状态或说明。done 会把进度记为 100（除非另行给出）。只改 progress 时写入任务板，不往工作流追加事件。', {'session': S, 'task_id': S, 'progress': {'type': 'integer', 'minimum': 0, 'maximum': 100}, 'status': {'type': 'string', 'enum': ['open', 'in_progress', 'done']}, 'detail': S}, ['session', 'task_id']),
     ('relay_team_report', '提交团队最终报告（Markdown），存成附件。现任领导者、创建者或指导端可提交。markdown 整篇替换，append 原样追加，二者择一。单次与累计最多 40 万字。可带 task_id 挂到父任务。公开页同时提供 report.md 与 report.pdf。', {'session': S, 'request_id': S, 'title': S, 'markdown': S, 'append': S, 'task_id': S, 'mode': {'type': 'string', 'enum': ['replace', 'append']}}, ['session', 'request_id']),
     ('relay_team_report_read', '读取当前最终报告的 Markdown 全文，供智能体继续使用。不含身份键、邀请码或租约。', {'session': S}, ['session']),
+    ('relay_team_report_publish', '仅创建者：批准或撤回当前最终报告进入合作方拉取源。默认不公开。session 可以是团队会话 id，也可以是公开编号 C-t…。approved=true 写入 public_approved_at；false 撤回，合作方文件地址立即 404，条目从 feed 消失。可选 title、summary 只用于公开 feed。新修订不会继承批准。令牌、内部编号和邀请链接会被拒绝。邮箱只告警，因为行业报告可能写出公开联系方式；批准前创建者必须自己看过正文。', {'session': S, 'approved': {'type': 'boolean'}, 'title': S, 'summary': S}, ['session', 'approved']),
     ('relay_team_ack', '确认已接收至指定全局 seq（不等于执行完成）。', {'session': S, 'seq': {'type': 'integer', 'minimum': 0}}, ['session', 'seq']),
     ('relay_team_heartbeat', '刷新在线状态；执行端可更新系统环境。', {'session': S, 'environment': ENV}, ['session']),
     ('relay_team_state', '仅创建者：暂停、继续或结束团队会话。', {'session': S, 'status': {'type': 'string', 'enum': ['active', 'paused', 'closed']}}, ['session', 'status']),
@@ -89,6 +90,8 @@ def call(name, args, actor, teams, identity, client_ip=None):
         return teams.submit_report(actor, sid, body)
     if name == 'relay_team_report_read':
         return teams.read_report(actor, sid)
+    if name == 'relay_team_report_publish':
+        return teams.set_report_publication(actor, sid, body)
     if name == 'relay_team_invite':
         return teams.invite(actor, sid, body)
     if name == 'relay_team_invites':

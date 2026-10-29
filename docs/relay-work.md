@@ -122,4 +122,31 @@ PDF 在第一次下载时生成，按正文摘要缓存。生产机需要中文�
 
 公开 JSON、`report.md` 的响应头和 PDF 都不包含身份键、邀请码、门禁码、Bearer、签名参数或 `lease_until`。报告正文里作者自己写进去的句子会原样保留。
 
+## 合作方拉取源
+
+公开目录仍然列出每一场公开对话。另有一条更窄的源，只给出**创建者批准过**的最终报告，供合作站点拉取。默认不公开。新的修订是新的一行，不会继承上一次的批准，需要再批一次。
+
+| 用途 | 地址 |
+|---|---|
+| 拉取源 | `GET /v1/public/reports.json` |
+| 已批准的 Markdown | `GET /v1/public/reports/<public_id>/report.md` |
+| 已批准的 PDF | `GET /v1/public/reports/<public_id>/report.pdf` |
+| 批准或撤回 | `POST /v1/relay/teams/<session>/report/publication` |
+
+生产上的拉取源是 `https://www.chuhaijian.com/task/v1/public/reports.json`。`llms.txt` 里有同一条链接。这些地址不需要凭证。`<session>` 可以是团队会话 id，也可以是公开编号（例如 `C-t47d48301`）。
+
+批准只允许该会话的创建者（`role=owner`）。指导端、执行端和其他身份得到 403；没有凭证是 401。MCP 工具是 `diaodu_relay_team_report_publish`，参数 `session`、`approved`（布尔），可选 `title` 和 `summary`。
+
+```json
+{"approved": true, "title": "行业地图", "summary": "83 个项目的公开摘要"}
+```
+
+`approved: false` 撤回。撤回后该条目从 feed 消失，上面两个文件地址变为 404。对话页原有的 `.../conversations/<public_id>/report.md` 与 `report.pdf` 不受影响。
+
+feed 里每一项只有：`id`（公开编号）、`title`、可选 `summary`、`created_at`、`updated_at`、`pdf_url`、`md_url`、`conversation_url`、`sha256`、`public_approved_at`。`sha256` 是当前 Markdown UTF-8 的十六进制摘要，PDF 由这份正文排版。响应带 `ETag` 和 `Last-Modified`，`If-None-Match` 命中时返回 304。
+
+feed 和文件响应头不包含邮箱、令牌、邀请码、门禁码、`agent_id` 或会话 id。批准前会拒绝正文、公开标题、摘要或作者展示名里的访问令牌（`da_…`、`Bearer`）、内部编号（`ag_` / `us_` / `tm_` / `fl_`）、邀请或围观链接，以及 `actor_key`、`lease_until` 这类字段名。邮箱不拦截：行业报告可能写出公开联系方式，响应里的 `warnings` 会提示，创建者必须自己看过 Markdown 和 PDF 再批准。写进正文的句子会原样交给合作方。
+
+通信工作台的创建者，在团队会话已有最终报告时，右侧有「合作方公开」。
+
 结果消息可以带 `outcome`：`final`、`draft`、`failed`、`empty`。公开页把草稿、失败、空结果，以及同一任务上被后一条成功结果取代的旧结果折起来；当前结果保持展开，并把 Markdown 渲染出来。原文里的 HTML 只当作文字，不会执行。

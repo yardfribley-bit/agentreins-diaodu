@@ -596,6 +596,9 @@ small { font-size: 12px; color: var(--muted); }
 .rail-head h2, .rail-section > h2 { min-width: 0; }
 .rail-head span, .rail-note { color: var(--muted); font-size: 13px; font-weight: 400; }
 .rail-note { margin-top: 4px; }
+.partner-fields { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.partner-fields label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 13px; font-weight: 400; }
+.partner-fields input, .partner-fields textarea { font-size: 14px; }
 .rail-actions, .danger-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
 .rail-actions button, .danger-list button { width: 100%; text-align: left; font-size: 14px; }
 .danger-zone { background: #fdf7f6; }

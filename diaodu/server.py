@@ -287,6 +287,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if design_mcp.is_design_path(parsed.path):
                     design_mcp.handle(self, 'HEAD' if getattr(self, '_head_only', False) else 'GET')
                     return
+                if parsed.path == '/v1/public/reports.json' or parsed.path.startswith('/v1/public/reports/'):
+                    from diaodu import report_public_http
+                    report_public_http.get(self, library, parsed)
+                    return
                 if parsed.path == '/v1/relay/teams' or parsed.path.startswith('/v1/relay/teams/'):
                     from diaodu import relay_teams_http
                     relay_teams_http.get(self, library, parsed)

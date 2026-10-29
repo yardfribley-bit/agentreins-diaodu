@@ -7,8 +7,8 @@
   <title>通信工作台 · AgentReins Hub</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="../tokens.css?v=20261028-relayfix">
-  <link rel="stylesheet" href="./relay.css?v=20261028-relayfix">
-  <script src="./relay.js?v=20261028-relayfix" defer></script>
+  <link rel="stylesheet" href="./relay.css?v=20261029-publication">
+  <script src="./relay.js?v=20261029-publication" defer></script>
 </head>
 <body class="relay-page" data-panel="sessions">
   <header class="site-header">
@@ -174,6 +174,20 @@
           <span>与消息同一份数据</span>
         </div>
         <div id="task-board-list"></div>
+      </section>
+
+      <section class="rail-section" id="partner-publication" hidden aria-labelledby="partner-title">
+        <h2 id="partner-title">合作方公开</h2>
+        <p class="rail-note" id="partner-status">默认不公开。只有创建者批准后，当前最终报告才会进入合作方拉取源。</p>
+        <div class="partner-fields">
+          <label for="partner-title-input">公开标题<input id="partner-title-input" maxlength="160" autocomplete="off" placeholder="留空则使用报告标题"></label>
+          <label for="partner-summary-input">公开摘要<textarea id="partner-summary-input" maxlength="600" rows="3" placeholder="留空则 feed 不带摘要"></textarea></label>
+        </div>
+        <p class="rail-note" id="partner-warning" hidden></p>
+        <div class="rail-actions">
+          <button type="button" class="primary" id="partner-approve">批准公开</button>
+          <button type="button" id="partner-revoke" hidden>撤回公开</button>
+        </div>
       </section>
 
       <section class="rail-section" aria-labelledby="invite-title">

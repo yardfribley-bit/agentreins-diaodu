@@ -22,6 +22,7 @@
   let retryTimer = null, heartbeatAt = 0, replyTo = null, outgoing = null, mutationBusy = false;
   let sending = false, createBusy = false, joinBusy = false, uploading = false, stopped = false, confirmTask = null, unread = 0;
   let pendingFiles = [], joinLookup = null, joinTimer = null;
+  let partnerKey = '', partnerWarning = {id: '', text: ''};
   const events = new Map();
   const PUBLIC_ID = /^C-[pt][0-9a-f]{8}$/;
   const WORK_KINDS = new Set(['joined', 'revoked', 'state', 'task', 'report']);
@@ -756,7 +757,60 @@
     $('state-banner').hidden = current.status === 'active';
     $('state-banner').className = 'state-banner ' + current.status;
     $('state-banner').textContent = current.status === 'closed' ? '会话已结束。历史记录仍可阅读，不再接受新消息或新成员。' : '新的指令已暂停，仍可发送进度、结果与备注。暂停不会强制停止远端已经启动的操作。';
-    renderPeers(); renderComposer(); renderTeamSummary(); renderTaskBoard(); renderConnectionFacts();
+    renderPeers(); renderComposer(); renderTeamSummary(); renderTaskBoard(); renderConnectionFacts(); renderPublication();
+  }
+  function renderPublication() {
+    const box = $('partner-publication');
+    if (!box) return;
+    const report = isTeam() && owner() ? current.report : null;
+    box.hidden = !report;
+    if (!report) return;
+    const pub = report.publication || {};
+    const approved = !!pub.approved;
+    $('partner-status').textContent = approved
+      ? '已批准公开。撤回后合作方文件地址立即失效，条目从拉取源消失。改过正文后需要重新批准。'
+      : '尚未公开。批准前请通读报告。令牌、邀请链接和内部编号会被拒绝；邮箱若写在正文里会随文件公开。';
+    $('partner-approve').textContent = approved ? '更新公开说明' : '批准公开';
+    $('partner-approve').disabled = mutationBusy;
+    $('partner-revoke').hidden = !approved;
+    $('partner-revoke').disabled = mutationBusy;
+    const titleInput = $('partner-title-input');
+    const summaryInput = $('partner-summary-input');
+    titleInput.disabled = mutationBusy;
+    summaryInput.disabled = mutationBusy;
+    const key = [current.id, text(report.id), text(pub.public_approved_at), text(pub.title), text(pub.summary)].join('\n');
+    const editing = document.activeElement === titleInput || document.activeElement === summaryInput;
+    if (key !== partnerKey && !editing) {
+      partnerKey = key;
+      titleInput.value = text(pub.title);
+      summaryInput.value = text(pub.summary);
+    }
+    const warn = partnerWarning.id === current.id ? partnerWarning.text : '';
+    $('partner-warning').hidden = !warn;
+    $('partner-warning').textContent = warn;
+  }
+  async function publishReport(approved) {
+    if (!owner() || !isTeam() || !current?.report || mutationBusy) return;
+    const id = current.id;
+    mutationBusy = true; renderCurrent();
+    try {
+      const value = await api(sessionPath(id, 'report/publication'), {
+        approved: approved,
+        title: $('partner-title-input').value,
+        summary: $('partner-summary-input').value
+      });
+      const warnings = array(value.publication && value.publication.warnings);
+      partnerWarning = {id: id, text: warnings.join(' ')};
+      partnerKey = '';
+      if (value.session) upsertSession(value.session, 'team');
+      notify(approved ? (warnings.length ? '已批准公开。请先看提示。' : '已批准公开，合作方拉取源会收录这份报告。') : '已撤回公开。合作方文件地址立即失效。');
+    } catch (error) {
+      partnerWarning = {id: id, text: ''};
+      notify(error.message, true);
+    } finally {
+      mutationBusy = false;
+      renderCurrent();
+    }
   }
   function ackRoster() {
     if (!current) return [];
@@ -1503,6 +1557,8 @@
   $('message-text').addEventListener('keydown',event => {if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && !event.isComposing) {event.preventDefault(); $('message-form').requestSubmit();}});
   $('cancel-reply').addEventListener('click',() => {replyTo = null; renderComposer();});
   $('toggle-state').addEventListener('click',() => changeState(current?.status === 'paused' ? 'active' : 'paused'));
+  $('partner-approve').addEventListener('click', () => publishReport(true));
+  $('partner-revoke').addEventListener('click', () => publishReport(false));
   $('toggle-public').addEventListener('click', async () => {
     if (!owner() || !current || mutationBusy) return;
     const id = current.id, enable = !current.public_read;
