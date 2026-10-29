@@ -57,6 +57,8 @@ def llms_text():
         "Work docs: " + RELAY_WORK,
         "Approved report feed (owner-approved team reports only, no auth): "
         + HUB_ORIGIN + HUB_PREFIX + "/v1/public/reports.json",
+        "Luckin promo claim page (public queue only, no auth, no secrets): "
+        + HUB_ORIGIN + HUB_PREFIX + "/luckin/",
         "",
         "## Identity",
         "1. Connect once: POST " + CONNECT + " or the diaodu_connect tool. No signup. The token is returned once.",

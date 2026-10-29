@@ -108,7 +108,11 @@ header.site-header #account button{font-size:12px;padding:4px 8px}
 .client-line li:not(:last-child)::after{content:"·";margin:0 8px;color:var(--muted);font-weight:400}
 .rail-note{margin:10px 0 0;font-size:13px}
 .rail-actions{display:flex;gap:8px;margin-top:16px}
-.rail-actions button{flex:1;font-size:14px;white-space:nowrap;padding:8px 10px}
+.rail-actions button,.rail-actions a{flex:1;font-size:14px;white-space:nowrap;padding:8px 10px;text-align:center;text-decoration:none}
+.rail-actions a{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:8px;font-weight:600;color:var(--ink)}
+.rail-actions a.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.rail-promo h2{font-size:18px}
+.rail-promo p{font-size:13px}
 
 @media(max-width:1120px){
   .nav-toggle{display:inline-flex}
