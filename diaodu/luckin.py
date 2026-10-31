@@ -1,14 +1,14 @@
-"""Luckin promo. A claim places the cup through the media order webhook.
+"""Luckin promo. The live menu is whatever a coupon can fully cover.
 
 Hub does not store Luckin account tokens or coupon codes, and it does not
-speak the Luckin API. The order webhook (media's allowlisted worker) runs
-preview then createOrder. Hub tries the coupon pay path first and, only when
-that reply is ``no_coupon``, tries balance. A pickup code marks the claim
-ready. A definite failure writes the reason and frees the day's cup. Chat
-confirmation is not part of this path.
+speak the Luckin API. A private media service holds the Luckin account. Hub
+asks that service for the drinks it can order with needPay false, then places
+one of those drinks. The reply is a pickup code and/or a pickup QR. needPay
+or any error fails the claim and frees the day's cup. There is no chat
+confirmation and no agent-type whitelist on this path.
 
-Contacts are stored sealed. Public JSON only gets a mask. Coupon codes that
-arrive on a webhook reply are dropped and never stored.
+Contacts are stored sealed. Public JSON only gets a mask. Coupon codes and
+payment QR links that arrive on a webhook reply are dropped and never stored.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import urllib.request
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -45,12 +45,16 @@ LABELS = {
     "cancelled": "已取消，今日名额已释放",
 }
 PAY_COUPON = "coupon"
-PAY_BALANCE = "balance"
-PAY_POLICY = "coupon_then_balance"
-NO_COUPON = "no_coupon"
+PAY_POLICY = "coupon_only"
+NO_COUPONS = "现在没有可用的券，暂时不能请客。"
+MENU_TTL = 60.0
+MENU_TIMEOUT = 8
+ORDER_TIMEOUT = 20
+SIGNATURE_SKEW = 300
 
-# Chinese names are what the page shows. product_id / sku are for the media
-# team only; v1 has a confirmed sku for the default drink.
+# Known product ids are a mapping helper only. A drink is offered when the
+# live menu lists it, never because it appears here. americano matches the
+# product id already used on the media account.
 DRINKS = {
     "coconut_latte": {
         "name": "生椰拿铁",
@@ -58,28 +62,28 @@ DRINKS = {
         "sku": "SP2077-01134",
         "spec": "大杯/冰/意式拼配/默认浓度/不另外加糖/无奶油",
     },
+    "americano": {
+        "name": "标准美式",
+        "product_id": "2500",
+        "sku": "SP2277-03135",
+        "spec": "大杯/冰",
+    },
     "latte": {"name": "普通拿铁", "product_id": "", "sku": "", "spec": ""},
     "butter_latte": {"name": "小黄油拿铁", "product_id": "", "sku": "", "spec": ""},
     "butter_americano": {"name": "小黄油美式", "product_id": "", "sku": "", "spec": ""},
     "ethiopia_americano": {"name": "埃塞金烘美式", "product_id": "", "sku": "", "spec": ""},
     "lemon_tea": {"name": "手打鲜切柠檬茶", "product_id": "", "sku": "", "spec": ""},
 }
-DEFAULT_DRINK = "coconut_latte"
 
-# MCP claims are limited to these self-reported coding agents. Match is
-# case-insensitive. Empty, 访客, 人员, and 未确认 mean the profile was never
-# set — ask the caller to fix it. Do not invent a type inside the claim call.
-CODING_AGENT_ALLOWLIST = ("Codex", "Claude", "Claude Code", "Cursor", "Grok")
-_UNSET_AGENT_TYPES = frozenset({"访客", "人员", "工具未确认", "未确认", "unknown", "none", "n/a", "na"})
-_CODING_AGENT_PHRASES = ("claude code", "codex", "claude", "cursor", "grok")
-_CODING_AGENT_JOINED = ("claudecode", "cursoragent", "cursorcloudagent")
-
-CLAIM_FIELDS = {"phone", "email", "city", "shopName", "locationNote", "lat", "lng", "drink", "consent"}
+CLAIM_FIELDS = {
+    "phone", "email", "city", "shopName", "locationNote", "lat", "lng",
+    "drink", "drink_id", "drinkId", "consent",
+}
 # Fields the media worker needs to call Luckin previewOrder / createOrder.
 # No phone, email, coupon code, or Luckin token. resultUrl is the guest's
 # short link; the worker must keep that endpoint private.
 ORDER_FIELDS = {
-    "action", "payWith", "payPolicy", "claimId", "resultUrl", "contactMasked",
+    "action", "payWith", "payPolicy", "needPay", "claimId", "resultUrl", "contactMasked",
     "city", "shopName", "locationNote", "latitude", "longitude",
     "drink", "drinkId", "productId", "skuCode", "amount", "spec",
     "productList", "createdAt",
@@ -107,62 +111,52 @@ def order_webhook_url():
     ).strip()
 
 
+def webhook_secret():
+    return os.environ.get("LUCKIN_WEBHOOK_SECRET", "").strip()
+
+
+def menu_webhook_url():
+    """Menu endpoint. An explicit URL wins; otherwise it is the order URL's sibling /menu."""
+    explicit = os.environ.get("LUCKIN_MENU_WEBHOOK_URL", "").strip()
+    if explicit:
+        return explicit
+    return sibling_menu_url(order_webhook_url())
+
+
+def sibling_menu_url(order_url):
+    parsed = urlparse(order_url or "")
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    path = parsed.path or ""
+    if path.endswith("/"):
+        path = path[:-1]
+    parent, slash, _last = path.rpartition("/")
+    menu_path = (parent + "/menu") if slash else "/menu"
+    return urlunparse((parsed.scheme, parsed.netloc, menu_path, "", "", ""))
+
+
+def sign_webhook(secret, timestamp, body):
+    """HMAC-SHA256 over ``timestamp + '.' + raw body``. ``body`` is the exact POST bytes."""
+    message = str(int(timestamp)).encode("ascii") + b"." + body
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def webhook_headers(body, secret, timestamp):
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": "agentreins-hub-luckin",
+    }
+    if secret:
+        headers["X-Luckin-Timestamp"] = str(int(timestamp))
+        headers["X-Luckin-Signature"] = sign_webhook(secret, timestamp, body)
+    return headers
+
+
 def is_fulfiller(actor):
     if not actor or actor.get("kind") != "agent":
         return False
     agent_id = actor.get("agent_id") or ""
     return bool(agent_id) and agent_id in fulfiller_ids()
-
-
-def _agent_type_text(agent_type):
-    if not isinstance(agent_type, str):
-        return ""
-    text = agent_type.strip().casefold().replace("－", "-").replace("—", "-")
-    text = re.sub(r"[-_/]+", " ", text)
-    return " ".join(text.split())
-
-
-def coding_agent_status(agent_type):
-    """Return ok, unset, or denied for a profile agent_type.
-
-    A type matches the allowlist when a known phrase appears as whole words
-    after casefolding and treating hyphens, underscores, and slashes as spaces.
-    Digits may follow the name (Grok 4, grok-4). Joined spellings ClaudeCode
-    and CursorAgent match as well. The claim arguments cannot supply this value.
-    """
-    spaced = _agent_type_text(agent_type)
-    if not spaced or spaced in _UNSET_AGENT_TYPES:
-        return "unset"
-    for phrase in _CODING_AGENT_PHRASES:
-        if re.search(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z])", spaced):
-            return "ok"
-    squashed = spaced.replace(" ", "")
-    if any(token in squashed for token in _CODING_AGENT_JOINED):
-        return "ok"
-    return "denied"
-
-
-def coding_agent_error(agent_type):
-    """LuckinError when this profile may not open an MCP claim, else None."""
-    status = coding_agent_status(agent_type)
-    if status == "ok":
-        return None
-    names = "、".join(CODING_AGENT_ALLOWLIST)
-    if status == "unset":
-        return LuckinError(
-            "资料里的 agent_type 还没填写。请用 POST /v1/me/profile 或 diaodu_connect "
-            "写成实际工具（" + names + "，大小写不限）。"
-            "不要在 diaodu_luckin_claim 的参数里临时编一个类型。",
-            403,
-            code="agent_type_required",
-        )
-    return LuckinError(
-        "瑞幸 MCP 领取只对编程助手开放，允许的 agent_type：" + names
-        + "（大小写不限，可以写成 Claude Code、claude-code、Cursor Agent、Grok 4）。"
-        "请用 POST /v1/me/profile 把资料改成实际工具。",
-        403,
-        code="agent_type_not_allowed",
-    )
 
 
 def normalize_phone(value):
@@ -248,8 +242,11 @@ class Luckin:
         self.claim_person_limit = 8
         self.read_ip_limit = 120
         self.rate_window = 600.0
+        self.menu_ttl = MENU_TTL
         self._hits = {}
         self._lock = threading.Lock()
+        self._menu_lock = threading.Lock()
+        self._menu_cache = None
         self._key = None
         with self._connect() as db:
             db.executescript(
@@ -301,6 +298,10 @@ class Luckin:
         columns = {row[1] for row in db.execute("PRAGMA table_info(claims)")}
         if "agent_id" not in columns:
             db.execute("ALTER TABLE claims ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''")
+        if "qr_url" not in columns:
+            db.execute("ALTER TABLE claims ADD COLUMN qr_url TEXT NOT NULL DEFAULT ''")
+        if "qr_data" not in columns:
+            db.execute("ALTER TABLE claims ADD COLUMN qr_data TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def _connect(self):
@@ -358,6 +359,42 @@ class Luckin:
             "remaining": max(0, DAILY_LIMIT - used),
         }
 
+    def forget_menu(self):
+        with self._menu_lock:
+            self._menu_cache = None
+
+    def menu(self):
+        """Drinks the account can order with a coupon. Empty when the service is down."""
+        now = time.monotonic()
+        with self._menu_lock:
+            cached = self._menu_cache
+            if cached is not None and cached[0] > now:
+                return [dict(item) for item in cached[1]]
+            drinks = self._load_menu()
+            self._menu_cache = (now + self.menu_ttl, drinks)
+            return [dict(item) for item in drinks]
+
+    def menu_public(self):
+        return [_public_drink(item) for item in self.menu()]
+
+    def offer(self):
+        """What an agent can be treated to right now, plus today's remaining cups."""
+        try:
+            drinks = self.menu_public()
+        except Exception:
+            drinks = []
+            print("luckin menu offer failed", file=sys.stderr)
+        quota = self.quota()
+        return {
+            "drinks": drinks,
+            "remaining": quota["remaining"],
+            "limit": quota["limit"],
+            "perPerson": quota["perPerson"],
+            "day": quota["day"],
+            "timezone": quota["timezone"],
+            "message": offer_message(drinks, quota["remaining"]),
+        }
+
     def create(self, body, origin, *, agent_id=""):
         if not isinstance(body, dict):
             raise LuckinError("请求不正确")
@@ -392,10 +429,16 @@ class Luckin:
         else:
             lat_v = _coord(lat, "纬度", -90, 90)
             lng_v = _coord(lng, "经度", -180, 180)
-        drink_id = body.get("drink") or DEFAULT_DRINK
-        if not isinstance(drink_id, str) or drink_id not in DRINKS:
-            raise LuckinError("请选择列出的饮品")
-        drink = DRINKS[drink_id]
+        drink_id = body.get("drink_id") or body.get("drinkId") or body.get("drink") or ""
+        if not isinstance(drink_id, str) or not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", drink_id.strip()):
+            raise LuckinError("请从当前可请清单里选择饮品", code="drink_unavailable")
+        drink_id = drink_id.strip()
+        drinks = self.menu()
+        if not drinks:
+            raise LuckinError(NO_COUPONS, 409, code="no_coupons")
+        drink = next((item for item in drinks if item["id"] == drink_id), None)
+        if drink is None:
+            raise LuckinError("这款饮品不在当前可请清单里。", 400, code="drink_unavailable")
         if agent_id is None:
             agent_id = ""
         if not isinstance(agent_id, str) or (agent_id and not re.fullmatch(r"ag_[0-9a-f]{24}", agent_id)):
@@ -413,12 +456,6 @@ class Luckin:
                 raise LuckinError("今日两杯已送完，请明天再来。", 409, code="quota_full")
             if self._count(db, day, person) >= PERSON_LIMIT:
                 raise LuckinError("今天已经领过一杯，请明天再来。", 409, code="already_claimed")
-            if not drink["product_id"] or not drink["sku"]:
-                raise LuckinError(
-                    "这款饮品还不能自动下单，请改选生椰拿铁。",
-                    400,
-                    code="drink_unavailable",
-                )
             sealed = self._seal(contact)
             db.execute(
                 """INSERT INTO claims (
@@ -430,7 +467,7 @@ class Luckin:
                 (
                     claim_id, person, kind, masked, sealed,
                     city, shop, note, lat_v, lng_v,
-                    drink_id, drink["name"], drink["product_id"], drink["sku"], drink["spec"],
+                    drink_id, drink["name"], drink.get("product_id") or "", drink.get("sku") or "", drink.get("spec") or "",
                     "ordering", day, now, now, token_hash, agent_id,
                 ),
             )
@@ -536,17 +573,24 @@ class Luckin:
             raise LuckinError("请求不正确")
         allowed = {
             "orderId", "order_id", "pickupCode", "pickup_code",
-            "shopName", "shop_name", "readyHint", "ready_hint", "rawNote", "raw_note",
+            "shopName", "shop_name", "storeName", "store_name",
+            "readyHint", "ready_hint", "rawNote", "raw_note",
+            "qrUrl", "qr_url", "qrData", "qr_data",
         }
         extra = sorted(set(body) - allowed)
         if extra:
             raise LuckinError("不支持这些字段：" + "、".join(extra))
         order_id = _clean(_first(body, "orderId", "order_id"), "订单号", 64)
         pickup = _clean(_first(body, "pickupCode", "pickup_code"), "取餐码", 64)
-        shop = _clean(_first(body, "shopName", "shop_name", default=""), "门店", 80, required=False)
+        shop = _clean(
+            _first(body, "storeName", "store_name", "shopName", "shop_name", default=""),
+            "门店", 80, required=False,
+        )
         hint = _clean(_first(body, "readyHint", "ready_hint", default=""), "取餐提示", 200, required=False)
         raw = _clean(_first(body, "rawNote", "raw_note", default=""), "履约备注", 2000, required=False)
-        return self._mark_ready(claim_id, order_id, pickup, shop, hint, raw)
+        qr_url = _pickup_qr_url(_first(body, "qrUrl", "qr_url", default="") or "")
+        qr_data = _pickup_qr_data(_first(body, "qrData", "qr_data", default="") or "")
+        return self._mark_ready(claim_id, order_id, pickup, shop, hint, raw, qr_url=qr_url, qr_data=qr_data)
 
     def fail(self, claim_id, reason):
         text = _clean(reason, "失败原因", 500)
@@ -644,6 +688,7 @@ class Luckin:
             "drink": row["drink_name"],
             "city": self._hide(row["city"], contact, masked),
             "shopName": shop,
+            "storeName": shop,
             "contactMasked": masked,
             "day": row["day"],
             "createdAt": iso_shanghai(row["created"]),
@@ -652,7 +697,14 @@ class Luckin:
         if note:
             shown["locationNote"] = note
         if row["status"] == "ready":
-            shown["pickupCode"] = row["pickup_code"]
+            if row["pickup_code"]:
+                shown["pickupCode"] = row["pickup_code"]
+            qr_url = row["qr_url"] if "qr_url" in row.keys() else ""
+            qr_data = row["qr_data"] if "qr_data" in row.keys() else ""
+            if qr_url:
+                shown["qrUrl"] = qr_url
+            if qr_data:
+                shown["qrData"] = qr_data
             shown["orderTime"] = iso_shanghai(row["ready_at"])
             if row["ready_hint"]:
                 shown["readyHint"] = row["ready_hint"]
@@ -688,6 +740,8 @@ class Luckin:
             "failReason": row["fail_reason"],
             "orderId": row["order_id"],
             "pickupCode": row["pickup_code"],
+            "qrUrl": row["qr_url"] if "qr_url" in row.keys() else "",
+            "storeName": row["fulfill_shop"] or row["shop_name"],
             "fulfillShop": row["fulfill_shop"],
             "readyHint": row["ready_hint"],
             "orderTime": iso_shanghai(row["ready_at"]),
@@ -696,10 +750,12 @@ class Luckin:
             shown["rawNote"] = row["raw_note"]
         return shown
 
-    def _mark_ready(self, claim_id, order_id, pickup, shop, hint, raw, staff_note=""):
+    def _mark_ready(self, claim_id, order_id, pickup, shop, hint, raw, staff_note="", qr_url="", qr_data=""):
         note = ""
         if staff_note:
             note = _clean(staff_note, "备注", 200, required=False)
+        if not pickup and not qr_url and not qr_data:
+            raise LuckinError("缺少取餐码", code="api")
         with self._txn() as db:
             row = self._locked(db, claim_id)
             if row["status"] == "ready":
@@ -711,10 +767,10 @@ class Luckin:
             now = self.clock()
             db.execute(
                 """UPDATE claims SET status='ready', order_id=?, pickup_code=?, fulfill_shop=?,
-                   ready_hint=?, raw_note=?, ready_at=?, updated=?,
+                   ready_hint=?, raw_note=?, qr_url=?, qr_data=?, ready_at=?, updated=?,
                    staff_note=CASE WHEN ?!='' THEN ? ELSE staff_note END
                    WHERE id=?""",
-                (order_id, pickup, shop, hint, raw, now, now, note, note, claim_id),
+                (order_id, pickup, shop, hint, raw, qr_url, qr_data, now, now, note, note, claim_id),
             )
             row = dict(db.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone())
         return self._fulfiller(row)
@@ -728,41 +784,45 @@ class Luckin:
             return
         contact = self._open(row["contact_sealed"])
         masked = row["contact_masked"]
-        for pay_with in (PAY_COUPON, PAY_BALANCE):
-            try:
-                payload = self._order_payload(row, token, origin, contact, pay_with)
-            except LuckinError:
-                self._fail_quietly(claim_id, "自动下单参数不正确", contact, masked)
-                return
-            result = self._exchange(payload)
-            if result.get("code") == NO_COUPON and pay_with == PAY_COUPON and not result.get("pickupCode"):
-                continue
-            if result.get("accepted") and not result.get("pickupCode"):
-                return
-            if result.get("ok") and result.get("orderId") and result.get("pickupCode"):
-                self._ready_quietly(claim_id, result, pay_with, contact, masked)
-                return
-            if result.get("ok") and result.get("orderId"):
-                return
-            reason = result.get("reason") or _FAIL_TEXT.get(result.get("code") or "", "自动下单失败")
-            if pay_with == PAY_BALANCE and result.get("code") in (NO_COUPON, "no_balance", None) and not result.get("reason"):
-                reason = "没有可用券，余额也不足以支付"
+        try:
+            payload = self._order_payload(row, token, origin, contact)
+        except LuckinError:
+            self._fail_quietly(claim_id, "自动下单参数不正确", contact, masked)
+            return
+        result = self._exchange(payload)
+        if result.get("needPay") is True:
+            reason = result.get("failReason") or result.get("reason") or "这杯需要另外支付，不能下单。"
             self._fail_quietly(claim_id, reason, contact, masked)
             return
+        pickup = result.get("pickupCode") or ""
+        qr_url = result.get("qrUrl") or ""
+        qr_data = result.get("qrData") or ""
+        if result.get("accepted") and not pickup and not qr_url and not qr_data:
+            return
+        if result.get("ok") is not False and (pickup or qr_url or qr_data):
+            self._ready_quietly(claim_id, result, contact, masked)
+            return
+        if result.get("ok") and result.get("orderId"):
+            return
+        reason = result.get("failReason") or result.get("reason") or _FAIL_TEXT.get(result.get("code") or "", "自动下单失败")
+        self._fail_quietly(claim_id, reason, contact, masked)
 
-    def _ready_quietly(self, claim_id, result, pay_with, contact, masked):
-        paid = result.get("payWith") if result.get("payWith") in (PAY_COUPON, PAY_BALANCE) else pay_with
-        shop = result.get("shopName") or ""
-        hint = result.get("readyHint") or "请到店报取餐码"
+    def _ready_quietly(self, claim_id, result, contact, masked):
+        shop = result.get("storeName") or result.get("shopName") or ""
+        hint = result.get("readyHint") or "请到店出示取餐码或二维码"
+        order_id = result.get("orderId") or claim_id
+        pickup = result.get("pickupCode") or ""
         try:
             self._mark_ready(
                 claim_id,
-                _clean(self._safe_reason(result["orderId"], contact, masked), "订单号", 64),
-                _clean(self._safe_reason(result["pickupCode"], contact, masked), "取餐码", 64),
+                _clean(self._safe_reason(order_id, contact, masked), "订单号", 64),
+                _clean(self._safe_reason(pickup, contact, masked), "取餐码", 64, required=False) if pickup else "",
                 _clean(self._safe_reason(shop, contact, masked), "门店", 80, required=False) if shop else "",
                 _clean(self._safe_reason(hint, contact, masked), "取餐提示", 200, required=False),
                 "",
-                staff_note="auto:" + paid,
+                staff_note="auto:coupon",
+                qr_url=result.get("qrUrl") or "",
+                qr_data=result.get("qrData") or "",
             )
         except LuckinError:
             print("luckin auto ready failed claim=" + claim_id, file=sys.stderr)
@@ -774,13 +834,13 @@ class Luckin:
         except LuckinError:
             print("luckin auto fail failed claim=" + claim_id, file=sys.stderr)
 
-    def _order_payload(self, row, token, origin, contact, pay_with):
+    def _order_payload(self, row, token, origin, contact):
         masked = row["contact_masked"]
-        product_id = int(row["product_id"])
         payload = {
             "action": "place",
-            "payWith": pay_with,
+            "payWith": PAY_COUPON,
             "payPolicy": PAY_POLICY,
+            "needPay": False,
             "claimId": row["id"],
             "resultUrl": self.result_url(token, origin),
             "contactMasked": masked,
@@ -788,13 +848,20 @@ class Luckin:
             "shopName": self._hide(row["shop_name"], contact, masked),
             "drink": row["drink_name"],
             "drinkId": row["drink_id"],
-            "productId": product_id,
-            "skuCode": row["sku"],
             "amount": 1,
             "spec": row["drink_spec"],
-            "productList": [{"amount": 1, "productId": product_id, "skuCode": row["sku"]}],
             "createdAt": iso_shanghai(row["created"]),
         }
+        product_id = (row["product_id"] or "").strip()
+        sku = row["sku"] or ""
+        if product_id:
+            try:
+                product_value = int(product_id)
+            except ValueError:
+                product_value = product_id
+            payload["productId"] = product_value
+            payload["skuCode"] = sku
+            payload["productList"] = [{"amount": 1, "productId": product_value, "skuCode": sku}]
         note = self._hide(row["location_note"], contact, masked)
         if note:
             payload["locationNote"] = note
@@ -807,6 +874,23 @@ class Luckin:
             raise LuckinError("通知不能包含原始联系方式", 500, code="server_error")
         return payload
 
+    def _load_menu(self):
+        url = menu_webhook_url()
+        if not url:
+            if order_webhook_url() or os.environ.get("LUCKIN_MENU_WEBHOOK_URL", "").strip():
+                print("luckin menu skipped: unsupported scheme", file=sys.stderr)
+            return []
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            print("luckin menu skipped: unsupported scheme", file=sys.stderr)
+            return []
+        try:
+            raw = self._post(url, {"action": "menu"}, MENU_TIMEOUT)
+        except Exception:
+            print("luckin menu failed", file=sys.stderr)
+            return []
+        return _menu_drinks(raw)
+
     def _exchange(self, payload):
         url = order_webhook_url()
         if not url:
@@ -816,14 +900,16 @@ class Luckin:
             print("luckin webhook skipped: unsupported scheme", file=sys.stderr)
             return {"ok": False, "code": "not_configured", "reason": "自动下单地址不正确"}
         try:
-            if self.poster is not None:
-                raw = self.poster(url, payload)
-            else:
-                raw = _post_json(url, payload)
+            raw = self._post(url, payload, ORDER_TIMEOUT)
         except Exception:
             print("luckin webhook failed claim=" + str(payload.get("claimId", "")), file=sys.stderr)
             return {"ok": False, "code": "api", "reason": "自动下单通知失败"}
         return _order_response(raw)
+
+    def _post(self, url, payload, timeout):
+        if self.poster is not None:
+            return self.poster(url, payload)
+        return _post_json(url, payload, timeout=timeout)
 
     def _safe_reason(self, text, contact, masked):
         if not isinstance(text, str):
@@ -862,18 +948,34 @@ def _xor(key, nonce, data):
 
 def _guest_message(shown):
     if shown.get("status") == "ready":
-        return "已下单。取餐码在结果链接上，到店报这个码即可。"
+        has_code = bool(shown.get("pickupCode"))
+        has_qr = bool(shown.get("qrUrl") or shown.get("qrData"))
+        if has_code and has_qr:
+            return "已下单。取餐码和取餐二维码都在结果里，到店出示即可。"
+        if has_qr:
+            return "已下单。到店出示取餐二维码即可。"
+        return "已下单。取餐码在结果里，到店报这个码即可。"
     if shown.get("status") == "failed":
         return shown.get("failReason") or "下单未成功，今日名额已释放。可以再提交一次。"
-    return "正在下单。请保存结果链接，取餐码会写在这一页。"
+    return "正在下单。请保存结果链接，取餐码或二维码会写在这一页。"
+
+
+def offer_message(drinks, remaining):
+    if not drinks:
+        return NO_COUPONS
+    names = "、".join(item["name"] for item in drinks)
+    return (
+        "现在可以用券请：" + names + "。今日还剩 " + str(remaining)
+        + " 杯。请选一杯，填取餐门店，再领取。下单成功会直接返回取餐码或取餐二维码。"
+    )
 
 
 _FAIL_TEXT = {
     "not_configured": "自动下单未配置",
-    "no_coupon": "没有可用的抖音或团购券",
-    "no_balance": "没有可用券，余额也不足以支付",
+    "no_coupon": "现在没有可用的券，暂时不能请客。",
     "shop": "没有匹配到可下单的门店",
     "api": "自动下单失败",
+    "need_pay": "这杯需要另外支付，不能下单。",
 }
 
 _RESPONSE_KEYS = {
@@ -881,23 +983,148 @@ _RESPONSE_KEYS = {
     "accepted": "accepted",
     "code": "code",
     "reason": "reason",
+    "failreason": "failReason",
     "paywith": "payWith",
     "orderid": "orderId",
     "pickupcode": "pickupCode",
     "shopname": "shopName",
+    "storename": "storeName",
     "readyhint": "readyHint",
+    "needpay": "needPay",
+    "qrurl": "qrUrl",
+    "qrdata": "qrData",
+}
+
+_PAY_MARKERS = ("wxpay", "weixin://", "pay.weixin", "wx.tenpay", "mmpay", "alipay", "支付")
+
+
+def _is_payment_artifact(value):
+    if not isinstance(value, str):
+        return False
+    folded = value.casefold()
+    return any(marker in folded for marker in _PAY_MARKERS)
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value in (0, 1):
+        return bool(int(value))
+    if isinstance(value, str) and value.strip().lower() in ("true", "false", "1", "0", "yes", "no"):
+        return value.strip().lower() in ("true", "1", "yes")
+    return None
+
+
+def _public_drink(item):
+    shown = {"id": item["id"], "name": item["name"], "spec": item.get("spec") or ""}
+    if item.get("remaining") is not None:
+        shown["remaining"] = item["remaining"]
+    return shown
+
+
+def _menu_drinks(data):
+    if not isinstance(data, dict):
+        return []
+    raw_items = None
+    for key in ("drinks", "menu", "items"):
+        if isinstance(data.get(key), list):
+            raw_items = data[key]
+            break
+    if raw_items is None:
+        return []
+    drinks = []
+    seen = set()
+    for item in raw_items:
+        parsed = _menu_item(item)
+        if parsed is None or parsed["id"] in seen:
+            continue
+        seen.add(parsed["id"])
+        drinks.append(parsed)
+    return drinks
+
+
+def _menu_item(item):
+    if not isinstance(item, dict):
+        return None
+    if _as_bool(item.get("needPay") if "needPay" in item else item.get("need_pay")) is True:
+        return None
+    drink_id = item.get("id") or item.get("drinkId") or item.get("drink_id")
+    if not isinstance(drink_id, str) or not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", drink_id):
+        return None
+    known = DRINKS.get(drink_id) or {}
+    name = item.get("name") if isinstance(item.get("name"), str) else ""
+    name = " ".join(name.split()) or known.get("name") or ""
+    if not name or len(name) > 40:
+        return None
+    spec = item.get("spec") if isinstance(item.get("spec"), str) else ""
+    spec = " ".join(spec.split())[:120] or known.get("spec") or ""
+    remaining = item.get("remaining", item.get("count"))
+    if remaining in (None, ""):
+        remaining_v = None
+    elif isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or isinstance(remaining, float) and not remaining.is_integer():
+        return None
+    else:
+        remaining_v = int(remaining)
+        if remaining_v <= 0:
+            return None
+    product_id = item.get("productId") or item.get("product_id") or known.get("product_id") or ""
+    sku = item.get("sku") or item.get("skuCode") or item.get("sku_code") or known.get("sku") or ""
+    return {
+        "id": drink_id,
+        "name": name,
+        "spec": spec,
+        "remaining": remaining_v,
+        "product_id": str(product_id).strip()[:32],
+        "sku": str(sku).strip()[:64],
+    }
+
+
+def _pickup_qr_url(value):
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if not text or len(text) > 500 or _is_payment_artifact(text):
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    return text
+
+
+def _pickup_qr_data(value):
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > 24000 or _is_payment_artifact(text):
+        return ""
+    if text.startswith("data:image/") and ";base64," in text[:80]:
+        return text
+    return ""
+
+
+_PAY_KEYS = {
+    "payurl", "payqr", "payqrcode", "paymenturl", "paymentqr", "codeurl",
+    "mweburl", "wechatpay", "wxpayurl", "wxpay", "paylink",
 }
 
 
 def _order_response(data):
-    """Keep only order fields. Coupon codes and tokens never leave this function."""
+    """Keep only order fields. Coupon codes, tokens, and payment QR links never leave this function."""
     if data is None:
         data = {}
     if not isinstance(data, dict):
         return {"ok": False, "code": "api", "reason": "自动下单返回无法识别"}
+    payment_field = False
+    for key, value in data.items():
+        folded = str(key).replace("_", "").lower()
+        if folded in _PAY_KEYS and value not in (None, "", False):
+            payment_field = True
+        elif isinstance(value, str) and folded not in ("readyhint", "reason", "failreason", "shopname", "storename") and _is_payment_artifact(value):
+            payment_field = True
     out = {}
     for key, value in data.items():
-        mapped = _RESPONSE_KEYS.get(str(key).replace("_", "").lower())
+        folded = str(key).replace("_", "").lower()
+        mapped = _RESPONSE_KEYS.get(folded)
         if mapped is None:
             mapped = _RESPONSE_KEYS.get(str(key).lower())
         if mapped:
@@ -906,15 +1133,22 @@ def _order_response(data):
         out["ok"] = out["ok"] is True
     if "accepted" in out:
         out["accepted"] = out["accepted"] is True
-    if "reason" in out:
-        if not isinstance(out["reason"], str):
-            out.pop("reason")
+    need_pay = _as_bool(out.get("needPay")) if "needPay" in out else None
+    if need_pay is not None:
+        out["needPay"] = need_pay
+    else:
+        out.pop("needPay", None)
+    for key in ("reason", "failReason"):
+        if key not in out:
+            continue
+        if not isinstance(out[key], str):
+            out.pop(key)
         else:
-            out["reason"] = " ".join(out["reason"].split())[:500]
+            out[key] = " ".join(out[key].split())[:500]
     if "code" in out:
         if not isinstance(out["code"], str) or not re.fullmatch(r"[a-z0-9_]{1,40}", out["code"]):
             out.pop("code", None)
-    for key in ("orderId", "pickupCode", "shopName", "readyHint", "payWith"):
+    for key in ("orderId", "pickupCode", "shopName", "storeName", "readyHint", "payWith"):
         if key not in out:
             continue
         value = out[key]
@@ -928,22 +1162,39 @@ def _order_response(data):
             out[key] = " ".join(value.split())
         else:
             out.pop(key)
+    if out.get("needPay") is not True:
+        if "qrUrl" in out:
+            cleaned = _pickup_qr_url(out["qrUrl"])
+            if cleaned:
+                out["qrUrl"] = cleaned
+            else:
+                out.pop("qrUrl", None)
+        if "qrData" in out:
+            cleaned = _pickup_qr_data(out["qrData"])
+            if cleaned:
+                out["qrData"] = cleaned
+            else:
+                out.pop("qrData", None)
+        if payment_field and not out.get("pickupCode") and not out.get("qrUrl") and not out.get("qrData"):
+            out["needPay"] = True
+    if out.get("needPay") is True:
+        out.pop("qrUrl", None)
+        out.pop("qrData", None)
+        out.pop("pickupCode", None)
+        out.setdefault("failReason", "这杯需要另外支付，不能下单。")
     return out
 
 
-def _post_json(url, payload):
+def _post_json(url, payload, timeout=ORDER_TIMEOUT):
     data = json.dumps(payload, ensure_ascii=False).encode()
     request = urllib.request.Request(
         url,
         data=data,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "agentreins-hub-luckin",
-        },
+        headers=webhook_headers(data, webhook_secret(), int(time.time())),
         method="POST",
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=20) as response:
+    with opener.open(request, timeout=timeout) as response:
         raw = response.read(65536)
     if not raw:
         return {}

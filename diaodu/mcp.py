@@ -23,7 +23,7 @@ def described(spec, description):
     return merged
 S={'type':'string'};A={'type':'array','items':S}
 TASK={'task':described(S,'Task id (tk_…) or short number such as T000017.')}
-READONLY={'list_tasks','read_task','read_chat','read_review','relay_list','relay_read','relay_download','mail_inbox','mail_read','outreach_assignments','outreach_status','relay_team_list','relay_team_get','relay_team_read','relay_team_who_is_leader','relay_team_list_online','relay_team_task_list','relay_team_report_read','relay_team_invites','relay_team_gate_get','relay_team_download','luckin_claims','luckin_quota','luckin_claim_status'}
+READONLY={'list_tasks','read_task','read_chat','read_review','relay_list','relay_read','relay_download','mail_inbox','mail_read','outreach_assignments','outreach_status','relay_team_list','relay_team_get','relay_team_read','relay_team_who_is_leader','relay_team_list_online','relay_team_task_list','relay_team_report_read','relay_team_invites','relay_team_gate_get','relay_team_download','luckin_claims','luckin_menu','luckin_quota','luckin_claim_status'}
 DESTRUCTIVE={'relay_revoke','relay_state','relay_team_revoke','relay_team_state','relay_team_invite_reset','relay_team_gate_close'}
 TOOLS=[
  ('outreach_reply','仅在邮箱本人另行开启基础答疑自动发送后，回复真实已联系客户的邮件。收件人取实际来信，最多3封/客户/24小时；报价或承诺须本人处理。Requires a connected mailbox.',{'owner_id':S,'reply_id':S,'text':S},['reply_id','text']),
@@ -115,12 +115,14 @@ def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip
      payload.update(account_key=status['account_key'],email_bound=status['email_bound'],reused=True)
      if bound:payload.update(bound)
      payload['credential_storage']='Keep the Bearer token already configured. A new token is not issued. Email stays optional; diaodu_bind_email links it without dropping history.'
+     _attach_luckin(payload, library)
     else:
      throttle();connected=identity.connect(args['alias'],args['agent_type'],'agent',args.get('email'),args.get('contact_consent',False))
      session['actor']=identity.agent(connected['token'])
      payload={k:v for k,v in connected.items() if k!='csrf'}
      payload['credential_storage']=SAVE_TOKEN
      payload['token_handling']='Shown once. Save outside the chat transcript.'
+     _attach_luckin(payload, library)
    elif name.startswith('luckin_'):
     from diaodu.luckin_mcp import call as luckin_call
     payload=luckin_call(name,args,actor,library.luckin,identity,origin=_luckin_origin(base_url,library.luckin),client_ip=client_ip)
@@ -210,6 +212,16 @@ def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip
   if getattr(exc,'code',None):payload['reason']=exc.code
   if getattr(exc,'retry_after',None) is not None:payload['retry_after']=exc.retry_after
   return {'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':json.dumps(payload,ensure_ascii=False)}],'isError':True}},None
+
+
+def _attach_luckin(payload, library):
+ """Menu of coupon-covered drinks, plus today's remaining cups, on every connect."""
+ luckin = getattr(library, 'luckin', None)
+ if luckin is None:
+  return
+ offer = luckin.offer()
+ payload['luckin'] = offer
+ payload['onboarding'] = offer['message']
 
 
 def _luckin_origin(base_url, luckin):

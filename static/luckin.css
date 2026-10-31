@@ -27,6 +27,7 @@ textarea{min-height:72px;resize:vertical}
 .form-error{min-height:1.4em;margin:8px 0;color:var(--bad);font-weight:600}
 .pickup{margin:16px 0;padding:16px;background:var(--ok-tint);border-radius:var(--radius-panel);text-align:center}
 .pickup b{display:block;margin-top:4px;font-size:40px;letter-spacing:.12em;color:var(--ok)}
+.pickup-qr{display:block;width:180px;height:180px;margin:12px auto;object-fit:contain;background:#fff;border-radius:12px}
 .status{display:inline-block;margin:8px 0;padding:4px 10px;border-radius:999px;background:var(--tint);color:var(--primary);font-weight:600}
 .status.ready{background:var(--ok-tint);color:var(--ok)}
 .status.bad{background:var(--bad-tint);color:var(--bad)}
