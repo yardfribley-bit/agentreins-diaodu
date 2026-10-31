@@ -21,6 +21,11 @@ Topic 由管理者创建并生成一个共享配对码。加入者提供 Topic �
 - POST `/v1/relay/sessions/:id/topic-code` `{}` → `{code}`。仅owner；立即重置共享 Topic 码，旧码失效。
 - POST `/v1/relay/sessions/:id/public` `{enabled:true|false}` → `{session,public_url}`。仅owner；开启时生成新的 24 字节 `public_token`（只存哈希），关闭立即清空，旧链接失效。
 - POST `/v1/relay/sessions/:id/revoke` `{role}` → `{session}`。仅owner；撤销即失去读写权限。被撤销的实例不能用原 Topic 码重新加入（含换角色），管理员如需重新接纳，须重新签发一次性邀请码。
+- GET `/v1/relay/delegations` → `{grants,audit}`。当前登录身份签发的 Topic 管理授权。不含明文。
+- POST `/v1/relay/delegations` `{label?}` → `{delegation,token}` (201)。明文 `dg_…` 只返回这一次。只绑定当前身份，不能替别人签发。
+- POST `/v1/relay/delegations/:id/revoke` → `{revoked,delegation}`。仅签发者。撤销后持有旧明文的智能体不能再代为操作。
+
+`dg_…` 不是 Bearer，也不是 Cookie。智能体用自己的 Bearer 调用 `diaodu_relay_owner_*`，并在参数 `grant` 里带上明文。这些调用以签发者的成员身份操作一对一 Topic：创建的会话 owner 是签发者，因此签发者自己的消息 `from_owner` 仍为 true。代发的 instruction 同样 `from_owner` 为 true（角色是 owner），并带 `delegated_by`（agent_id、name、grant_id）。授权不能撤销平台身份。未带授权的既有 `diaodu_relay_*` 工具不变。
 
 session: `{id,title,goal,status,created_at,updated_at,owner:boolean,role:'owner'|'mentor'|'worker',peers:[{role,name,online,last_seen,ack_seq}],last_seq,public_read,visibility,public_id}`。新建会话 `visibility` 为 `public`，并立即分配 `public_id`（`C-p` + 8 位十六进制）。`public_id` 不是会话 id，也不是 Topic 码。
 

@@ -61,6 +61,36 @@ def _name(actor):
     return "参与者"
 
 
+def _delegated_view(raw, *, member):
+    """Attribution for a grant-backed send. Public views keep the display name only."""
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    shown = {"name": name.strip()[:160]}
+    if not member:
+        return shown
+    agent_id = raw.get("agent_id")
+    grant_id = raw.get("grant_id")
+    if isinstance(agent_id, str) and agent_id.startswith("ag_") and len(agent_id) <= 80:
+        shown["agent_id"] = agent_id
+    if isinstance(grant_id, str) and grant_id.startswith("dgr_") and len(grant_id) <= 40:
+        shown["grant_id"] = grant_id
+    return shown
+
+
+def _actor_from_key(owner_key, owner_name):
+    """Rebuild the owner actor a grant stands for. The key is the membership key, not a cookie."""
+    name = owner_name if isinstance(owner_name, str) and owner_name.strip() else "管理者"
+    if isinstance(owner_key, str) and owner_key.startswith("user:") and owner_key != "user:":
+        return {"kind": "user", "user_id": owner_key[5:], "user_name": name, "display_name": name}
+    if isinstance(owner_key, str) and owner_key.startswith("agent:") and owner_key != "agent:":
+        agent_id = owner_key[6:]
+        return {"kind": "agent", "agent_id": agent_id, "agent_name": name, "user_name": name}
+    raise AuthError("授权无效或已撤销", 401)
+
+
 def _environment(value):
     value = _body(value, {"os_name", "os_version", "architecture", "shells", "python_version"})
     result = {key: _text(value.get(key), key, 160)
@@ -384,6 +414,7 @@ class Relay:
                      "video/mp4", "video/webm", "text/plain", "application/octet-stream")
 
     SIGNED_SECONDS = relay_files.SIGNED_SECONDS
+    MAX_LIVE_GRANTS = 8
 
     def __init__(self, root: Path, public_base_path: str = "", public_origin: str = ""):
         root = Path(root)
@@ -434,6 +465,17 @@ class Relay:
                   size INTEGER NOT NULL, sha256 TEXT NOT NULL, type TEXT NOT NULL,
                   uploader TEXT NOT NULL, actor_key TEXT NOT NULL, created REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS files_session ON files(session_id);
+                CREATE TABLE IF NOT EXISTS owner_grants (
+                  id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL,
+                  owner_key TEXT NOT NULL, owner_name TEXT NOT NULL, label TEXT NOT NULL,
+                  created REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, revoked_at REAL,
+                  last_used REAL, last_actor_key TEXT, last_actor_name TEXT);
+                CREATE INDEX IF NOT EXISTS owner_grants_owner ON owner_grants(owner_key, revoked);
+                CREATE TABLE IF NOT EXISTS grant_audit (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, grant_id TEXT NOT NULL,
+                  owner_key TEXT NOT NULL, actor_key TEXT NOT NULL, actor_name TEXT NOT NULL,
+                  action TEXT NOT NULL, session_id TEXT, detail TEXT NOT NULL, created REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS grant_audit_owner ON grant_audit(owner_key, id);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
             if "topic_code_hash" not in columns:
@@ -615,7 +657,12 @@ class Relay:
                 public["task_id"] = message.get("task_id")
             if attachments:
                 public["attachments"] = attachments
-            return {"message": public}
+            shown = {"message": public}
+            # Name only: the public directory must not gain agent ids or grant ids.
+            delegated = _delegated_view(payload.get("delegated_by"), member=False)
+            if delegated:
+                shown["delegated_by"] = delegated
+            return shown
         if kind == "joined":
             public = {"role": payload.get("role")}
             # One-to-one sessions have no seats; only emit the field where it exists
@@ -815,6 +862,7 @@ class Relay:
                   "sender": {"role": row["sender_role"], "name": row["sender_name"]},
                   "from_owner": row["sender_role"] == "owner"}
         payload = json.loads(row["payload"])
+        delegated = _delegated_view(payload.pop("delegated_by", None), member=True)
         message = payload.get("message")
         if isinstance(message, dict):
             # Old events predate attachments: readers always get a list, never a KeyError.
@@ -823,6 +871,8 @@ class Relay:
                                       (self._file_json(db, row["session_id"], file_id) for file_id in ids)
                                       if item is not None]
         result.update(payload)
+        if delegated:
+            result["delegated_by"] = delegated
         return result
 
     def _append(self, db, sid, member, kind, payload, *, request_id=None, content_hash=None,
@@ -852,13 +902,18 @@ class Relay:
                    (hashlib.sha256(code.encode()).hexdigest(), sid, role, expires))
         return {"role": role, "code": code, "expires_at": _iso(expires)}
 
-    def list_sessions(self, actor, session_id=None):
+    def list_sessions(self, actor, session_id=None, *, delegation=None):
         key = _actor(actor)
         if session_id is not None:
             if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 160:
                 raise ValueError("session不合法")
             session_id = session_id.strip()
+        if delegation is not None:
+            with self._write(notify=False) as db:
+                self._consume_grant(db, actor, delegation, "list", session_id, {})
         with self._read() as db:
+            if delegation is not None:
+                self._require_live_grant(db, actor, delegation)
             rows = db.execute("SELECT s.* FROM sessions s JOIN members m ON m.session_id=s.id "
                               "WHERE m.actor_key=? ORDER BY s.updated DESC,s.id", (key,)).fetchall()
             result = []
@@ -889,7 +944,7 @@ class Relay:
                 "创建属于管理者。指导端，以及已经是某场管理者的身份，仍可创建。",
                 403)
 
-    def create(self, actor, body):
+    def create(self, actor, body, *, delegation=None):
         key = _actor(actor)
         body = _body(body, {"title", "goal"})
         title = _text(body.get("title"), "标题", 160)
@@ -898,6 +953,7 @@ class Relay:
         sid = "rl_" + secrets.token_hex(16)
         topic_code = secrets.token_urlsafe(24)
         with self._write() as db:
+            self._consume_grant(db, actor, delegation, "create", sid, {"title": title})
             self._refuse_worker_topic(db, key)
             count = db.execute("SELECT COUNT(*) FROM sessions WHERE owner_key=? AND status!='closed'", (key,)).fetchone()[0]
             if count >= self.MAX_OPEN_SESSIONS:
@@ -992,25 +1048,36 @@ class Relay:
             return {"session": self._session(db, session, member), "events": [self._event(db, row) for row in batch],
                     "next_cursor": batch[-1]["seq"] if batch else after, "has_more": len(rows) > self.PAGE_SIZE}
 
-    def events(self, actor, sid, after=0, wait=0, abandon=None):
+    def events(self, actor, sid, after=0, wait=0, abandon=None, *, delegation=None):
         key = _actor(actor)
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after须为非负整数")
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or not 0 <= wait <= 20:
             raise ValueError("wait须为0至20秒")
+        if delegation is not None:
+            with self._write(notify=False) as db:
+                self._consume_grant(db, actor, delegation, "read", sid, {})
         waiter = (sid, key)
         registered = False
         deadline = time.monotonic() + wait
         try:
             with self._condition:
                 while True:
+                    if delegation is not None:
+                        with self._read() as db:
+                            self._require_live_grant(db, actor, delegation)
                     result = self._page(actor, sid, after)
                     if _long_poll_ready(result, wait, deadline, abandon):
+                        if delegation is not None:
+                            with self._read() as db:
+                                self._require_live_grant(db, actor, delegation)
                         # A listening client is alive even when it never sends: refresh
                         # presence (60s throttle) before the final membership recheck.
                         self._touch(sid, key)
                         # Recheck in a fresh transaction immediately before returning data.
                         with self._read() as db:
+                            if delegation is not None:
+                                self._require_live_grant(db, actor, delegation)
                             result["session"] = self._view(db, actor, sid)
                         return result
                     if not registered:
@@ -1022,7 +1089,7 @@ class Relay:
                 with self._condition:
                     self._waiters.discard(waiter)
 
-    def send(self, actor, sid, body):
+    def send(self, actor, sid, body, *, delegation=None):
         body = _body(body, {"kind", "text", "request_id", "reply_to", "attachments"})
         kind = body.get("kind")
         if kind not in ("instruction", "progress", "result", "question", "note"):
@@ -1043,7 +1110,17 @@ class Relay:
         if reply is not None and (isinstance(reply, bool) or not isinstance(reply, int) or reply < 1):
             raise ValueError("reply_to须为本会话消息序号")
         hashed = hashlib.sha256(json.dumps(message, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        payload = {"message": message}
+        # Outside the hash: a retry of the same instruction still matches, and the
+        # client cannot set this field (unknown body keys are rejected above).
+        if delegation is not None:
+            payload["delegated_by"] = {
+                "agent_id": delegation.get("agent_id"),
+                "name": delegation.get("actor_name"),
+                "grant_id": delegation.get("grant_id"),
+            }
         with self._write() as db:
+            self._consume_grant(db, actor, delegation, "send", sid, {"kind": kind, "request_id": request_id})
             session, member = self._access(db, actor, sid)
             duplicate = db.execute("SELECT * FROM events WHERE session_id=? AND sender_key=? AND request_id=?",
                                    (sid, member["actor_key"], request_id)).fetchone()
@@ -1069,7 +1146,7 @@ class Relay:
                     "SELECT 1 FROM events WHERE session_id=? AND seq=?", (sid, reply)).fetchone()):
                 raise ValueError("reply_to不属于本会话历史")
             db.execute("UPDATE members SET last_seen=? WHERE session_id=? AND actor_key=?", (time.time(), sid, member["actor_key"]))
-            event = self._append(db, sid, member, "message", {"message": message}, request_id=request_id, content_hash=hashed)
+            event = self._append(db, sid, member, "message", payload, request_id=request_id, content_hash=hashed)
             return {"event": event, "duplicate": False}
 
     def _files_member(self, db, actor, sid):
@@ -1195,12 +1272,13 @@ class Relay:
             db.execute("UPDATE members SET last_seen=? WHERE session_id=? AND actor_key=?", (time.time(), sid, member["actor_key"]))
             return {"session": self._view(db, actor, sid)}
 
-    def state(self, actor, sid, body):
+    def state(self, actor, sid, body, *, delegation=None):
         body = _body(body, {"status"})
         status = body.get("status")
         if status not in ("active", "paused", "closed"):
             raise ValueError("未知会话状态")
         with self._write() as db:
+            self._consume_grant(db, actor, delegation, "state", sid, {"status": status})
             session, member = self._access(db, actor, sid)
             self._owner(member)
             if session["status"] == "closed" and status != "closed":
@@ -1212,12 +1290,13 @@ class Relay:
                     db.execute("DELETE FROM invites WHERE session_id=?", (sid,))
             return {"session": self._view(db, actor, sid)}
 
-    def invite(self, actor, sid, body):
+    def invite(self, actor, sid, body, *, delegation=None):
         body = _body(body, {"role"})
         role = body.get("role")
         if role not in ("mentor", "worker"):
             raise ValueError("角色须为mentor或worker")
         with self._write() as db:
+            self._consume_grant(db, actor, delegation, "invite", sid, {"role": role})
             session, member = self._access(db, actor, sid)
             self._owner(member)
             if session["status"] == "closed":
@@ -1226,11 +1305,12 @@ class Relay:
                 raise AuthError("角色已配对，请先撤销成员", 409)
             return self._issue(db, sid, role)
 
-    def rotate_topic_code(self, actor, sid, body):
+    def rotate_topic_code(self, actor, sid, body, *, delegation=None):
         _body(body, set())
         code = secrets.token_urlsafe(24)
         hashed = hashlib.sha256(code.encode()).hexdigest()
         with self._write() as db:
+            self._consume_grant(db, actor, delegation, "topic_code", sid, {})
             session, member = self._access(db, actor, sid)
             self._owner(member)
             if session["status"] == "closed":
@@ -1238,12 +1318,13 @@ class Relay:
             db.execute("UPDATE sessions SET topic_code_hash=?,updated=? WHERE id=?", (hashed,time.time(),sid))
             return {"code": code}
 
-    def revoke(self, actor, sid, body):
+    def revoke(self, actor, sid, body, *, delegation=None):
         body = _body(body, {"role"})
         role = body.get("role")
         if role not in ("mentor", "worker"):
             raise ValueError("角色须为mentor或worker")
         with self._write() as db:
+            self._consume_grant(db, actor, delegation, "revoke_seat", sid, {"role": role})
             session, member = self._access(db, actor, sid)
             self._owner(member)
             person = db.execute("SELECT actor_key FROM members WHERE session_id=? AND role=?", (sid, role)).fetchone()
@@ -1260,3 +1341,147 @@ class Relay:
                            (sid, person["actor_key"], role, time.time()))
                 db.execute("UPDATE sessions SET updated=? WHERE id=?", (time.time(), sid))
             return {"session": self._view(db, actor, sid)}
+
+    # -- owner relay grant ----------------------------------------------
+    # One credential, minted by the owner, scoped to pair-relay management.
+    # It is not a browser cookie and it is not an agent Bearer. Callers pass
+    # it only to the owner-scoped tools. The plaintext is returned once.
+
+    def _grant_row(self, db, actor, delegation):
+        if delegation is None:
+            return None
+        if not isinstance(delegation, dict):
+            raise AuthError("授权无效或已撤销", 401)
+        token_hash = delegation.get("grant_hash")
+        if not isinstance(token_hash, str) or len(token_hash) != 64:
+            raise AuthError("授权无效或已撤销", 401)
+        row = db.execute("SELECT * FROM owner_grants WHERE token_hash=?", (token_hash,)).fetchone()
+        if row is None or row["revoked"] or row["owner_key"] != _actor(actor):
+            raise AuthError("授权无效或已撤销", 401)
+        return row
+
+    def _require_live_grant(self, db, actor, delegation):
+        self._grant_row(db, actor, delegation)
+
+    def ensure_grant(self, actor, delegation):
+        with self._read() as db:
+            self._require_live_grant(db, actor, delegation)
+
+    def _audit(self, db, grant_id, owner_key, actor_key, actor_name, action, session_id, detail):
+        now = time.time()
+        db.execute(
+            "INSERT INTO grant_audit (grant_id,owner_key,actor_key,actor_name,action,session_id,detail,created) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (grant_id, owner_key, actor_key[:200], actor_name[:160], action,
+             session_id if isinstance(session_id, str) else None,
+             json.dumps(detail if isinstance(detail, dict) else {}, ensure_ascii=False, sort_keys=True)[:1000],
+             now))
+        db.execute(
+            "DELETE FROM grant_audit WHERE owner_key=? AND id NOT IN "
+            "(SELECT id FROM grant_audit WHERE owner_key=? ORDER BY id DESC LIMIT 500)",
+            (owner_key, owner_key))
+
+    def _consume_grant(self, db, actor, delegation, action, session_id, detail):
+        row = self._grant_row(db, actor, delegation)
+        if row is None:
+            return
+        actor_key = delegation.get("actor_key")
+        actor_name = delegation.get("actor_name")
+        if not isinstance(actor_key, str) or not actor_key or not isinstance(actor_name, str) or not actor_name.strip():
+            raise AuthError("授权无效或已撤销", 401)
+        now = time.time()
+        db.execute(
+            "UPDATE owner_grants SET last_used=?, last_actor_key=?, last_actor_name=? WHERE id=?",
+            (now, actor_key[:200], actor_name.strip()[:160], row["id"]))
+        self._audit(db, row["id"], row["owner_key"], actor_key, actor_name.strip(), action, session_id, detail)
+
+    def open_delegation(self, token, acting):
+        """Resolve a grant for an agent. Does not read cookies. The write path rechecks."""
+        if not isinstance(acting, dict) or acting.get("kind") != "agent" or not isinstance(acting.get("agent_id"), str) or not acting.get("agent_id"):
+            raise AuthError("使用授权需要智能体的 Bearer。人员登录请直接使用自己的 Topic 接口。", 403)
+        if not isinstance(token, str) or not token.startswith("dg_") or len(token) > 200:
+            raise AuthError("授权无效或已撤销", 401)
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        with self._read() as db:
+            row = db.execute("SELECT * FROM owner_grants WHERE token_hash=?", (hashed,)).fetchone()
+        if row is None or row["revoked"]:
+            raise AuthError("授权无效或已撤销", 401)
+        owner = _actor_from_key(row["owner_key"], row["owner_name"])
+        delegation = {
+            "grant_hash": hashed,
+            "grant_id": row["id"],
+            "actor_key": _actor(acting),
+            "actor_name": _name(acting),
+            "agent_id": acting["agent_id"],
+        }
+        return owner, delegation
+
+    def _grant_json(self, row):
+        return {"id": row["id"], "label": row["label"], "created_at": _iso(row["created"]),
+                "revoked": bool(row["revoked"]), "revoked_at": _iso(row["revoked_at"]),
+                "last_used_at": _iso(row["last_used"]),
+                "last_actor_name": row["last_actor_name"] or None}
+
+    def _audit_json(self, row):
+        try:
+            detail = json.loads(row["detail"])
+        except json.JSONDecodeError:
+            detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        safe = {key: detail[key] for key in ("role", "status", "kind", "title", "request_id", "label") if key in detail}
+        return {"grant_id": row["grant_id"], "action": row["action"], "actor_name": row["actor_name"],
+                "actor_key": row["actor_key"], "session_id": row["session_id"], "detail": safe,
+                "created_at": _iso(row["created"])}
+
+    def grants(self, actor):
+        key = _actor(actor)
+        with self._read() as db:
+            rows = db.execute("SELECT * FROM owner_grants WHERE owner_key=? ORDER BY created DESC, id",
+                              (key,)).fetchall()
+            audit = db.execute("SELECT * FROM grant_audit WHERE owner_key=? ORDER BY id DESC LIMIT 20",
+                               (key,)).fetchall()
+        return {"grants": [self._grant_json(row) for row in rows],
+                "audit": [self._audit_json(row) for row in audit]}
+
+    def mint_grant(self, actor, body):
+        key = _actor(actor)
+        body = _body({} if body is None else body, {"label"})
+        if "label" in body and body.get("label") != "":
+            label = _text(body.get("label"), "备注", 60)
+        else:
+            label = "relay"
+        name = _name(actor)
+        token = "dg_" + secrets.token_urlsafe(32)
+        grant_id = "dgr_" + secrets.token_hex(8)
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        now = time.time()
+        with self._write(notify=False) as db:
+            live = db.execute("SELECT COUNT(*) FROM owner_grants WHERE owner_key=? AND revoked=0",
+                              (key,)).fetchone()[0]
+            if live >= self.MAX_LIVE_GRANTS:
+                raise AuthError("未撤销的授权已达上限（最多 8 枚）。请先撤销不用的。", 429)
+            db.execute(
+                "INSERT INTO owner_grants (id,token_hash,owner_key,owner_name,label,created,revoked) "
+                "VALUES (?,?,?,?,?,?,0)",
+                (grant_id, hashed, key, name, label, now))
+            self._audit(db, grant_id, key, key, name, "mint", None, {"label": label})
+            item = self._grant_json(db.execute("SELECT * FROM owner_grants WHERE id=?", (grant_id,)).fetchone())
+        # token is returned once. It is not a Bearer and it is not written to the audit row.
+        return {"delegation": item, "token": token}
+
+    def revoke_grant(self, actor, grant_id):
+        key = _actor(actor)
+        if not isinstance(grant_id, str) or not re.fullmatch(r"dgr_[0-9a-f]{16}", grant_id):
+            raise AuthError("没有这个授权", 404)
+        name = _name(actor)
+        with self._write(notify=False) as db:
+            row = db.execute("SELECT * FROM owner_grants WHERE id=?", (grant_id,)).fetchone()
+            if row is None or row["owner_key"] != key:
+                raise AuthError("没有这个授权", 404)
+            if not row["revoked"]:
+                now = time.time()
+                db.execute("UPDATE owner_grants SET revoked=1, revoked_at=? WHERE id=?", (now, grant_id))
+                self._audit(db, grant_id, key, key, name, "revoke_grant", None, {"label": row["label"]})
+            item = self._grant_json(db.execute("SELECT * FROM owner_grants WHERE id=?", (grant_id,)).fetchone())
+        return {"revoked": True, "delegation": item}

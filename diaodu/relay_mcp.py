@@ -37,6 +37,27 @@ TOOLS = [
     ('relay_state', '管理者暂停、继续或结束会话。暂停阻止后续指令，执行端需配合停止本地操作。', {'session': S, 'status': {'type': 'string', 'enum': ['active', 'paused', 'closed']}}, ['session', 'status']),
     ('relay_invite', '管理者为尚未配对的角色重新生成单次码，旧码立即失效。', {'session': S, 'role': ROLE}, ['session', 'role']),
     ('relay_revoke', '管理者撤销指定端的会话访问权限。', {'session': S, 'role': ROLE}, ['session', 'role']),
+    ('relay_delegation_create', '所有者签发一枚 Topic 管理授权，明文只返回这一次。只作用于当前登录身份自己的一对一 Topic，不能撤销别人的实例，也不能读取浏览器 Cookie。把返回的 token 交给要代为操作的智能体，保存为环境变量，不要写进对话。',
+     {'label': {'type': 'string', 'description': '可选备注，1 到 60 字，例如 Hub 运维。省略时记为 relay。'}}, []),
+    ('relay_delegation_list', '列出当前身份签发的 Topic 管理授权和最近的代操作记录。不含明文 token。', {}, []),
+    ('relay_delegation_revoke', '撤销一枚自己签发的 Topic 管理授权。撤销后，持有旧明文的智能体不能再代为创建、邀请或发指令。',
+     {'grant_id': {'type': 'string', 'description': '授权编号 dgr_…，来自签发或列表，不是明文 token。'}}, ['grant_id']),
+    ('relay_owner_create', '用所有者签发的授权，创建一场归所有者本人的 Topic。session.owner_key 是所有者，不是调用方。之后所有者在工作台发出的消息 from_owner 仍为 true。返回 topic_code 和 session.id。',
+     {'grant': {'type': 'string', 'description': '所有者签发的 dg_… 明文。不是 Bearer，也不是 Cookie。'}, 'title': S, 'goal': S}, ['grant', 'title', 'goal']),
+    ('relay_owner_list', '用授权列出所有者仍参与的一对一会话。传入 session 时只核对该 id，member 表示所有者是不是成员。会话 id 在 sessions[].id。',
+     {'grant': {'type': 'string', 'description': '所有者签发的 dg_… 明文。'}, 'session': {'type': 'string', 'description': '可选。要核对的会话 id。'}}, ['grant']),
+    ('relay_owner_invite', '用授权为所有者的 Topic 签发一次性加入码。role=worker 是执行端。旧的一次性码立即失效。不要把码写进公开对话。',
+     {'grant': {'type': 'string', 'description': '所有者签发的 dg_… 明文。'}, 'session': SESSION_ARG, 'role': ROLE}, ['grant', 'session', 'role']),
+    ('relay_owner_topic_code', '用授权重置这场 Topic 的共享配对码。旧码立即失效。已加入的成员不受影响。',
+     {'grant': {'type': 'string', 'description': '所有者签发的 dg_… 明文。'}, 'session': SESSION_ARG}, ['grant', 'session']),
+    ('relay_owner_send', '用授权以 Topic 所有者的身份发消息。kind=instruction 时 from_owner 为 true，因为发送者角色是 owner；事件另带 delegated_by（当前智能体的 agent_id、名字、grant_id），用来标明是谁代写的。手机端只执行 kind=instruction 且 from_owner=true 的指令，因此这条指令会被执行。text 最长 8000 字符。',
+     {'grant': {'type': 'string', 'description': '所有者签发的 dg_… 明文。'}, 'session': SESSION_ARG, 'kind': {'type': 'string', 'enum': ['instruction', 'progress', 'result', 'question', 'note'], 'description': '代所有者发送时使用 instruction、question 或 note。progress 和 result 仍只有 worker 能发。'}, 'text': {'type': 'string', 'description': '1 到 8000 字符。'}, 'request_id': {'type': 'string', 'description': '所有者在本会话内的幂等键。'}, 'reply_to': {'type': 'integer', 'minimum': 1}, 'attachments': {'type': 'array', 'items': S, 'maxItems': 20}}, ['grant', 'session', 'kind', 'text', 'request_id']),
+    ('relay_owner_read', '用授权按所有者的成员身份读取一场 Topic。wait 最长 20 秒。每条事件的 from_owner 与 delegated_by 由服务端写入。',
+     {'grant': {'type': 'string', 'description': '所有者签发的 dg_… 明文。'}, 'session': SESSION_ARG, 'after': {'type': 'integer', 'minimum': 0}, 'wait': {'type': 'integer', 'minimum': 0, 'maximum': 20, 'description': '最长等待秒数，上限 20。'}}, ['grant', 'session']),
+    ('relay_owner_state', '用授权暂停、继续或结束所有者的 Topic。',
+     {'grant': {'type': 'string', 'description': '所有者签发的 dg_… 明文。'}, 'session': SESSION_ARG, 'status': {'type': 'string', 'enum': ['active', 'paused', 'closed']}}, ['grant', 'session', 'status']),
+    ('relay_owner_revoke', '用授权撤销这场 Topic 里一个已加入的角色。不能撤销平台身份。',
+     {'grant': {'type': 'string', 'description': '所有者签发的 dg_… 明文。'}, 'session': SESSION_ARG, 'role': ROLE}, ['grant', 'session', 'role']),
 ]
 
 # Worker join must carry environment. JSON Schema if/then is advisory for clients;
@@ -58,7 +79,9 @@ _EVENT = {'type': 'object',
               'seq': {'type': 'integer', 'description': '本会话递增序号。ack 和 reply_to 用它。'},
               'kind': {'type': 'string', 'enum': ['message', 'joined', 'state', 'revoked', 'environment']},
               'sender': _SENDER,
-              'from_owner': {'type': 'boolean', 'description': 'sender.role 是否为 owner。服务端计算，与正文无关。'},
+              'from_owner': {'type': 'boolean', 'description': 'sender.role 是否为 owner。服务端计算。授权代发的指令也是 owner，因此为 true。'},
+              'delegated_by': {'type': 'object', 'description': '仅授权代发时出现。说明哪一个智能体代所有者写下了这条消息。不是权限开关。',
+                               'properties': {'agent_id': {'type': 'string'}, 'name': {'type': 'string'}, 'grant_id': {'type': 'string'}}},
               'message': {'type': 'object', 'properties': {
                   'kind': {'type': 'string', 'enum': ['instruction', 'progress', 'result', 'question', 'note']},
                   'text': {'type': 'string'},
@@ -111,6 +134,42 @@ OUTPUT_SCHEMAS = {
     'relay_ack': {'type': 'object', 'properties': {
         'acknowledged': {'type': 'integer', 'description': '已确认到的 seq。'}},
         'required': ['acknowledged']},
+    'relay_delegation_create': {'type': 'object', 'properties': {
+        'delegation': {'type': 'object', 'properties': {
+            'id': {'type': 'string', 'description': '授权编号 dgr_…。撤销时用它，不是明文。'},
+            'label': {'type': 'string'}, 'revoked': {'type': 'boolean'}},
+            'required': ['id', 'label', 'revoked']},
+        'token': {'type': 'string', 'description': 'dg_… 明文，只此一次。交给智能体作为 grant 参数，不要当作 Authorization Bearer。'}},
+        'required': ['delegation', 'token']},
+    'relay_delegation_list': {'type': 'object', 'properties': {
+        'grants': {'type': 'array'}, 'audit': {'type': 'array', 'description': '最近的代操作。不含明文和邀请码。'}},
+        'required': ['grants', 'audit']},
+    'relay_delegation_revoke': {'type': 'object', 'properties': {
+        'revoked': {'type': 'boolean'}, 'delegation': {'type': 'object'}},
+        'required': ['revoked']},
+    'relay_owner_create': {'type': 'object', 'properties': {
+        'session': _SESSION, 'topic_code': {'type': 'string', 'description': '共享配对码，只在这次响应里出现明文。'}},
+        'required': ['session', 'topic_code']},
+    'relay_owner_list': {'type': 'object', 'properties': {
+        'sessions': {'type': 'array', 'items': _SESSION},
+        'member': {'type': 'boolean'}},
+        'required': ['sessions']},
+    'relay_owner_invite': {'type': 'object', 'properties': {
+        'role': {'type': 'string'}, 'code': {'type': 'string', 'description': '一次性加入码，只此一次。'},
+        'expires_at': {'type': 'string'}},
+        'required': ['role', 'code', 'expires_at']},
+    'relay_owner_topic_code': {'type': 'object', 'properties': {
+        'code': {'type': 'string', 'description': '新的共享配对码。旧码立即失效。'}},
+        'required': ['code']},
+    'relay_owner_send': {'type': 'object', 'properties': {
+        'event': _EVENT, 'duplicate': {'type': 'boolean'}},
+        'required': ['event', 'duplicate']},
+    'relay_owner_read': {'type': 'object', 'properties': {
+        'session': _SESSION, 'events': {'type': 'array', 'items': _EVENT},
+        'next_cursor': {'type': 'integer'}, 'has_more': {'type': 'boolean'}},
+        'required': ['session', 'events', 'next_cursor', 'has_more']},
+    'relay_owner_state': {'type': 'object', 'properties': {'session': _SESSION}, 'required': ['session']},
+    'relay_owner_revoke': {'type': 'object', 'properties': {'session': _SESSION}, 'required': ['session']},
 }
 
 
@@ -126,8 +185,53 @@ def validate_actor(actor, identity):
         raise AuthError('需要有效的平台身份', 401)
 
 
+def _delegation_call(name, args, actor, relay):
+    if name == 'relay_delegation_create':
+        return relay.mint_grant(actor, {'label': args['label']} if 'label' in args else {})
+    if name == 'relay_delegation_list':
+        return relay.grants(actor)
+    if name == 'relay_delegation_revoke':
+        return relay.revoke_grant(actor, args.get('grant_id'))
+    raise ValueError('未知工具')
+
+
+def _owner_call(name, args, actor, relay, identity):
+    """Act as the grant's owner. The Bearer still names who acted; the grant names for whom."""
+    validate_actor(actor, identity)
+    if actor.get('kind') != 'agent':
+        raise AuthError('使用授权需要智能体的 Bearer。人员登录请直接使用自己的 Topic 接口。', 403)
+    owner, delegation = relay.open_delegation(args.get('grant'), actor)
+    if name == 'relay_owner_create':
+        return relay.create(owner, {'title': args.get('title'), 'goal': args.get('goal')}, delegation=delegation)
+    if name == 'relay_owner_list':
+        return relay.list_sessions(owner, args.get('session'), delegation=delegation)
+    sid = args['session']
+    if name == 'relay_owner_read':
+        result = relay.events(owner, sid, args.get('after', 0), args.get('wait', 0), delegation=delegation)
+        validate_actor(actor, identity)
+        relay.ensure_grant(owner, delegation)
+        relay.get(owner, sid)
+        return result
+    if name == 'relay_owner_invite':
+        return relay.invite(owner, sid, {'role': args.get('role')}, delegation=delegation)
+    if name == 'relay_owner_topic_code':
+        return relay.rotate_topic_code(owner, sid, {}, delegation=delegation)
+    if name == 'relay_owner_state':
+        return relay.state(owner, sid, {'status': args.get('status')}, delegation=delegation)
+    if name == 'relay_owner_revoke':
+        return relay.revoke(owner, sid, {'role': args.get('role')}, delegation=delegation)
+    if name == 'relay_owner_send':
+        body = {key: args[key] for key in ('kind', 'text', 'request_id', 'reply_to', 'attachments') if key in args}
+        return relay.send(owner, sid, body, delegation=delegation)
+    raise ValueError('未知工具')
+
+
 def call(name, args, actor, relay, identity):
     validate_actor(actor, identity)
+    if name.startswith('relay_delegation_'):
+        return _delegation_call(name, args, actor, relay)
+    if name.startswith('relay_owner_'):
+        return _owner_call(name, args, actor, relay, identity)
     body = {key: value for key, value in args.items() if key != 'session'}
     if name == 'relay_list':
         return relay.list_sessions(actor, args.get('session'))

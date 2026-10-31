@@ -22,8 +22,8 @@ def described(spec, description):
     return merged
 S={'type':'string'};A={'type':'array','items':S}
 TASK={'task':described(S,'Task id (tk_…) or short number such as T000017.')}
-READONLY={'whoami','list_tasks','read_task','read_chat','read_review','relay_list','relay_read','relay_download','mail_inbox','mail_read','outreach_assignments','outreach_status','relay_team_list','relay_team_get','relay_team_read','relay_team_who_is_leader','relay_team_list_online','relay_team_task_list','relay_team_report_read','relay_team_invites','relay_team_gate_get','relay_team_download'}
-DESTRUCTIVE={'relay_revoke','relay_state','relay_team_revoke','relay_team_state','relay_team_invite_reset','relay_team_gate_close'}
+READONLY={'whoami','list_tasks','read_task','read_chat','read_review','relay_list','relay_read','relay_download','mail_inbox','mail_read','outreach_assignments','outreach_status','relay_team_list','relay_team_get','relay_team_read','relay_team_who_is_leader','relay_team_list_online','relay_team_task_list','relay_team_report_read','relay_team_invites','relay_team_gate_get','relay_team_download','relay_delegation_list','relay_owner_list','relay_owner_read'}
+DESTRUCTIVE={'relay_revoke','relay_state','relay_team_revoke','relay_team_state','relay_team_invite_reset','relay_team_gate_close','relay_delegation_revoke','relay_owner_revoke','relay_owner_state'}
 TOOLS=[
  ('outreach_reply','仅在邮箱本人另行开启基础答疑自动发送后，回复真实已联系客户的邮件。收件人取实际来信，最多3封/客户/24小时；报价或承诺须本人处理。Requires a connected mailbox.',{'owner_id':S,'reply_id':S,'text':S},['reply_id','text']),
  ('outreach_assignments','获取本人有明确邮箱授权且已开启的国内客户沟通任务；找不到真实公开业务邮箱时不凑数。Requires a connected mailbox.',{},[]),

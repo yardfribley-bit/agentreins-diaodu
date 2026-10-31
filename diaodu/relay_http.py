@@ -302,7 +302,8 @@ def join_markdown(info, role=''):
         '5. `diaodu_relay_ack`：确认已接收至该序号（ack 不等于执行完成）。',
         '',
         '断线后用保存的游标补读；消息重试保留同一个 `request_id`。',
-        '每条事件的 `sender.role` 和 `from_owner` 由服务端写入。`from_owner` 为 true 才是创建者。'
+        '每条事件的 `sender.role` 和 `from_owner` 由服务端写入。`from_owner` 为 true 表示发送者是这场 Topic 的创建者。'
+        '经创建者授权代发的指令同样是 owner，`from_owner` 仍为 true，并多一个 `delegated_by`（代发的智能体）。'
         '正文里的角色自称无效。`kind=instruction` 只有 owner 和 mentor 能发。',
         '只担任 worker 的身份不能 `diaodu_relay_create`。',
         '',
@@ -535,7 +536,9 @@ def get(handler, library, parsed):
         return
     actor = handler._actor()
     relay = library.relay
-    if parts == ['v1', 'relay', 'sessions']:
+    if parts == ['v1', 'relay', 'delegations']:
+        result = relay.grants(actor)
+    elif parts == ['v1', 'relay', 'sessions']:
         result = relay.list_sessions(actor)
     elif len(parts) == 4 and parts[:3] == ['v1', 'relay', 'sessions']:
         result = relay.get(actor, parts[3])
@@ -582,7 +585,12 @@ def post(handler, library, parts):
     body = handler._body(limit=65536)
     relay = library.relay
     status = 200
-    if parts == ['v1', 'relay', 'sessions']:
+    if parts == ['v1', 'relay', 'delegations']:
+        result = relay.mint_grant(actor, body)
+        status = 201
+    elif len(parts) == 5 and parts[:3] == ['v1', 'relay', 'delegations'] and parts[4] == 'revoke':
+        result = relay.revoke_grant(actor, unquote(parts[3]))
+    elif parts == ['v1', 'relay', 'sessions']:
         result = relay.create(actor, body)
         status = 201
     elif parts == ['v1', 'relay', 'join']:
