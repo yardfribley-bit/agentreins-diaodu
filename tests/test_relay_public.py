@@ -78,7 +78,7 @@ class RelayPublic(unittest.TestCase):
         joined = [event for event in public['events'] if event['kind'] == 'joined']
         self.assertTrue(joined)
         for event in joined:
-            self.assertEqual(set(event) - {'seq', 'kind', 'created_at', 'sender', 'role'}, set())
+            self.assertEqual(set(event) - {'seq', 'kind', 'created_at', 'sender', 'role', 'from_owner'}, set())
 
     def test_enable_disable_and_rotation_invalidate_old_links(self):
         self.join()

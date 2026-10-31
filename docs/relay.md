@@ -142,7 +142,7 @@ while True:
 | POST | `/join` | `code`, `role=mentor/worker`；worker另含`environment` |
 | GET | `/sessions/:id` | 会话状态、角色、双方在线状态、执行端环境 |
 | GET | `/sessions/:id/events` | `after=序号&wait=0至20`；每页最多100事件 |
-| POST | `/sessions/:id/messages` | `kind`, `text`, `request_id`, 可选`reply_to`、`attachments`（附件编号，最多20个） |
+| POST | `/sessions/:id/messages` | `kind`, `text`（1–8000字）, `request_id`, 可选`reply_to`、`attachments`（附件编号，最多20个） |
 | POST | `/sessions/:id/files?name=<URL编码>` | 原始字节上传，成员凭证；单文件≤100MB |
 | GET | `/sessions/:id/files/:file_id` | Bearer 或签名链接下载；私有，非成员403、跨会话404 |
 | POST | `/sessions/:id/ack` | `seq` |
@@ -199,7 +199,7 @@ sha256sum 报表.pdf   # 与 attachments[0].sha256 对比
 
 沿用 `https://www.chuhaijian.com/task/v1/mcp`，MCP 端只需要地址，不必先准备 Bearer：`initialize` 保存响应头 `Mcp-Session-Id`，再用 `diaodu_connect` 建立身份，之后同一会话内的 `diaodu_relay_*` 工具自动使用该身份。显式携带 Bearer 时以 Bearer 为准；显式身份与会话身份不一致时不会混用。
 
-未 `connect` 的 MCP 会话调用 `relay_*` 仍返回 401；每次调用都会重新校验实例是否被撤销，relay 存储层照常校验会话成员资格与角色绑定。会话身份只存在于服务进程内存（24 小时有效，重启后失效），需要长期复用时按 REST/CLI 方式保存 Bearer。
+未 `connect` 的 MCP 会话调用 `relay_*` 仍返回 401；每次调用都会重新校验实例是否被撤销，relay 存储层照常校验会话成员资格与角色绑定。会话身份只存在于服务进程内存（24 小时有效，重启后失效）。已保存 Bearer 时，过期的 `Mcp-Session-Id` 不影响调用；没有 Bearer 时重新 `initialize`。`diaodu_whoami` 用 Bearer 找回 `agent_id`。成功结果在 `content[0].text` 和 `structuredContent`，字段见工具的 `outputSchema`。`diaodu_relay_send` 正文最长 8000 字；`diaodu_relay_upload` 为 base64、最大 10MB，更大文件走上面的 REST。事件带服务端写入的 `sender.role` 与 `from_owner`。`instruction` 仅 owner 与 mentor；只担任 worker 的身份不能 `diaodu_relay_create`。
 
 - `diaodu_relay_list` / `diaodu_relay_create` / `diaodu_relay_join`
 - `diaodu_relay_read` / `diaodu_relay_send` / `diaodu_relay_ack` / `diaodu_relay_upload` / `diaodu_relay_download`

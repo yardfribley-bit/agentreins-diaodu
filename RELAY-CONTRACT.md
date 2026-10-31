@@ -7,8 +7,8 @@ Topic 由管理者创建并生成一个共享配对码。加入者提供 Topic �
 ## REST
 
 - GET `/v1/relay/sessions` → `{sessions:[session]}`
-- POST `/v1/relay/sessions` `{title,goal}` → `{session,topic_code}` (201)
-- POST `/v1/relay/join` `{code,role,environment?}` → `{session}`。Topic码需提供role；worker必须提供environment，mentor不发送。
+- POST `/v1/relay/sessions` `{title,goal}` → `{session,topic_code}` (201)。已在未结束会话中仅担任 worker、且不是任何未结束会话 owner 的身份返回 403。指导端和管理者仍可创建。
+- POST `/v1/relay/join` `{code,role,environment?}` → `{session}`。会话 id 在 `session.id`。Topic码需提供role；worker必须提供environment（`os_name`、`os_version`、`architecture` 必填），mentor不发送。
 - GET `/v1/relay/sessions/:id` → `{session}`
 - GET `/v1/relay/sessions/:id/events?after=0&wait=20` → `{session,events:[event],next_cursor,has_more}`。wait 0..20 秒，实时唤醒长轮询，每页最多100项。
 - POST `/v1/relay/sessions/:id/messages` `{kind,text,request_id,reply_to?,attachments?}` → `{event,duplicate}`。request_id 必填，幂等重试；同ID不同内容409。`attachments` 为本会话附件编号数组，最多20个。
@@ -24,7 +24,7 @@ Topic 由管理者创建并生成一个共享配对码。加入者提供 Topic �
 
 session: `{id,title,goal,status,created_at,updated_at,owner:boolean,role:'owner'|'mentor'|'worker',peers:[{role,name,online,last_seen,ack_seq}],last_seq,public_read,visibility,public_id}`。新建会话 `visibility` 为 `public`，并立即分配 `public_id`（`C-p` + 8 位十六进制）。`public_id` 不是会话 id，也不是 Topic 码。
 
-event: `{seq,kind:'message'|'joined'|'state'|'revoked'|'environment',created_at,sender:{role,name},message?:{kind,text,reply_to,attachments},status?,role?,environment?}`。`message.attachments` 每项为 `{id,name,size,sha256,type,uploader,created_at,url,download_url}`；`url`/`download_url` 是带签名、带 host 的绝对地址（public_origin 为空时退化为相对路径），可直接裸 GET，无需 Authorization 头。没有附件的历史事件返回 `[]`，不会缺字段。
+event: `{seq,kind:'message'|'joined'|'state'|'revoked'|'environment',created_at,sender:{role,name},from_owner:boolean,message?:{kind,text,reply_to,attachments},status?,role?,environment?}`。`from_owner` 为 `sender.role==owner`，由服务端计算，不看正文。`message.attachments` 每项为 `{id,name,size,sha256,type,uploader,created_at,url,download_url}`；`url`/`download_url` 是带签名、带 host 的绝对地址（public_origin 为空时退化为相对路径），可直接裸 GET，无需 Authorization 头。没有附件的历史事件返回 `[]`，不会缺字段。
 
 附件与事件解耦：先上传拿 `file_id`，发送消息时引用；文件落在 data/library/relay-files/，元数据在 relay.sqlite3 的 files 表；字节在锁外流式写入并计算 sha256，锁内只登记元数据。下载必须持有会话成员凭证或有效签名链接，不能像公开任务附件那样匿名读取；签名只放在 URL 里，服务端不记录含签名的请求行。
 
@@ -38,7 +38,7 @@ event: `{seq,kind:'message'|'joined'|'state'|'revoked'|'environment',created_at,
 
 方法均返回上述JSON可序列化对象，错误用AuthError(message,status)或ValueError：
 
-`list_sessions(actor)`, `create(actor,body)`, `join(actor,body)`, `get(actor,sid)`,
+`list_sessions(actor, session_id=None)`, `create(actor,body)`, `join(actor,body)`, `get(actor,sid)`,
 `events(actor,sid,after=0,wait=0)`, `send(actor,sid,body)`, `ack(actor,sid,body)`,
 `heartbeat(actor,sid,body=None)`, `state(actor,sid,body)`, `invite(actor,sid,body)`, `revoke(actor,sid,body)`。
 

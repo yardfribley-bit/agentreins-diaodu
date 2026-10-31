@@ -569,6 +569,46 @@ class RelayStoreTests(unittest.TestCase):
         self.error(404, lambda: self.relay.get(self.worker, self.sid))
         self.assertEqual(self.relay.get(self.owner, self.sid)["session"]["last_seq"], 5)
 
+    def test_sender_role_is_server_bound(self):
+        self.paired()
+        owner_event = self.send(self.owner, kind="instruction", request_id="owner-inst")["event"]
+        self.assertEqual(owner_event["sender"]["role"], "owner")
+        self.assertTrue(owner_event["from_owner"])
+        mentor_event = self.send(self.mentor, kind="instruction", request_id="mentor-inst")["event"]
+        self.assertEqual(mentor_event["sender"]["role"], "mentor")
+        self.assertFalse(mentor_event["from_owner"])
+        worker_event = self.send(self.worker, kind="note", request_id="worker-note")["event"]
+        self.assertEqual(worker_event["sender"]["role"], "worker")
+        self.assertFalse(worker_event["from_owner"])
+        self.error(403, lambda: self.send(self.worker, kind="instruction", request_id="worker-inst"))
+        self.error(404, lambda: self.send(self.other, kind="instruction", request_id="outsider-inst"))
+
+    def test_worker_only_identity_cannot_create_a_topic(self):
+        earlier = self.relay.create(self.worker, {"title": "加入前", "goal": "自己的"})
+        self.assertTrue(earlier["session"]["owner"])
+        self.paired()
+        again = self.relay.create(self.worker, {"title": "已是管理者", "goal": "可以再建"})
+        self.assertEqual(again["session"]["role"], "owner")
+        self.relay.state(self.worker, earlier["session"]["id"], {"status": "closed"})
+        self.relay.state(self.worker, again["session"]["id"], {"status": "closed"})
+        self.error(403, lambda: self.relay.create(self.worker, {"title": "只剩执行端", "goal": "拒绝"}))
+        mentor_topic = self.relay.create(self.mentor, {"title": "指导端", "goal": "不受影响"})
+        self.assertTrue(mentor_topic["topic_code"])
+        self.relay.state(self.owner, self.sid, {"status": "closed"})
+        released = self.relay.create(self.worker, {"title": "执行端会话结束后", "goal": "恢复"})
+        self.assertEqual(released["session"]["role"], "owner")
+
+    def test_list_can_check_one_session(self):
+        self.paired()
+        mine = self.relay.list_sessions(self.worker, self.sid)
+        self.assertTrue(mine["member"])
+        self.assertEqual([item["id"] for item in mine["sessions"]], [self.sid])
+        self.assertEqual(mine["sessions"][0]["role"], "worker")
+        other = self.relay.list_sessions(self.other, self.sid)
+        self.assertFalse(other["member"])
+        self.assertEqual(other["sessions"], [])
+        self.assertNotIn("member", self.relay.list_sessions(self.worker))
+
     def test_open_session_quota_is_transactional_and_close_frees_capacity(self):
         self.relay.MAX_OPEN_SESSIONS = 2
         self.relay.create(self.owner, {"title": "第二个", "goal": "两个"})
