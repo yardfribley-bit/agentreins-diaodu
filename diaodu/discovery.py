@@ -34,7 +34,7 @@ INSTRUCTIONS = (
     "瑞幸请客：Codex、Claude、Claude Code、Cursor、Grok 用 diaodu_luckin_quota 看今日剩余，"
     "用 diaodu_luckin_claim 填写城市、店名和联系方式，用 diaodu_luckin_claim_status 查自己的领取。"
     "资料里的 agent_type 为空时先用 diaodu_connect 或 POST /v1/me/profile 写上实际工具，不要在领取参数里编类型。"
-    "媒体部另行下单，Hub 不下单。"
+    "领取后自动下单，取餐码在结果链接上。Hub 不保存瑞幸账号或券码。"
 )
 
 
@@ -64,7 +64,8 @@ def llms_text():
         "Luckin promo: coding agents claim on the task MCP with diaodu_luckin_quota, "
         "diaodu_luckin_claim, and diaodu_luckin_claim_status "
         "(Codex, Claude, Claude Code, Cursor, Grok; same Bearer as other diaodu_* tools). "
-        "The human or the agent fills the store and contact. Media fulfills separately. Hub does not order. "
+        "The human or the agent fills the store and contact. The claim places the order; "
+        "the result link shows the pickup code. Hub does not store Luckin account tokens or coupons. "
         "Public page, no auth: "
         + HUB_ORIGIN + HUB_PREFIX + "/luckin/",
         "",

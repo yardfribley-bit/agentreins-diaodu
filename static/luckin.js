@@ -45,7 +45,7 @@ function renderForm() {
   $("#app").innerHTML = `<article class="panel">
     <p class="eyebrow">平台推广</p>
     <h1>每天请人喝两杯瑞幸</h1>
-    <p class="lede">Hub 只负责排队。媒体部人工确认后才会下单，本页不会连接瑞幸，也不收集瑞幸账号。饮品默认生椰拿铁，需到店自取。按北京时间计算，每天全平台两杯，每人一杯，送完即止。</p>
+    <p class="lede">提交后会立刻自动下单。请保存结果链接，取餐码出现在结果页。本页不连接你的瑞幸账号，也不收集券码。饮品默认生椰拿铁，需到店自取。按北京时间计算，每天全平台两杯，每人一杯，送完即止。</p>
     <p class="quota" id="quota">正在查看今日剩余杯数…</p>
     <form id="claim-form">
       <div class="pair">
@@ -58,7 +58,7 @@ function renderForm() {
       </div>
       <p class="help">联系方式至少填一个。页面和公开结果只显示打码后的联系方式。</p>
       <label><span>饮品</span><select name="drink" aria-label="饮品">${options}</select>
-        <span class="help">默认生椰拿铁。不提供糖度、冰量等定制，下单规格由媒体部按默认处理。</span></label>
+        <span class="help">默认生椰拿铁，大杯、冰、不另外加糖。不提供糖度、冰量等定制。</span></label>
       <label><span>定位描述（选填）</span><textarea name="locationNote" maxlength="120" placeholder="例如：近地铁 2 号口"></textarea></label>
       <div class="row">
         <button type="button" id="locate">附上大致位置（选填）</button>
@@ -66,7 +66,7 @@ function renderForm() {
       </div>
       <input type="hidden" name="lat" value="">
       <input type="hidden" name="lng" value="">
-      <label class="consent"><input name="consent" type="checkbox" required>我了解这是到店自取的推广体验，不是无条件福利；每天全平台两杯、每人限一杯；需要人工确认后才会下单，且与 AgentReins Hub 推广相关。</label>
+      <label class="consent"><input name="consent" type="checkbox" required>我了解这是到店自取的推广体验，不是无条件福利；每天全平台两杯、每人限一杯；提交后会自动下单，且与 AgentReins Hub 推广相关。</label>
       <p class="form-error" id="form-error" role="alert"></p>
       <button class="primary" type="submit">提交领取</button>
     </form>
@@ -153,13 +153,22 @@ async function submitClaim(event) {
 }
 
 function showSubmitted(claim) {
+  const ready = claim.status === "ready" && claim.pickupCode;
+  const failed = claim.status === "failed";
+  const eyebrow = ready ? "可取餐" : (failed ? "这次没有下成" : "正在下单");
+  const title = ready ? "取餐码" : (failed ? "今日名额已释放" : "正在下单");
+  const pickup = ready ? `<div class="pickup"><span>取餐码</span><b>${esc(claim.pickupCode)}</b></div>` : "";
+  const story = failed
+    ? esc(claim.failReason || claim.message || "下单未成功，可以再提交一次。")
+    : esc(claim.message || "正在下单。请保存结果链接，取餐码会写在这一页。");
   $("#app").innerHTML = `<article class="panel">
-    <p class="eyebrow">已排队</p>
-    <h1>请保存这个结果链接</h1>
-    <p>${esc(claim.message || "已排队。媒体部人工确认后才会下单。")}</p>
+    <p class="eyebrow">${eyebrow}</p>
+    ${pickup}
+    <h1>${title}</h1>
+    <p>${story}</p>
     <p>领取编号 ${esc(claim.claimId)} · ${esc(claim.drink)} · ${esc(claim.contactMasked)}</p>
     <p><a class="result-link" href="${esc(claim.resultUrl)}">${esc(claim.resultUrl)}</a></p>
-    <p class="muted">链接就是查看凭证。不要发到公开场合。取餐码会在人工下单成功后出现在该页。</p>
+    <p class="muted">链接就是查看凭证。不要发到公开场合。</p>
   </article>`;
 }
 
@@ -172,20 +181,28 @@ function statusClass(status) {
 
 function resultBody(claim) {
   const when = claim.orderTime ? new Date(claim.orderTime).toLocaleString("zh-CN", {hour12: false, timeZone: "Asia/Shanghai"}) : "";
-  const pickup = claim.status === "ready" ? `<div class="pickup"><span>取餐码</span><b>${esc(claim.pickupCode)}</b></div>` : "";
+  const ready = claim.status === "ready";
+  const ordering = claim.status === "ordering" || claim.status === "pending";
+  const failed = claim.status === "failed" || claim.status === "rejected" || claim.status === "cancelled";
+  const pickup = ready ? `<div class="pickup"><span>取餐码</span><b>${esc(claim.pickupCode)}</b></div>` : "";
   const hint = claim.readyHint ? `<p>${esc(claim.readyHint)}</p>` : "";
-  const again = (claim.status === "failed" || claim.status === "rejected")
-    ? `<p><a href="${esc(formHref())}">返回领取页</a></p>` : "";
+  const eyebrow = ready ? "可取餐" : (ordering ? "正在下单" : "领取进度");
+  const title = ready ? esc(claim.drink || "瑞幸请客") : (ordering ? "正在下单" : esc(claim.drink || "瑞幸请客"));
+  const story = ordering
+    ? `<p>正在向瑞幸下单。这一页会刷新出取餐码。</p>`
+    : (claim.status === "failed" && claim.failReason ? `<p>${esc(claim.failReason)}</p>` : "");
+  const again = failed ? `<p><a href="${esc(formHref())}">返回领取页</a></p>` : "";
   return `<article class="panel">
-    <p class="eyebrow">领取进度</p>
-    <h1>${esc(claim.drink || "瑞幸请客")}</h1>
-    <p class="status ${statusClass(claim.status)}">${esc(claim.statusLabel || claim.status)}</p>
+    <p class="eyebrow">${eyebrow}</p>
     ${pickup}
+    <h1>${title}</h1>
+    <p class="status ${statusClass(claim.status)}">${esc(claim.statusLabel || claim.status)}</p>
+    ${story}
     <p>门店 ${esc(claim.shopName || "")}${claim.city ? " · " + esc(claim.city) : ""}</p>
     ${when ? `<p>下单时间 ${esc(when)}</p>` : ""}
     ${hint}
     <p class="muted">联系方式 ${esc(claim.contactMasked || "")} · 编号 ${esc(claim.claimId || "")}</p>
-    <p class="muted">到店自取。这是 AgentReins Hub 的推广体验，需人工确认后下单，不是无条件福利。</p>
+    <p class="muted">到店自取。这是 AgentReins Hub 的推广体验，不是无条件福利。</p>
     ${again}
     <p class="row"><button type="button" id="refresh-result">刷新状态</button></p>
   </article>`;

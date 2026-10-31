@@ -1,4 +1,4 @@
-"""Luckin MCP tools. Hub records claims; it does not call Luckin.
+"""Luckin MCP tools.
 
 Claim tools use the same Bearer as the other diaodu_* task tools:
 
@@ -6,12 +6,12 @@ Claim tools use the same Bearer as the other diaodu_* task tools:
   MCP session. luckin_claim reads agent_type from the saved profile. The
   allowlist is Codex, Claude, Claude Code, Cursor, and Grok. An empty profile
   is a request to set it via diaodu_connect or POST /v1/me/profile, not a
-  field on the claim.
+  field on the claim. A claim asks the order webhook to place the cup.
+  claim_status then reports ready or failed without a media chat.
 
 - luckin_claims, luckin_decide, luckin_fulfill, luckin_fail stay limited to
-  LUCKIN_FULFILLER_AGENT_IDS. They return the claimant contact so the media
-  team can place the order elsewhere. Do not copy that contact into a public
-  task, chat, or transcript.
+  LUCKIN_FULFILLER_AGENT_IDS. They are the ops fallback. The contact on those
+  replies is for the operator, not for a public task, chat, or transcript.
 """
 
 from diaodu.identity import AuthError
@@ -36,7 +36,7 @@ CLAIM_TOOLS = [
     (
         "luckin_quota",
         "今日瑞幸请客还剩几杯（Asia/Shanghai 自然日）。全平台每天 2 杯，每人每天 1 杯。"
-        "计入 pending、ordering、ready。Hub 不下单。",
+        "计入 pending、ordering、ready。领取后由履约 webhook 自动下单。",
         {},
         [],
         {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
@@ -47,7 +47,8 @@ CLAIM_TOOLS = [
         "必填城市、店名、手机号或邮箱、consent=true；drink 默认 coconut_latte；定位描述和经纬度选填。"
         "agent_type 只读资料里已经保存的值，允许 Codex、Claude、Claude Code、Cursor、Grok（大小写不限）。"
         "资料是空的、访客或未确认时，先用 diaodu_connect 或 POST /v1/me/profile 写上实际工具，不要在本工具参数里编一个类型。"
-        "返回 claimId、resultUrl 和今日剩余杯数。把结果链接交给取餐的人。联系方式不要写入任务、群聊或成果。Hub 不下单，媒体部另行履约。",
+        "返回 claimId、resultUrl 和今日剩余杯数。把结果链接交给取餐的人。联系方式不要写入任务、群聊或成果。"
+        "领取后立刻自动下单：有券走券，没有券再试余额。成功时结果链接上是取餐码；失败会写明原因并释放今日名额。不需要聊天确认。",
         {
             "city": _described(S, "城市，1–40 字。例如上海。"),
             "shop_name": _described(S, "瑞幸店名，1–80 字。例如瑞幸咖啡（陆家嘴店）。"),
@@ -68,7 +69,8 @@ CLAIM_TOOLS = [
     (
         "luckin_claim_status",
         "查看本实例用 diaodu_luckin_claim 提交的领取。claim_id 或 result_token 至少填一个。"
-        "只能看自己的。别人的领取、以及网页匿名提交，都返回没有这笔领取。不下单。",
+        "只能看自己的。别人的领取、以及网页匿名提交，都返回没有这笔领取。"
+        "下单完成后 status 为 ready 并带 pickupCode；失败为 failed 并带 failReason。中间状态是 ordering（正在下单）。",
         {
             "claim_id": _described(S, "lk_ 开头的领取编号。"),
             "result_token": _described(S, "本实例 diaodu_luckin_claim 返回的 resultUrl 里的 token。"),
@@ -81,15 +83,15 @@ CLAIM_TOOLS = [
 TOOLS = [
     (
         "luckin_claims",
-        "列出瑞幸请客排队。仅 LUCKIN_FULFILLER_AGENT_IDS 中的实例可调用。"
-        "返回的联系方式只用于下单，禁止写入公开任务、群聊或对话记录。Hub 不下单。",
+        "列出瑞幸请客。默认 status=ordering（正在自动下单）。仅 LUCKIN_FULFILLER_AGENT_IDS 中的实例可调用。"
+        "返回的联系方式只给运维兜底，禁止写入公开任务、群聊或对话记录。",
         {"status": {"type": "string", "enum": list(STATUSES)}},
         [],
     ),
     (
         "luckin_decide",
-        "人工确认瑞幸领取。对话里说「通过/下单 claimId」之后，approve 把 pending 或 failed 变为 ordering；"
-        "failed 拉回仍是同一杯，不新占名额。reject 释放当日名额。Hub 不下单。"
+        "运维兜底，不是领取必经步骤。approve 把 pending 或 failed 变为 ordering；"
+        "failed 拉回仍是同一杯，不新占名额，也不会再次自动下单。reject 释放当日名额。"
         "仅 LUCKIN_FULFILLER_AGENT_IDS 中的实例可调用。",
         {
             "claim_id": S,
@@ -100,8 +102,8 @@ TOOLS = [
     ),
     (
         "luckin_fulfill",
-        "下单成功后写回取餐码，状态变为 ready。联系方式不要写入公开渠道。Hub 不下单。"
-        "仅 LUCKIN_FULFILLER_AGENT_IDS 中的实例可调用。",
+        "把取餐码写回结果短链，状态变为 ready。pending 或 ordering 都可以写，不必先 decide。"
+        "联系方式不要写入公开渠道。仅 LUCKIN_FULFILLER_AGENT_IDS 中的实例可调用。",
         {
             "claim_id": S,
             "order_id": S,
@@ -114,7 +116,8 @@ TOOLS = [
     ),
     (
         "luckin_fail",
-        "下单失败并释放当日名额。之后可用 luckin_decide approve 把同一 claimId 拉回 ordering。Hub 不下单。"
+        "下单失败：写入 reason，并释放当日名额。不要把领取留在 pending。"
+        "之后可用 luckin_decide approve 把同一 claimId 拉回 ordering（不自动再下单）。"
         "仅 LUCKIN_FULFILLER_AGENT_IDS 中的实例可调用。",
         {"claim_id": S, "reason": S},
         ["claim_id", "reason"],
@@ -195,7 +198,7 @@ def call(name, args, actor, luckin, identity, origin="", client_ip=None):
     if not is_fulfiller(actor):
         raise AuthError("此实例不在 LUCKIN_FULFILLER_AGENT_IDS 允许名单", 403)
     if name == "luckin_claims":
-        return {"claims": luckin.list_claims(args.get("status") or "pending")}
+        return {"claims": luckin.list_claims(args.get("status") or "ordering")}
     if name == "luckin_decide":
         return luckin.decide(args["claim_id"], args["action"], args.get("note") or "")
     if name == "luckin_fulfill":
