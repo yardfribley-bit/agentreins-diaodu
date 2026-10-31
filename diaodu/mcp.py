@@ -4,6 +4,7 @@ from diaodu import chat,agent_api
 from diaodu.discovery import INSTRUCTIONS, SERVER_VERSION
 from diaodu.identity import AuthError, text
 from diaodu.library import LibraryError
+from diaodu.luckin import LuckinError
 SESSIONS={};BEARER_RUNS={};LOCK=threading.Lock()
 VERSION='2025-11-25'
 SAVE_TOKEN = (
@@ -22,7 +23,7 @@ def described(spec, description):
     return merged
 S={'type':'string'};A={'type':'array','items':S}
 TASK={'task':described(S,'Task id (tk_…) or short number such as T000017.')}
-READONLY={'list_tasks','read_task','read_chat','read_review','relay_list','relay_read','relay_download','mail_inbox','mail_read','outreach_assignments','outreach_status','relay_team_list','relay_team_get','relay_team_read','relay_team_who_is_leader','relay_team_list_online','relay_team_task_list','relay_team_report_read','relay_team_invites','relay_team_gate_get','relay_team_download','luckin_claims'}
+READONLY={'list_tasks','read_task','read_chat','read_review','relay_list','relay_read','relay_download','mail_inbox','mail_read','outreach_assignments','outreach_status','relay_team_list','relay_team_get','relay_team_read','relay_team_who_is_leader','relay_team_list_online','relay_team_task_list','relay_team_report_read','relay_team_invites','relay_team_gate_get','relay_team_download','luckin_claims','luckin_quota','luckin_claim_status'}
 DESTRUCTIVE={'relay_revoke','relay_state','relay_team_revoke','relay_team_state','relay_team_invite_reset','relay_team_gate_close'}
 TOOLS=[
  ('outreach_reply','仅在邮箱本人另行开启基础答疑自动发送后，回复真实已联系客户的邮件。收件人取实际来信，最多3封/客户/24小时；报价或承诺须本人处理。Requires a connected mailbox.',{'owner_id':S,'reply_id':S,'text':S},['reply_id','text']),
@@ -49,8 +50,10 @@ from diaodu.relay_mcp import TOOLS as RELAY_TOOLS
 TOOLS.extend(RELAY_TOOLS)
 from diaodu.relay_teams_mcp import TOOLS as TEAM_TOOLS
 TOOLS.extend(TEAM_TOOLS)
-from diaodu.luckin_mcp import TOOLS as LUCKIN_TOOLS
-TOOLS.extend(LUCKIN_TOOLS)
+from diaodu.luckin_mcp import CLAIM_TOOLS as LUCKIN_CLAIM_TOOLS, TOOLS as LUCKIN_FULFILLER_TOOLS
+TOOLS.extend(LUCKIN_CLAIM_TOOLS)
+TOOLS.extend(LUCKIN_FULFILLER_TOOLS)
+FULFILLER_ONLY={item[0] for item in LUCKIN_FULFILLER_TOOLS}
 
 def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip=None):
  method=request.get('method');rid=request.get('id');params=request.get('params') or {}
@@ -77,7 +80,7 @@ def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip
   if method=='ping':result={}
   elif method=='tools/list':
    from diaodu.luckin import is_fulfiller
-   visible=TOOLS if is_fulfiller(actor) else [item for item in TOOLS if not item[0].startswith('luckin_')]
+   visible=TOOLS if is_fulfiller(actor) else [item for item in TOOLS if item[0] not in FULFILLER_ONLY]
    result={'tools':[tool_spec(item) for item in visible]}
   elif method=='resources/list':result={'resources':[]}
   elif method=='resources/templates/list':result={'resourceTemplates':[{'uriTemplate':'diaodu://task/{task}','name':'task','mimeType':'application/json'}]}
@@ -120,7 +123,7 @@ def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip
      payload['token_handling']='Shown once. Save outside the chat transcript.'
    elif name.startswith('luckin_'):
     from diaodu.luckin_mcp import call as luckin_call
-    payload=luckin_call(name,args,actor,library.luckin,identity)
+    payload=luckin_call(name,args,actor,library.luckin,identity,origin=_luckin_origin(base_url,library.luckin),client_ip=client_ip)
    elif name.startswith('relay_team_'):
     from diaodu.relay_teams_mcp import call as team_call
     payload=team_call(name,args,actor,library.teams,identity,client_ip=client_ip)
@@ -202,11 +205,23 @@ def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip
  except LookupError as exc:
   payload={'code':404,'message':str(exc)}
   return {'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':json.dumps(payload,ensure_ascii=False)}],'isError':True}},None
- except (AuthError,ValueError,LibraryError) as exc:
+ except (AuthError,ValueError,LibraryError,LuckinError) as exc:
   payload={'code':getattr(exc,'status',400),'message':str(exc)}
   if getattr(exc,'code',None):payload['reason']=exc.code
   if getattr(exc,'retry_after',None) is not None:payload['retry_after']=exc.retry_after
   return {'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':json.dumps(payload,ensure_ascii=False)}],'isError':True}},None
+
+
+def _luckin_origin(base_url, luckin):
+ """Origin for result links. public_base_path is added again by Luckin.result_url."""
+ if luckin.public_origin:
+  return luckin.public_origin
+ suffix=(luckin.public_base_path or '')+'/v1'
+ if suffix!='/v1' and isinstance(base_url,str) and base_url.endswith(suffix):
+  return base_url[:-len(suffix)]
+ if isinstance(base_url,str) and base_url.endswith('/v1'):
+  return base_url[:-3]
+ return base_url or ''
 
 
 def tool_spec(item):

@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -17,7 +18,15 @@ from urllib.request import Request, urlopen
 from diaodu.discovery import llms_text
 from diaodu.identity import Identity
 from diaodu.library import Library
-from diaodu.luckin import Luckin, mask_email, mask_phone, normalize_email, normalize_phone
+from diaodu.luckin import (
+    Luckin,
+    LuckinError,
+    coding_agent_status,
+    mask_email,
+    mask_phone,
+    normalize_email,
+    normalize_phone,
+)
 from diaodu.server import make_handler
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -223,6 +232,92 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn(PHONE_B, err.getvalue())
         self.assertIn("unsupported scheme", err.getvalue())
 
+    def test_coding_agent_allowlist(self):
+        allowed = (
+            "Codex", "CODEX", "OpenAI Codex", "codex-cli",
+            "Claude", "Anthropic Claude",
+            "Claude Code", "claude-code", "ClaudeCode",
+            "Cursor", "Cursor Agent", "cursor-agent", "CursorAgent",
+            "Grok", "gRoK", "xAI Grok", "Grok 4", "grok-4",
+        )
+        for name in allowed:
+            self.assertEqual(coding_agent_status(name), "ok", name)
+        for name in ("", "   ", None, "访客", "人员", "未确认", "工具未确认"):
+            self.assertEqual(coding_agent_status(name), "unset", name)
+        for name in ("WorkBuddy", "豆包", "ChatGPT", "Gemini", "codexx"):
+            self.assertEqual(coding_agent_status(name), "denied", name)
+
+    def test_mcp_owner_cannot_read_someone_elses_claim(self):
+        owner = "ag_" + "ab" * 12
+        other = "ag_" + "cd" * 12
+        created = self.store.create(claim_body(), "https://www.chuhaijian.com", agent_id=owner)
+        own = self.store.claim_for_agent(owner, claim_id=created["claimId"])
+        self.assertEqual(own["claimId"], created["claimId"])
+        self.assertEqual(own["contactMasked"], "138****0001")
+        self.assertNotIn("contact", own)
+        token = created["resultToken"]
+        by_token = self.store.claim_for_agent(owner, result_token=token, origin="https://www.chuhaijian.com")
+        self.assertEqual(by_token["resultUrl"], created["resultUrl"])
+        for kwargs in (
+            {"claim_id": created["claimId"]},
+            {"result_token": token},
+        ):
+            with self.assertRaises(LuckinError) as raised:
+                self.store.claim_for_agent(other, **kwargs)
+            self.assertEqual(raised.exception.status, 404)
+            self.assertEqual(raised.exception.code, "not_found")
+        web = self.store.create(claim_body(PHONE_B), "https://www.chuhaijian.com")
+        with self.assertRaises(LuckinError) as raised:
+            self.store.claim_for_agent(owner, claim_id=web["claimId"])
+        self.assertEqual(raised.exception.code, "not_found")
+        with self.assertRaises(LuckinError) as raised:
+            self.store.claim_for_agent(owner, claim_id=created["claimId"], result_token="a" * 24)
+        self.assertEqual(raised.exception.code, "not_found")
+
+    def test_legacy_database_gains_agent_id(self):
+        root = Path(self.tmp.name) / "legacy"
+        root.mkdir()
+        db = sqlite3.connect(root / "luckin.sqlite3")
+        db.execute(
+            """CREATE TABLE claims (
+              id TEXT PRIMARY KEY,
+              person_hash TEXT NOT NULL,
+              contact_kind TEXT NOT NULL,
+              contact_masked TEXT NOT NULL,
+              contact_sealed BLOB NOT NULL,
+              city TEXT NOT NULL,
+              shop_name TEXT NOT NULL,
+              location_note TEXT NOT NULL DEFAULT '',
+              lat REAL,
+              lng REAL,
+              drink_id TEXT NOT NULL,
+              drink_name TEXT NOT NULL,
+              product_id TEXT NOT NULL DEFAULT '',
+              sku TEXT NOT NULL DEFAULT '',
+              drink_spec TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL,
+              day TEXT NOT NULL,
+              staff_note TEXT NOT NULL DEFAULT '',
+              fail_reason TEXT NOT NULL DEFAULT '',
+              order_id TEXT NOT NULL DEFAULT '',
+              pickup_code TEXT NOT NULL DEFAULT '',
+              fulfill_shop TEXT NOT NULL DEFAULT '',
+              ready_hint TEXT NOT NULL DEFAULT '',
+              raw_note TEXT NOT NULL DEFAULT '',
+              created REAL NOT NULL,
+              updated REAL NOT NULL,
+              ready_at REAL,
+              result_token_hash TEXT NOT NULL UNIQUE
+            )"""
+        )
+        db.commit()
+        db.close()
+        store = Luckin(root, "/task", "https://www.chuhaijian.com")
+        created = store.create(claim_body(), "https://www.chuhaijian.com", agent_id="ag_" + "ef" * 12)
+        self.assertTrue(created["claimId"].startswith("lk_"))
+        found = store.claim_for_agent("ag_" + "ef" * 12, claim_id=created["claimId"])
+        self.assertEqual(found["status"], "pending")
+
 
 class HttpTests(unittest.TestCase):
     def setUp(self):
@@ -295,6 +390,19 @@ class HttpTests(unittest.TestCase):
         self.assertIn("每天请人喝两杯瑞幸", (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
         doc = (ROOT / "docs" / "luckin-promo.md").read_text(encoding="utf-8")
         for snippet in ("LUCKIN_FULFILLER_AGENT_IDS", "LUCKIN_PENDING_WEBHOOK_URL", "通过/下单", "coconut_latte", "SP2077-01134"):
+            self.assertIn(snippet, doc)
+        self.assertIn("diaodu_luckin_claim", guide)
+        self.assertIn("diaodu_luckin_quota", guide)
+        self.assertIn("diaodu_luckin_claim_status", guide)
+        guide_md = (ROOT / "diaodu" / "agent-guide.md").read_text(encoding="utf-8")
+        for snippet in (
+            "diaodu_luckin_claim",
+            "diaodu_luckin_quota",
+            "diaodu_luckin_claim_status",
+            "POST /v1/me/profile",
+            "Claude Code",
+        ):
+            self.assertIn(snippet, guide_md)
             self.assertIn(snippet, doc)
 
         missing, missing_body = self.req("GET", "/v1/luckin/result")
@@ -401,6 +509,195 @@ class HttpTests(unittest.TestCase):
         payload = json.loads(allowed[1]["result"]["content"][0]["text"])
         self.assertEqual(payload["status"], "rejected")
         self.assertEqual(payload["contact"], "guest@example.com")
+
+    def _mcp(self, token, method, params=None, req_id=1):
+        return self.req("POST", "/v1/mcp", {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": params or {},
+        }, token=token)
+
+    def _tool_names(self, token):
+        status, body = self._mcp(token, "tools/list")
+        self.assertEqual(status, 200, body)
+        return {tool["name"]: tool for tool in body["result"]["tools"]}
+
+    def _call(self, token, name, arguments=None):
+        status, body = self._mcp(token, "tools/call", {"name": name, "arguments": arguments or {}})
+        self.assertEqual(status, 200, body)
+        result = body["result"]
+        text = result["content"][0]["text"]
+        payload = json.loads(text)
+        return result.get("isError"), payload
+
+    def test_mcp_claim_quota_and_ownership(self):
+        guest = self._tool_names(self.other["token"])
+        for name in ("diaodu_luckin_quota", "diaodu_luckin_claim", "diaodu_luckin_claim_status"):
+            self.assertIn(name, guest)
+        for name in ("diaodu_luckin_claims", "diaodu_luckin_decide", "diaodu_luckin_fulfill", "diaodu_luckin_fail"):
+            self.assertNotIn(name, guest)
+        claim_tool = guest["diaodu_luckin_claim"]
+        schema = claim_tool["inputSchema"]
+        self.assertEqual(schema["additionalProperties"], False)
+        self.assertEqual(schema["required"], ["city", "shop_name", "consent"])
+        self.assertIn("coconut_latte", schema["properties"]["drink"]["enum"])
+        self.assertNotIn("agent_type", schema["properties"])
+        self.assertTrue(guest["diaodu_luckin_quota"]["annotations"]["readOnlyHint"])
+        self.assertTrue(guest["diaodu_luckin_claim_status"]["annotations"]["readOnlyHint"])
+        media = self._tool_names(self.media["token"])
+        self.assertIn("diaodu_luckin_fulfill", media)
+        self.assertIn("diaodu_luckin_claim", media)
+
+        error, quota = self._call(self.other["token"], "diaodu_luckin_quota")
+        self.assertFalse(error, quota)
+        self.assertEqual(quota["remaining"], 2)
+        self.assertEqual(quota["timezone"], "Asia/Shanghai")
+        self.assertEqual(quota["limit"], 2)
+
+        error, anon = self._call(None, "diaodu_luckin_claim", {
+            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE, "consent": True,
+        })
+        self.assertTrue(error)
+        self.assertEqual(anon["code"], 401)
+
+        error, invented = self._call(self.other["token"], "diaodu_luckin_claim", {
+            "city": "上海",
+            "shop_name": "瑞幸咖啡（陆家嘴店）",
+            "phone": PHONE,
+            "consent": True,
+            "agent_type": "Codex",
+        })
+        self.assertTrue(error)
+        self.assertIn("agent_type", invented["message"])
+
+        error, created = self._call(self.other["token"], "diaodu_luckin_claim", {
+            "city": "上海",
+            "shop_name": "瑞幸咖啡（陆家嘴店）",
+            "phone": PHONE,
+            "location_note": "近2号口",
+            "consent": True,
+        })
+        self.assertFalse(error, created)
+        self.assertTrue(created["claimId"].startswith("lk_"))
+        self.assertIn("/luckin/r/", created["resultUrl"])
+        self.assertEqual(created["remaining"], 1)
+        self.assertEqual(created["quota"]["remaining"], 1)
+        self.assertEqual(created["drink"], "生椰拿铁")
+        self.assertEqual(created["status"], "pending")
+        blob = json.dumps(created, ensure_ascii=False)
+        self.assertNotIn(PHONE, blob)
+        self.assertIn("138****0001", blob)
+
+        error, again = self._call(self.other["token"], "diaodu_luckin_claim", {
+            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE, "consent": True,
+        })
+        self.assertTrue(error)
+        self.assertEqual(again["reason"], "already_claimed")
+        self.assertEqual(again["code"], 409)
+        error, quota = self._call(self.other["token"], "diaodu_luckin_quota")
+        self.assertEqual(quota["remaining"], 1)
+
+        error, by_id = self._call(self.other["token"], "diaodu_luckin_claim_status", {"claim_id": created["claimId"]})
+        self.assertFalse(error, by_id)
+        self.assertEqual(by_id["claimId"], created["claimId"])
+        self.assertEqual(by_id["status"], "pending")
+        self.assertNotIn(PHONE, json.dumps(by_id, ensure_ascii=False))
+        error, by_token = self._call(self.other["token"], "diaodu_luckin_claim_status", {"result_token": created["resultToken"]})
+        self.assertFalse(error, by_token)
+        self.assertEqual(by_token["claimId"], created["claimId"])
+        self.assertEqual(by_token["resultUrl"], created["resultUrl"])
+
+        error, hidden = self._call(self.media["token"], "diaodu_luckin_claim_status", {"claim_id": created["claimId"]})
+        self.assertTrue(error)
+        self.assertEqual(hidden["reason"], "not_found")
+        error, hidden_token = self._call(self.media["token"], "diaodu_luckin_claim_status", {"result_token": created["resultToken"]})
+        self.assertTrue(error)
+        self.assertEqual(hidden_token["reason"], "not_found")
+
+        error, listed = self._call(self.media["token"], "diaodu_luckin_claims", {"status": "pending"})
+        self.assertFalse(error, listed)
+        self.assertEqual(listed["claims"][0]["contact"], PHONE)
+        error, denied = self._call(self.other["token"], "diaodu_luckin_fulfill", {
+            "claim_id": created["claimId"], "order_id": "1", "pickup_code": "2",
+        })
+        self.assertTrue(denied)
+        self.assertEqual(denied["code"], 403)
+
+        status, web = self.req("POST", "/v1/luckin/claims", claim_body(PHONE_B))
+        self.assertEqual(status, 201, web)
+        error, web_status = self._call(self.other["token"], "diaodu_luckin_claim_status", {"claim_id": web["claimId"]})
+        self.assertTrue(error)
+        self.assertEqual(web_status["reason"], "not_found")
+        error, full = self._call(self.other["token"], "diaodu_luckin_claim", {
+            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE_C, "consent": True,
+        })
+        self.assertTrue(error)
+        self.assertEqual(full["reason"], "quota_full")
+        self.assertEqual(self.req("GET", "/luckin/")[0], 200)
+        self.assertEqual(self.req("GET", "/v1/luckin/result/" + created["resultToken"])[1]["claimId"], created["claimId"])
+
+    def test_mcp_agent_type_gate(self):
+        buddy = self.identity.connect("办公助手", "WorkBuddy")
+        doubao = self.identity.connect("豆包助手", "豆包")
+        blank = self.identity.connect("未填工具", "Codex")
+        claude = self.identity.connect("克劳德", "Claude Code")
+        grok = self.identity.connect("格罗克", "gRoK")
+        with self.identity.db() as db:
+            db.execute("UPDATE agents SET type='' WHERE id=?", (blank["agent_id"],))
+
+        error, quota = self._call(buddy["token"], "diaodu_luckin_quota")
+        self.assertFalse(error, quota)
+        self.assertEqual(quota["remaining"], 2)
+
+        error, blocked = self._call(buddy["token"], "diaodu_luckin_claim", {
+            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE, "consent": True,
+        })
+        self.assertTrue(error)
+        self.assertEqual(blocked["code"], 403)
+        self.assertEqual(blocked["reason"], "agent_type_not_allowed")
+        self.assertIn("/v1/me/profile", blocked["message"])
+        self.assertIn("Codex", blocked["message"])
+
+        error, empty = self._call(blank["token"], "diaodu_luckin_claim", {
+            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "email": "guest@example.com", "consent": True,
+        })
+        self.assertTrue(error)
+        self.assertEqual(empty["reason"], "agent_type_required")
+        self.assertIn("diaodu_connect", empty["message"])
+        self.assertIn("/v1/me/profile", empty["message"])
+        self.assertIn("不要在 diaodu_luckin_claim", empty["message"])
+
+        error, folded = self._call(doubao["token"], "diaodu_luckin_claim", {
+            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE_B, "consent": True,
+        })
+        self.assertTrue(error)
+        self.assertEqual(folded["reason"], "agent_type_not_allowed")
+
+        status, profile = self.req("POST", "/v1/me/profile", {"agent_type": "claude-code"}, token=buddy["token"])
+        self.assertEqual(status, 200, profile)
+        self.assertEqual(profile["agent_type"], "claude-code")
+        error, created = self._call(buddy["token"], "diaodu_luckin_claim", {
+            "city": "杭州",
+            "shop_name": "瑞幸咖啡（西湖店）",
+            "phone": PHONE,
+            "consent": True,
+        })
+        self.assertFalse(error, created)
+        self.assertEqual(created["drink"], "生椰拿铁")
+        self.assertEqual(created["remaining"], 1)
+
+        error, second = self._call(claude["token"], "diaodu_luckin_claim", {
+            "city": "深圳", "shop_name": "瑞幸咖啡（科技园店）", "email": "claude@example.com", "consent": True,
+        })
+        self.assertFalse(error, second)
+        self.assertEqual(second["remaining"], 0)
+        error, third = self._call(grok["token"], "diaodu_luckin_claim", {
+            "city": "北京", "shop_name": "瑞幸咖啡（国贸店）", "phone": PHONE_C, "drink": "latte", "consent": True,
+        })
+        self.assertTrue(error)
+        self.assertEqual(third["reason"], "quota_full")
+        self.assertEqual(self.req("GET", "/v1/luckin/quota")[1]["remaining"], 0)
 
 
 if __name__ == "__main__":
