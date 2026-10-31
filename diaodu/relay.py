@@ -636,7 +636,8 @@ class Relay:
         if row["kind"] == "environment":
             return None
         event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
-                 "sender": {"role": row["sender_role"], "name": row["sender_name"]}}
+                 "sender": {"role": row["sender_role"], "name": row["sender_name"]},
+                 "from_owner": row["sender_role"] == "owner"}
         event.update(self._public_payload(row["kind"], json.loads(row["payload"]),
                                          db, row["session_id"]))
         return event
@@ -757,7 +758,8 @@ class Relay:
         if row["kind"] == "environment":
             return None
         event = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
-                 "sender": {"role": row["sender_role"], "name": row["sender_name"]}}
+                 "sender": {"role": row["sender_role"], "name": row["sender_name"]},
+                 "from_owner": row["sender_role"] == "owner"}
         event.update(self._public_payload(row["kind"], json.loads(row["payload"]),
                                           db, row["session_id"], "files",
                                           public_id=public_id, file_base=self._public_base()))
@@ -810,7 +812,8 @@ class Relay:
 
     def _event(self, db, row):
         result = {"seq": row["seq"], "kind": row["kind"], "created_at": _iso(row["created"]),
-                  "sender": {"role": row["sender_role"], "name": row["sender_name"]}}
+                  "sender": {"role": row["sender_role"], "name": row["sender_name"]},
+                  "from_owner": row["sender_role"] == "owner"}
         payload = json.loads(row["payload"])
         message = payload.get("message")
         if isinstance(message, dict):
@@ -849,16 +852,42 @@ class Relay:
                    (hashlib.sha256(code.encode()).hexdigest(), sid, role, expires))
         return {"role": role, "code": code, "expires_at": _iso(expires)}
 
-    def list_sessions(self, actor):
+    def list_sessions(self, actor, session_id=None):
         key = _actor(actor)
+        if session_id is not None:
+            if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 160:
+                raise ValueError("session不合法")
+            session_id = session_id.strip()
         with self._read() as db:
             rows = db.execute("SELECT s.* FROM sessions s JOIN members m ON m.session_id=s.id "
                               "WHERE m.actor_key=? ORDER BY s.updated DESC,s.id", (key,)).fetchall()
             result = []
             for row in rows:
+                if session_id is not None and row["id"] != session_id:
+                    continue
                 member = db.execute("SELECT * FROM members WHERE session_id=? AND actor_key=?", (row["id"], key)).fetchone()
                 result.append(self._session(db, row, member))
-            return {"sessions": result}
+            payload = {"sessions": result}
+            if session_id is not None:
+                payload["member"] = bool(result)
+            return payload
+
+    def _refuse_worker_topic(self, db, key):
+        """A token that only sits as worker must not open a topic it would own.
+
+        Owners and mentors still create topics. An identity that is already an
+        owner of some open session can create another, even if it is also a
+        worker elsewhere. Closing the worker session lifts the block.
+        """
+        rows = db.execute(
+            "SELECT m.role FROM members m JOIN sessions s ON s.id=m.session_id "
+            "WHERE m.actor_key=? AND s.status!='closed'", (key,)).fetchall()
+        roles = {row["role"] for row in rows}
+        if "worker" in roles and "owner" not in roles:
+            raise AuthError(
+                "执行端不能创建 Topic。当前身份在未结束的会话里只是 worker；"
+                "创建属于管理者。指导端，以及已经是某场管理者的身份，仍可创建。",
+                403)
 
     def create(self, actor, body):
         key = _actor(actor)
@@ -869,6 +898,7 @@ class Relay:
         sid = "rl_" + secrets.token_hex(16)
         topic_code = secrets.token_urlsafe(24)
         with self._write() as db:
+            self._refuse_worker_topic(db, key)
             count = db.execute("SELECT COUNT(*) FROM sessions WHERE owner_key=? AND status!='closed'", (key,)).fetchone()[0]
             if count >= self.MAX_OPEN_SESSIONS:
                 raise AuthError("每个管理者最多20个未关闭会话", 429)

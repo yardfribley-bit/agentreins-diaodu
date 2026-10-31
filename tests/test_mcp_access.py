@@ -254,6 +254,117 @@ class McpAccess(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(deleted['ok'], True)
 
+    def test_whoami_relay_contract_and_stale_mcp_session(self):
+        listed, _sid = self.rpc('tools/list')
+        tools = {tool['name']: tool for tool in listed['result']['tools']}
+        self.assertIn('diaodu_whoami', tools)
+        self.assertTrue(tools['diaodu_whoami']['annotations']['readOnlyHint'])
+        self.assertIn('agent_id', tools['diaodu_connect']['outputSchema']['required'])
+        self.assertIn('agent_id', tools['diaodu_whoami']['outputSchema']['properties'])
+        join = tools['diaodu_relay_join']['inputSchema']
+        self.assertEqual(join['required'], ['code', 'role'])
+        self.assertEqual(join['properties']['environment']['required'], ['os_name', 'os_version', 'architecture'])
+        self.assertIn('allOf', join)
+        self.assertIn('id', tools['diaodu_relay_join']['outputSchema']['properties']['session']['required'])
+        self.assertIn('sessions', tools['diaodu_relay_list']['outputSchema']['properties'])
+        self.assertIn('session', tools['diaodu_relay_list']['inputSchema']['properties'])
+        self.assertNotIn('session', tools['diaodu_relay_list']['inputSchema']['required'])
+        self.assertIn('8000', tools['diaodu_relay_send']['description'])
+        self.assertIn('8000', tools['diaodu_relay_send']['inputSchema']['properties']['text']['description'])
+        self.assertIn('10MB', tools['diaodu_relay_upload']['description'])
+        self.assertIn('REST', tools['diaodu_relay_upload']['description'])
+        self.assertIn('file_id', tools['diaodu_relay_upload']['outputSchema']['required'])
+        read = tools['diaodu_relay_read']
+        self.assertEqual(read['inputSchema']['properties']['wait']['maximum'], 20)
+        self.assertIn('from_owner', read['description'])
+        event = read['outputSchema']['properties']['events']['items']
+        self.assertIn('sender', event['properties'])
+        self.assertIn('from_owner', event['required'])
+        self.assertIn('seq', event['required'])
+        self.assertIn('diaodu_whoami', self.raw('GET', '/llms.txt')[1])
+        guide = self.raw('GET', '/v1/agent-guide.md')[1]
+        self.assertIn('from_owner', guide)
+        self.assertIn('diaodu_whoami', guide)
+        self.assertIn('8000', guide)
+
+        token = self.agents[0]['token']
+        other = self.agents[1]['token']
+        who, _sid = self.rpc('whoami', {}, token=token, call=True)
+        self.assertFalse(who['result']['isError'], who)
+        identity = json.loads(who['result']['content'][0]['text'])
+        self.assertEqual(who['result']['structuredContent'], identity)
+        self.assertEqual(identity['agent_id'], self.agents[0]['agent_id'])
+        self.assertNotIn('token', identity)
+
+        created = self.tool('relay_create', {'title': '核对', 'goal': '属于我'}, token=token)
+        sid = created['session']['id']
+        self.assertTrue(sid.startswith('rl_'))
+        self.assertTrue(created['topic_code'])
+        listed_one = self.tool('relay_list', {'session': sid}, token=token)
+        self.assertTrue(listed_one['member'])
+        self.assertEqual(listed_one['sessions'][0]['role'], 'owner')
+        stranger = self.tool('relay_list', {'session': sid}, token=other)
+        self.assertFalse(stranger['member'])
+        self.assertEqual(stranger['sessions'], [])
+
+        denied, _sid = self.rpc('relay_send', {
+            'session': sid, 'kind': 'instruction', 'text': '外人指令', 'request_id': 'nope',
+        }, token=other, call=True)
+        self.assertTrue(denied['result']['isError'])
+        self.assertEqual(json.loads(denied['result']['content'][0]['text'])['code'], 404)
+        self.assertNotIn('structuredContent', denied['result'])
+
+        joined = self.tool('relay_join', {
+            'code': created['topic_code'], 'role': 'worker',
+            'environment': {'os_name': 'Android', 'os_version': '14', 'architecture': 'arm64'},
+        }, token=other)
+        self.assertEqual(joined['session']['id'], sid)
+        self.assertEqual(joined['session']['role'], 'worker')
+        blocked, _sid = self.rpc('relay_send', {
+            'session': sid, 'kind': 'instruction', 'text': '执行端指令', 'request_id': 'worker-inst',
+        }, token=other, call=True)
+        self.assertEqual(json.loads(blocked['result']['content'][0]['text'])['code'], 403)
+        cannot_create, _sid = self.rpc('relay_create', {'title': '越权', 'goal': '执行端'}, token=other, call=True)
+        self.assertEqual(json.loads(cannot_create['result']['content'][0]['text'])['code'], 403)
+
+        sent = self.tool('relay_send', {
+            'session': sid, 'kind': 'instruction', 'text': '管理者指令', 'request_id': 'owner-inst',
+        }, token=token)
+        self.assertTrue(sent['event']['from_owner'])
+        self.assertEqual(sent['event']['sender']['role'], 'owner')
+        self.assertGreaterEqual(sent['event']['seq'], 1)
+        note = self.tool('relay_send', {
+            'session': sid, 'kind': 'note', 'text': '执行端备注', 'request_id': 'worker-note',
+        }, token=other)
+        self.assertFalse(note['event']['from_owner'])
+        self.assertEqual(note['event']['sender']['role'], 'worker')
+        too_long, _sid = self.rpc('relay_send', {
+            'session': sid, 'kind': 'note', 'text': 'x' * 8001, 'request_id': 'long',
+        }, token=token, call=True)
+        self.assertEqual(json.loads(too_long['result']['content'][0]['text'])['code'], 400)
+        second = self.tool('relay_create', {'title': '环境', 'goal': '缺字段'}, token=token)
+        missing_env, _sid = self.rpc('relay_join', {
+            'code': second['topic_code'], 'role': 'worker',
+        }, token=other, call=True)
+        self.assertTrue(missing_env['result']['isError'])
+        self.assertIn('不合法', json.loads(missing_env['result']['content'][0]['text'])['message'])
+
+        _init, mcp_sid = self.rpc('initialize', {'protocolVersion': '2025-11-25'})
+        from diaodu import mcp as mcp_mod
+        saved = dict(mcp_mod.SESSIONS)
+        mcp_mod.SESSIONS.clear()
+        try:
+            recovered = self.tool('whoami', {}, sid=mcp_sid, token=token)
+            self.assertEqual(recovered['agent_id'], self.agents[0]['agent_id'])
+            lost, _sid = self.rpc('whoami', {}, sid=mcp_sid, call=True)
+            self.assertTrue(lost['result']['isError'])
+            err = json.loads(lost['result']['content'][0]['text'])
+            self.assertEqual(err['reason'], 'mcp_session_unknown')
+            self.assertEqual(err['code'], 401)
+        finally:
+            mcp_mod.SESSIONS.clear()
+            mcp_mod.SESSIONS.update(saved)
+
 
 if __name__ == '__main__':
     unittest.main()

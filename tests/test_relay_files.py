@@ -91,6 +91,9 @@ class RelayFiles(unittest.TestCase):
                 self.assertEqual(status, 400)
 
     def test_private_attachments_and_cross_session_ids(self):
+        # Create before joining: a token that is only a worker cannot open a topic.
+        other = self.clients['worker'].create('另一个会话', '跨会话不可读')
+        other_sid = other['session']['id']
         self.join()
         status, _ = self.upload(self.sid, '私有.txt', b'secret', 'outsider')
         self.assertEqual(status, 403)
@@ -98,8 +101,6 @@ class RelayFiles(unittest.TestCase):
         self.assertEqual(status, 201)
         status, _, _ = self.download(self.sid, meta['id'], 'outsider')
         self.assertEqual(status, 403)
-        other = self.clients['worker'].create('另一个会话', '跨会话不可读')
-        other_sid = other['session']['id']
         status, _, _ = self.download(other_sid, meta['id'], 'worker')
         self.assertEqual(status, 404)
 
@@ -152,7 +153,9 @@ class RelayFiles(unittest.TestCase):
             'content_base64': base64.b64encode(content).decode()}, sid2)
         self.assertFalse(body['result']['isError'])
         meta = self.mcp_payload(body)
+        self.assertEqual(meta['file_id'], meta['id'])
         self.assertEqual(meta['sha256'], hashlib.sha256(content).hexdigest())
+        self.assertEqual(body['result']['structuredContent']['file_id'], meta['id'])
         status, body = self.mcp_call('relay_send', {
             'session': created['session']['id'], 'kind': 'result', 'text': '完成',
             'request_id': 'mcp-file-1', 'attachments': [meta['id']]}, sid2)
@@ -190,6 +193,8 @@ class RelayFiles(unittest.TestCase):
         self.assertEqual(hashlib.sha256(data).hexdigest(), meta['sha256'])
 
     def test_signed_url_expired_tampered_and_cross_session(self):
+        other = self.clients['worker'].create('跨会话签名', '不得读取')
+        other_sid = other['session']['id']
         self.join()
         status, meta = self.upload(self.sid, '签名.txt', b'payload', 'worker')
         relay = self.library.relay
@@ -205,8 +210,6 @@ class RelayFiles(unittest.TestCase):
         wrong_exp = (f'{self.base}/v1/relay/sessions/{self.sid}/files/{meta["id"]}'
                      f'?exp={shifted}&sig={query["sig"][0]}')
         self.assertEqual(self.raw_get(wrong_exp)[0], 403)
-        other = self.clients['worker'].create('跨会话签名', '不得读取')
-        other_sid = other['session']['id']
         other_exp, other_sig = relay.signature(other_sid, meta['id'])
         cross = (f'{self.base}/v1/relay/sessions/{other_sid}/files/{meta["id"]}'
                  f'?exp={other_exp}&sig={other_sig}')
