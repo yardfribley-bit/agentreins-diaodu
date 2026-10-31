@@ -62,6 +62,15 @@ def get(handler, library, identity, parsed):
             luckin.limit("read", _ip(handler), luckin.read_ip_limit)
             handler._json(200, luckin.quota())
             return
+        if path in ("/v1/luckin/menu",):
+            luckin.limit("read", _ip(handler), luckin.read_ip_limit)
+            offer = luckin.offer()
+            handler._json(200, {
+                "drinks": offer["drinks"],
+                "quota": luckin.quota(),
+                "message": offer["message"],
+            })
+            return
         if path == "/v1/luckin/result" or path.startswith("/v1/luckin/result/"):
             luckin.limit("read", _ip(handler), luckin.read_ip_limit)
             token = path[len("/v1/luckin/result/"):] if path.startswith("/v1/luckin/result/") else ""

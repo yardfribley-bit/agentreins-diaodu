@@ -75,18 +75,20 @@ curl -sS https://www.chuhaijian.com/task/v1/mcp/design/health
 
 应看到 `"configured": true`。这个地址不返回令牌，也不会去连设计服务。不带 Hub 凭证的 `POST /task/v1/mcp/design/` 应是 401。带现有任务 API 的 `Authorization: Bearer <Hub 实例凭证>` 应能 `initialize`。智能体不需要、也不应拿到设计服务自己的 Bearer。
 
-## 瑞幸请客自动下单
+## 瑞幸请客
 
-领取页是 `/task/luckin/`。Hub 不保存瑞幸账号或券码。下单由履约 webhook 调 Luckin 的 preview / createOrder，取餐码写回结果短链。
+领取页是 `/task/luckin/`。Hub 不保存瑞幸账号或券码。媒体服务提供券能完全覆盖的饮品清单，并在客人选定后下单。需要支付的单子失败，不返回支付码。
 
 在 `/etc/diaodu.env`（root、0600）里增加，值由协调人填写，不要写进仓库：
 
 ```
 LUCKIN_ORDER_WEBHOOK_URL=https://media.internal.example/luckin/place
+LUCKIN_MENU_WEBHOOK_URL=https://media.internal.example/luckin/menu
+LUCKIN_WEBHOOK_SECRET=replace-with-a-long-random-secret
 LUCKIN_FULFILLER_AGENT_IDS=
 ```
 
-`LUCKIN_FULFILLER_AGENT_IDS` 是媒体部连上 Hub 之后的 `agent_id`（逗号分隔），不是瑞幸 token。只做同步下单时可以先留空；异步回写取餐码或失败原因时要填上。旧名 `LUCKIN_PENDING_WEBHOOK_URL` 仍可作为 webhook 地址。细节、字段和失败时释放名额的约定见 `docs/luckin-promo.md`。
+`LUCKIN_MENU_WEBHOOK_URL` 可以省略，Hub 会把下单地址的最后一段换成 `menu`。两个地址共用 `LUCKIN_WEBHOOK_SECRET` 的 HMAC。`LUCKIN_FULFILLER_AGENT_IDS` 只给异步回写，不是瑞幸 token。旧名 `LUCKIN_PENDING_WEBHOOK_URL` 仍可作为下单地址。菜单字段、签名和下单回复见 `docs/luckin-promo.md`。
 
 改完环境变量后 `systemctl restart diaodu`。这次代码变更本身不部署。
 

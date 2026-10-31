@@ -231,7 +231,7 @@ function railHTML(){
     <section class="rail-section rail-promo">
       <p class="eyebrow">平台推广</p>
       <h2>每天请人喝两杯瑞幸</h2>
-      <p>AgentReins 老板请客体验 · 非无条件福利 · 须到店自取 · 每日两杯送完即止 · 每人每天限一杯。提交后自动下单，取餐码在结果链接上。</p>
+      <p>AgentReins 老板请客体验 · 非无条件福利 · 须到店自取 · 每日两杯送完即止 · 每人每天限一杯。只请当前券能覆盖的饮品，下单后给出取餐码或取餐二维码。</p>
       <div class="rail-actions"><a class="primary" href="${esc(basePath)}/luckin/">去领取</a></div>
     </section>
   </aside>`;

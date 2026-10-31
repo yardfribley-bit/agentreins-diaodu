@@ -10,7 +10,7 @@ import unittest
 import urllib.request
 from contextlib import redirect_stderr
 from datetime import datetime, timezone
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -21,11 +21,11 @@ from diaodu.library import Library
 from diaodu.luckin import (
     Luckin,
     LuckinError,
-    coding_agent_status,
     mask_email,
     mask_phone,
     normalize_email,
     normalize_phone,
+    sign_webhook,
 )
 from diaodu.server import make_handler
 
@@ -34,6 +34,53 @@ PHONE = "13800000001"
 PHONE_B = "13900000002"
 PHONE_C = "13700000003"
 PHONE_D = "13600000004"
+
+SAMPLE_MENU = {
+    "drinks": [
+        {
+            "id": "coconut_latte",
+            "name": "生椰拿铁",
+            "spec": "大杯/冰/意式拼配/默认浓度/不另外加糖/无奶油",
+            "remaining": 2,
+            "productId": "1262",
+            "sku": "SP2077-01134",
+            "needPay": False,
+        },
+        {
+            "id": "americano",
+            "name": "标准美式",
+            "spec": "大杯/冰",
+            "remaining": 1,
+            "productId": "2500",
+            "sku": "SP2277-03135",
+            "needPay": False,
+        },
+        {
+            "id": "paid_latte",
+            "name": "要付钱的拿铁",
+            "spec": "大杯",
+            "needPay": True,
+            "productId": "1",
+            "sku": "NOPE",
+        },
+    ]
+}
+
+QR_URL = "https://media.example/luckin/pickup/3891.png"
+QR_DATA = "data:image/png;base64,iVBORw0KGgo="
+
+
+def webhook_reply(order):
+    """Poster that serves the coupon menu and delegates place calls."""
+
+    def poster(url, payload):
+        if isinstance(payload, dict) and payload.get("action") == "menu":
+            return SAMPLE_MENU
+        if callable(order):
+            return order(url, payload)
+        return order
+
+    return poster
 
 
 def claim_body(phone=PHONE, **extra):
@@ -78,6 +125,8 @@ class StoreTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _poster(self, url, payload):
+        if isinstance(payload, dict) and payload.get("action") == "menu":
+            return SAMPLE_MENU
         self.hooks.append((url, payload))
         return {"ok": True, "accepted": True}
 
@@ -96,7 +145,8 @@ class StoreTests(unittest.TestCase):
         hook = self.hooks[0][1]
         self.assertEqual(hook["action"], "place")
         self.assertEqual(hook["payWith"], "coupon")
-        self.assertEqual(hook["payPolicy"], "coupon_then_balance")
+        self.assertEqual(hook["payPolicy"], "coupon_only")
+        self.assertIs(hook["needPay"], False)
         self.assertEqual(hook["drink"], "生椰拿铁")
         self.assertEqual(hook["drinkId"], "coconut_latte")
         self.assertEqual(hook["productId"], 1262)
@@ -219,39 +269,29 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["person_hash"], rows[1]["person_hash"])
         self.assertEqual([row["day"] for row in rows], ["2026-10-29", "2026-10-30"])
 
-    def test_webhook_failure_frees_quota_and_hides_the_phone(self):
+    def test_menu_down_refuses_without_consuming_quota(self):
         os.environ["LUCKIN_PENDING_WEBHOOK_URL"] = "http://127.0.0.1:1/luckin"
         self.store.poster = None
+        self.store.forget_menu()
         err = io.StringIO()
         with redirect_stderr(err):
-            created = self.store.create(claim_body(), "https://www.chuhaijian.com")
-        self.assertEqual(created["status"], "failed")
-        self.assertIn("自动下单通知失败", created["failReason"])
+            with self.assertRaises(LuckinError) as raised:
+                self.store.create(claim_body(), "https://www.chuhaijian.com")
+        self.assertEqual(raised.exception.code, "no_coupons")
+        self.assertIn("没有可用的券", str(raised.exception))
         self.assertEqual(self.store.quota()["remaining"], 2)
         self.assertNotIn(PHONE, err.getvalue())
-        self.assertIn(created["claimId"], err.getvalue())
+        with self.store._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM claims").fetchone()[0], 0)
         os.environ["LUCKIN_PENDING_WEBHOOK_URL"] = "file:///tmp/luckin-secret"
+        self.store.forget_menu()
         err = io.StringIO()
         with redirect_stderr(err):
-            self.store.fail(created["claimId"], "腾出名额")
-            self.store.create(claim_body(PHONE_B), "https://www.chuhaijian.com")
+            with self.assertRaises(LuckinError) as raised:
+                self.store.create(claim_body(PHONE_B), "https://www.chuhaijian.com")
+        self.assertEqual(raised.exception.code, "no_coupons")
         self.assertNotIn(PHONE_B, err.getvalue())
         self.assertIn("unsupported scheme", err.getvalue())
-
-    def test_coding_agent_allowlist(self):
-        allowed = (
-            "Codex", "CODEX", "OpenAI Codex", "codex-cli",
-            "Claude", "Anthropic Claude",
-            "Claude Code", "claude-code", "ClaudeCode",
-            "Cursor", "Cursor Agent", "cursor-agent", "CursorAgent",
-            "Grok", "gRoK", "xAI Grok", "Grok 4", "grok-4",
-        )
-        for name in allowed:
-            self.assertEqual(coding_agent_status(name), "ok", name)
-        for name in ("", "   ", None, "访客", "人员", "未确认", "工具未确认"):
-            self.assertEqual(coding_agent_status(name), "unset", name)
-        for name in ("WorkBuddy", "豆包", "ChatGPT", "Gemini", "codexx"):
-            self.assertEqual(coding_agent_status(name), "denied", name)
 
     def test_mcp_owner_cannot_read_someone_elses_claim(self):
         owner = "ag_" + "ab" * 12
@@ -318,7 +358,7 @@ class StoreTests(unittest.TestCase):
         )
         db.commit()
         db.close()
-        store = Luckin(root, "/task", "https://www.chuhaijian.com", poster=lambda url, payload: {"ok": True, "accepted": True})
+        store = Luckin(root, "/task", "https://www.chuhaijian.com", poster=webhook_reply({"ok": True, "accepted": True}))
         created = store.create(claim_body(), "https://www.chuhaijian.com", agent_id="ag_" + "ef" * 12)
         self.assertTrue(created["claimId"].startswith("lk_"))
         found = store.claim_for_agent("ag_" + "ef" * 12, claim_id=created["claimId"])
@@ -333,9 +373,13 @@ class AutoOrderTests(unittest.TestCase):
         self._saved = {
             "LUCKIN_ORDER_WEBHOOK_URL": os.environ.get("LUCKIN_ORDER_WEBHOOK_URL"),
             "LUCKIN_PENDING_WEBHOOK_URL": os.environ.get("LUCKIN_PENDING_WEBHOOK_URL"),
+            "LUCKIN_MENU_WEBHOOK_URL": os.environ.get("LUCKIN_MENU_WEBHOOK_URL"),
+            "LUCKIN_WEBHOOK_SECRET": os.environ.get("LUCKIN_WEBHOOK_SECRET"),
         }
         os.environ["LUCKIN_ORDER_WEBHOOK_URL"] = "https://media.example/luckin/place"
         os.environ.pop("LUCKIN_PENDING_WEBHOOK_URL", None)
+        os.environ.pop("LUCKIN_MENU_WEBHOOK_URL", None)
+        os.environ.pop("LUCKIN_WEBHOOK_SECRET", None)
 
     def tearDown(self):
         for key, value in self._saved.items():
@@ -346,13 +390,19 @@ class AutoOrderTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _poster(self, url, payload):
+        if isinstance(payload, dict) and payload.get("action") == "menu":
+            return SAMPLE_MENU
         self.calls.append((url, payload))
         return {"ok": True, "accepted": True}
 
     def test_coupon_preview_places_the_order_and_hides_the_coupon(self):
         def place(url, payload):
+            if payload.get("action") == "menu":
+                return SAMPLE_MENU
             self.calls.append(payload)
             self.assertEqual(payload["payWith"], "coupon")
+            self.assertEqual(payload["payPolicy"], "coupon_only")
+            self.assertIs(payload["needPay"], False)
             self.assertNotIn(PHONE, json.dumps(payload, ensure_ascii=False))
             return {
                 "ok": True,
@@ -385,54 +435,93 @@ class AutoOrderTests(unittest.TestCase):
         self.assertEqual(self.store.quota()["remaining"], 1)
         self.assertEqual(len(self.calls), 1)
 
-    def test_no_coupon_then_balance_succeeds(self):
+    def test_success_returns_pickup_code_and_qr(self):
         def place(url, payload):
-            self.calls.append(dict(payload))
-            if payload["payWith"] == "coupon":
-                return {"ok": False, "code": "no_coupon", "reason": "没有可用的抖音或团购券", "couponCodeList": ["DY-SECRET"]}
-            self.assertEqual(payload["payWith"], "balance")
-            self.assertNotIn("couponCodeList", payload)
-            self.assertNotIn("DY-SECRET", json.dumps(payload))
+            if payload.get("action") == "menu":
+                return SAMPLE_MENU
+            self.calls.append(payload["payWith"])
             return {
                 "ok": True,
+                "needPay": False,
                 "orderId": "LK2",
                 "pickupCode": "1024",
-                "payWith": "balance",
-                "shopName": "瑞幸咖啡（陆家嘴店）",
+                "qrUrl": QR_URL,
+                "qrData": QR_DATA,
+                "storeName": "瑞幸咖啡（陆家嘴店）",
+                "payUrl": "https://pay.weixin.qq.com/secret",
+                "couponCodeList": ["DY-SECRET"],
             }
 
         self.store.poster = place
         created = self.store.create(claim_body(), "https://www.chuhaijian.com")
         self.assertEqual(created["status"], "ready")
         self.assertEqual(created["pickupCode"], "1024")
-        self.assertEqual([item["payWith"] for item in self.calls], ["coupon", "balance"])
-        listed = self.store.list_claims("ready")
-        self.assertEqual(listed[0]["staffNote"], "auto:balance")
-        self.assertNotIn("DY-SECRET", json.dumps(listed, ensure_ascii=False))
-        self.assertEqual(self.store.quota()["remaining"], 1)
+        self.assertEqual(created["qrUrl"], QR_URL)
+        self.assertEqual(created["qrData"], QR_DATA)
+        self.assertEqual(created["storeName"], "瑞幸咖啡（陆家嘴店）")
+        blob = json.dumps(created, ensure_ascii=False)
+        self.assertNotIn("pay.weixin", blob)
+        self.assertNotIn("DY-SECRET", blob)
+        self.assertEqual(self.calls, ["coupon"])
+        public = self.store.public_by_token(created["resultToken"])
+        self.assertEqual(public["qrUrl"], QR_URL)
+        self.assertEqual(public["storeName"], "瑞幸咖啡（陆家嘴店）")
+        self.assertNotIn("pay.weixin", json.dumps(public))
 
-    def test_no_coupon_and_no_balance_frees_the_cup(self):
+    def test_need_pay_fails_and_frees_quota(self):
         def place(url, payload):
+            if payload.get("action") == "menu":
+                return SAMPLE_MENU
             self.calls.append(payload["payWith"])
-            if payload["payWith"] == "coupon":
-                return {"ok": False, "code": "no_coupon", "reason": "没有可用券"}
-            return {"ok": False, "code": "no_balance", "reason": "余额不足"}
+            return {
+                "ok": False,
+                "needPay": True,
+                "failReason": "这杯券没有完全覆盖，不能下单。",
+                "pickupCode": "9999",
+                "qrUrl": "weixin://wxpay/secret",
+                "payUrl": "https://pay.weixin.qq.com/checkout",
+            }
 
         self.store.poster = place
         created = self.store.create(claim_body(), "https://www.chuhaijian.com")
         self.assertEqual(created["status"], "failed")
-        self.assertNotEqual(created["status"], "pending")
-        self.assertEqual(created["failReason"], "余额不足")
+        self.assertEqual(created["failReason"], "这杯券没有完全覆盖，不能下单。")
+        self.assertNotIn("pickupCode", created)
+        blob = json.dumps(created, ensure_ascii=False)
+        self.assertNotIn("9999", blob)
+        self.assertNotIn("wxpay", blob)
+        self.assertNotIn("pay.weixin", blob)
         self.assertEqual(self.store.quota()["remaining"], 2)
-        self.assertEqual(self.calls, ["coupon", "balance"])
-        again = self.store.create(claim_body(), "https://www.chuhaijian.com")
-        self.assertEqual(again["status"], "failed")
-        self.assertNotEqual(again["claimId"], created["claimId"])
+        self.assertEqual(self.calls, ["coupon"])
+        with self.store._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM claims WHERE status='failed'").fetchone()[0], 1)
 
-    def test_shop_error_does_not_try_balance(self):
+    def test_empty_menu_and_off_menu_do_not_consume_quota(self):
+        self.store.poster = lambda url, payload: {"drinks": []}
+        self.store.forget_menu()
+        with self.assertRaises(LuckinError) as empty:
+            self.store.create(claim_body(), "https://www.chuhaijian.com")
+        self.assertEqual(empty.exception.code, "no_coupons")
+        self.assertEqual(self.store.quota()["remaining"], 2)
+        with self.store._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM claims").fetchone()[0], 0)
+
+        self.store.poster = self._poster
+        self.store.forget_menu()
+        with self.assertRaises(LuckinError) as off:
+            self.store.create(claim_body(drink="latte"), "https://www.chuhaijian.com")
+        self.assertEqual(off.exception.code, "drink_unavailable")
+        self.assertEqual(self.store.quota()["remaining"], 2)
+        with self.store._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM claims").fetchone()[0], 0)
+        self.assertEqual(self.calls, [])
+
+    def test_shop_error_does_not_place_a_second_call(self):
         def place(url, payload):
+            if payload.get("action") == "menu":
+                return SAMPLE_MENU
             self.calls.append(payload["payWith"])
-            return {"ok": False, "code": "shop", "reason": "没有这家店"}
+            return {"ok": False, "needPay": False, "failReason": "没有这家店"}
 
         self.store.poster = place
         created = self.store.create(claim_body(), "https://www.chuhaijian.com")
@@ -441,15 +530,20 @@ class AutoOrderTests(unittest.TestCase):
         self.assertEqual(self.calls, ["coupon"])
         self.assertEqual(self.store.quota()["remaining"], 2)
 
-    def test_missing_webhook_fails_closed_and_frees_quota(self):
+    def test_missing_webhook_refuses_before_taking_a_cup(self):
         os.environ.pop("LUCKIN_ORDER_WEBHOOK_URL", None)
         os.environ.pop("LUCKIN_PENDING_WEBHOOK_URL", None)
-        created = self.store.create(claim_body(), "https://www.chuhaijian.com")
-        self.assertEqual(created["status"], "failed")
-        self.assertIn("自动下单未配置", created["failReason"])
+        os.environ.pop("LUCKIN_MENU_WEBHOOK_URL", None)
+        self.store.forget_menu()
+        with self.assertRaises(LuckinError) as missing:
+            self.store.create(claim_body(), "https://www.chuhaijian.com")
+        self.assertEqual(missing.exception.code, "no_coupons")
         self.assertEqual(self.calls, [])
         self.assertEqual(self.store.quota()["remaining"], 2)
+        with self.store._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM claims").fetchone()[0], 0)
         os.environ["LUCKIN_PENDING_WEBHOOK_URL"] = "https://media.example/from-pending"
+        self.store.forget_menu()
         created = self.store.create(claim_body(), "https://www.chuhaijian.com")
         self.assertEqual(self.calls[0][0], "https://media.example/from-pending")
         self.assertEqual(created["status"], "ordering")
@@ -472,6 +566,67 @@ class AutoOrderTests(unittest.TestCase):
         self.assertEqual(ready["pickupCode"], "5555")
         self.assertEqual(self.store.public_by_token(created["resultToken"])["pickupCode"], "5555")
 
+    def test_menu_and_order_share_a_signature(self):
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                seen.append((
+                    self.path,
+                    body,
+                    self.headers.get("X-Luckin-Timestamp"),
+                    self.headers.get("X-Luckin-Signature"),
+                ))
+                if self.path.endswith("/menu"):
+                    payload = json.dumps(SAMPLE_MENU).encode()
+                else:
+                    payload = json.dumps({
+                        "ok": True,
+                        "needPay": False,
+                        "orderId": "LK9",
+                        "pickupCode": "2468",
+                        "qrUrl": QR_URL,
+                        "storeName": "瑞幸咖啡（陆家嘴店）",
+                    }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, fmt, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            os.environ["LUCKIN_ORDER_WEBHOOK_URL"] = "http://127.0.0.1:" + str(port) + "/luckin/place"
+            os.environ["LUCKIN_WEBHOOK_SECRET"] = "test-secret"
+            self.store.poster = None
+            self.store.forget_menu()
+            created = self.store.create(claim_body(), "https://www.chuhaijian.com")
+            self.assertEqual(created["status"], "ready")
+            self.assertEqual(created["pickupCode"], "2468")
+            self.assertEqual(created["qrUrl"], QR_URL)
+            self.assertEqual([item[0] for item in seen], ["/luckin/menu", "/luckin/place"])
+            for path, body, timestamp, signature in seen:
+                self.assertEqual(signature, sign_webhook("test-secret", timestamp, body))
+                parsed = json.loads(body)
+                if path.endswith("/menu"):
+                    self.assertEqual(parsed["action"], "menu")
+                else:
+                    self.assertEqual(parsed["payPolicy"], "coupon_only")
+                    self.assertIs(parsed["needPay"], False)
+                    self.assertEqual(parsed["drinkId"], "coconut_latte")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
 
 class HttpTests(unittest.TestCase):
     def setUp(self):
@@ -490,7 +645,7 @@ class HttpTests(unittest.TestCase):
         os.environ["LUCKIN_ORDER_WEBHOOK_URL"] = "https://media.example/luckin/place"
         os.environ.pop("LUCKIN_PENDING_WEBHOOK_URL", None)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(None, self.library, self.identity))
-        self.library.luckin.poster = lambda url, payload: {"ok": True, "accepted": True}
+        self.library.luckin.poster = webhook_reply({"ok": True, "accepted": True})
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = "http://127.0.0.1:" + str(self.server.server_address[1])
@@ -535,10 +690,19 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("AgentReins 老板请客体验 · 非无条件福利 · 须到店自取 · 每日两杯送完即止 · 每人每天限一杯", page)
         script = self.req("GET", "/luckin/luckin.js")[1]
-        self.assertIn("生椰拿铁", script)
+        self.assertIn("/v1/luckin/menu", script)
+        self.assertIn("取餐二维码", script)
         self.assertIn("正在下单", script)
         self.assertIn("取餐码", script)
         self.assertNotIn("人工确认", script)
+        self.assertNotIn("coconut_latte", script)
+        status, menu = self.req("GET", "/v1/luckin/menu")
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in menu["drinks"]], ["coconut_latte", "americano"])
+        self.assertNotIn("productId", json.dumps(menu))
+        self.assertNotIn("SP2077", json.dumps(menu))
+        self.assertIn("生椰拿铁", menu["message"])
+        self.assertEqual(menu["quota"]["remaining"], 2)
         self.assertNotIn("SP2077-01134", page)
         self.assertNotIn("1262", page)
         self.assertNotIn("__", page)
@@ -553,27 +717,46 @@ class HttpTests(unittest.TestCase):
         for snippet in (
             "LUCKIN_FULFILLER_AGENT_IDS",
             "LUCKIN_ORDER_WEBHOOK_URL",
+            "LUCKIN_MENU_WEBHOOK_URL",
+            "LUCKIN_WEBHOOK_SECRET",
             "LUCKIN_PENDING_WEBHOOK_URL",
-            "no_coupon",
+            "needPay",
+            "pickupCode",
+            "qrUrl",
+            "storeName",
+            "failReason",
+            "X-Luckin-Signature",
             "coconut_latte",
             "SP2077-01134",
-            "正在下单",
-            "取餐码",
+            "标准美式",
+            "现在没有可用的券",
         ):
             self.assertIn(snippet, doc)
+        self.assertIn("diaodu_luckin_menu", guide)
         self.assertIn("diaodu_luckin_claim", guide)
         self.assertIn("diaodu_luckin_quota", guide)
         self.assertIn("diaodu_luckin_claim_status", guide)
         guide_md = (ROOT / "diaodu" / "agent-guide.md").read_text(encoding="utf-8")
         for snippet in (
+            "diaodu_luckin_menu",
             "diaodu_luckin_claim",
             "diaodu_luckin_quota",
             "diaodu_luckin_claim_status",
-            "POST /v1/me/profile",
-            "Claude Code",
+            "pickupCode",
+            "storeName",
         ):
             self.assertIn(snippet, guide_md)
             self.assertIn(snippet, doc)
+        self.assertNotIn("agent_type_not_allowed", doc)
+        status, card = self.req("GET", "/.well-known/mcp.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(card["luckin"]["menuTool"], "diaodu_luckin_menu")
+        self.assertEqual([item["id"] for item in card["luckin"]["drinks"]], ["coconut_latte", "americano"])
+        status, live = self.req("GET", "/llms.txt")
+        self.assertEqual(status, 200)
+        self.assertIn("diaodu_luckin_menu", live)
+        self.assertIn("生椰拿铁", live)
+        self.assertIn("https://www.chuhaijian.com/task/luckin/", live)
 
         missing, missing_body = self.req("GET", "/v1/luckin/result")
         self.assertEqual(missing, 404)
@@ -700,16 +883,17 @@ class HttpTests(unittest.TestCase):
 
     def test_mcp_claim_quota_and_ownership(self):
         guest = self._tool_names(self.other["token"])
-        for name in ("diaodu_luckin_quota", "diaodu_luckin_claim", "diaodu_luckin_claim_status"):
+        for name in ("diaodu_luckin_menu", "diaodu_luckin_quota", "diaodu_luckin_claim", "diaodu_luckin_claim_status"):
             self.assertIn(name, guest)
         for name in ("diaodu_luckin_claims", "diaodu_luckin_decide", "diaodu_luckin_fulfill", "diaodu_luckin_fail"):
             self.assertNotIn(name, guest)
         claim_tool = guest["diaodu_luckin_claim"]
         schema = claim_tool["inputSchema"]
         self.assertEqual(schema["additionalProperties"], False)
-        self.assertEqual(schema["required"], ["city", "shop_name", "consent"])
-        self.assertIn("coconut_latte", schema["properties"]["drink"]["enum"])
+        self.assertEqual(schema["required"], ["drink_id", "city", "shop_name", "consent"])
+        self.assertNotIn("drink", schema["properties"])
         self.assertNotIn("agent_type", schema["properties"])
+        self.assertTrue(guest["diaodu_luckin_menu"]["annotations"]["readOnlyHint"])
         self.assertTrue(guest["diaodu_luckin_quota"]["annotations"]["readOnlyHint"])
         self.assertTrue(guest["diaodu_luckin_claim_status"]["annotations"]["readOnlyHint"])
         media = self._tool_names(self.media["token"])
@@ -723,12 +907,13 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(quota["limit"], 2)
 
         error, anon = self._call(None, "diaodu_luckin_claim", {
-            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE, "consent": True,
+            "drink_id": "coconut_latte", "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE, "consent": True,
         })
         self.assertTrue(error)
         self.assertEqual(anon["code"], 401)
 
         error, invented = self._call(self.other["token"], "diaodu_luckin_claim", {
+            "drink_id": "coconut_latte",
             "city": "上海",
             "shop_name": "瑞幸咖啡（陆家嘴店）",
             "phone": PHONE,
@@ -739,6 +924,7 @@ class HttpTests(unittest.TestCase):
         self.assertIn("agent_type", invented["message"])
 
         error, created = self._call(self.other["token"], "diaodu_luckin_claim", {
+            "drink_id": "coconut_latte",
             "city": "上海",
             "shop_name": "瑞幸咖啡（陆家嘴店）",
             "phone": PHONE,
@@ -757,7 +943,7 @@ class HttpTests(unittest.TestCase):
         self.assertIn("138****0001", blob)
 
         error, again = self._call(self.other["token"], "diaodu_luckin_claim", {
-            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE, "consent": True,
+            "drink_id": "coconut_latte", "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE, "consent": True,
         })
         self.assertTrue(error)
         self.assertEqual(again["reason"], "already_claimed")
@@ -797,54 +983,41 @@ class HttpTests(unittest.TestCase):
         self.assertTrue(error)
         self.assertEqual(web_status["reason"], "not_found")
         error, full = self._call(self.other["token"], "diaodu_luckin_claim", {
-            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE_C, "consent": True,
+            "drink_id": "coconut_latte", "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE_C, "consent": True,
         })
         self.assertTrue(error)
         self.assertEqual(full["reason"], "quota_full")
         self.assertEqual(self.req("GET", "/luckin/")[0], 200)
         self.assertEqual(self.req("GET", "/v1/luckin/result/" + created["resultToken"])[1]["claimId"], created["claimId"])
 
-    def test_mcp_agent_type_gate(self):
+    def test_any_agent_sees_the_menu_on_connect_and_claims_from_it(self):
+        status, connected = self.req("POST", "/v1/connect", {"alias": "来客", "agent_type": "WorkBuddy"})
+        self.assertEqual(status, 201, connected)
+        self.assertEqual([item["id"] for item in connected["luckin"]["drinks"]], ["coconut_latte", "americano"])
+        self.assertEqual(connected["luckin"]["remaining"], 2)
+        self.assertIn("生椰拿铁", connected["onboarding"])
+        self.assertNotIn("1262", json.dumps(connected["luckin"]))
+
         buddy = self.identity.connect("办公助手", "WorkBuddy")
-        doubao = self.identity.connect("豆包助手", "豆包")
-        blank = self.identity.connect("未填工具", "Codex")
-        claude = self.identity.connect("克劳德", "Claude Code")
-        grok = self.identity.connect("格罗克", "gRoK")
-        with self.identity.db() as db:
-            db.execute("UPDATE agents SET type='' WHERE id=?", (blank["agent_id"],))
+        error, menu = self._call(buddy["token"], "diaodu_luckin_menu")
+        self.assertFalse(error, menu)
+        self.assertEqual(menu["drinks"][0]["name"], "生椰拿铁")
+        self.assertEqual(menu["quota"]["remaining"], 2)
+        self.assertNotIn("sku", json.dumps(menu))
 
-        error, quota = self._call(buddy["token"], "diaodu_luckin_quota")
-        self.assertFalse(error, quota)
-        self.assertEqual(quota["remaining"], 2)
-
-        error, blocked = self._call(buddy["token"], "diaodu_luckin_claim", {
-            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE, "consent": True,
+        error, off = self._call(buddy["token"], "diaodu_luckin_claim", {
+            "drink_id": "latte",
+            "city": "上海",
+            "shop_name": "瑞幸咖啡（陆家嘴店）",
+            "phone": PHONE,
+            "consent": True,
         })
         self.assertTrue(error)
-        self.assertEqual(blocked["code"], 403)
-        self.assertEqual(blocked["reason"], "agent_type_not_allowed")
-        self.assertIn("/v1/me/profile", blocked["message"])
-        self.assertIn("Codex", blocked["message"])
+        self.assertEqual(off["reason"], "drink_unavailable")
+        self.assertEqual(self.req("GET", "/v1/luckin/quota")[1]["remaining"], 2)
 
-        error, empty = self._call(blank["token"], "diaodu_luckin_claim", {
-            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "email": "guest@example.com", "consent": True,
-        })
-        self.assertTrue(error)
-        self.assertEqual(empty["reason"], "agent_type_required")
-        self.assertIn("diaodu_connect", empty["message"])
-        self.assertIn("/v1/me/profile", empty["message"])
-        self.assertIn("不要在 diaodu_luckin_claim", empty["message"])
-
-        error, folded = self._call(doubao["token"], "diaodu_luckin_claim", {
-            "city": "上海", "shop_name": "瑞幸咖啡（陆家嘴店）", "phone": PHONE_B, "consent": True,
-        })
-        self.assertTrue(error)
-        self.assertEqual(folded["reason"], "agent_type_not_allowed")
-
-        status, profile = self.req("POST", "/v1/me/profile", {"agent_type": "claude-code"}, token=buddy["token"])
-        self.assertEqual(status, 200, profile)
-        self.assertEqual(profile["agent_type"], "claude-code")
         error, created = self._call(buddy["token"], "diaodu_luckin_claim", {
+            "drink_id": "coconut_latte",
             "city": "杭州",
             "shop_name": "瑞幸咖啡（西湖店）",
             "phone": PHONE,
@@ -854,13 +1027,26 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(created["drink"], "生椰拿铁")
         self.assertEqual(created["remaining"], 1)
 
-        error, second = self._call(claude["token"], "diaodu_luckin_claim", {
-            "city": "深圳", "shop_name": "瑞幸咖啡（科技园店）", "email": "claude@example.com", "consent": True,
+        blank = self.identity.connect("未填工具", "Codex")
+        with self.identity.db() as db:
+            db.execute("UPDATE agents SET type='' WHERE id=?", (blank["agent_id"],))
+        error, second = self._call(blank["token"], "diaodu_luckin_claim", {
+            "drink_id": "americano",
+            "city": "深圳",
+            "shop_name": "瑞幸咖啡（科技园店）",
+            "email": "guest@example.com",
+            "consent": True,
         })
         self.assertFalse(error, second)
+        self.assertEqual(second["drink"], "标准美式")
         self.assertEqual(second["remaining"], 0)
-        error, third = self._call(grok["token"], "diaodu_luckin_claim", {
-            "city": "北京", "shop_name": "瑞幸咖啡（国贸店）", "phone": PHONE_C, "drink": "latte", "consent": True,
+
+        error, third = self._call(buddy["token"], "diaodu_luckin_claim", {
+            "drink_id": "coconut_latte",
+            "city": "北京",
+            "shop_name": "瑞幸咖啡（国贸店）",
+            "phone": PHONE_C,
+            "consent": True,
         })
         self.assertTrue(error)
         self.assertEqual(third["reason"], "quota_full")
@@ -868,19 +1054,26 @@ class HttpTests(unittest.TestCase):
 
     def test_mcp_claim_reaches_ready_or_failed_without_media(self):
         def place_coupon(url, payload):
+            if payload.get("action") == "menu":
+                return SAMPLE_MENU
             self.assertEqual(payload["action"], "place")
             self.assertEqual(payload["payWith"], "coupon")
             self.assertNotIn(PHONE, json.dumps(payload, ensure_ascii=False))
             return {
                 "ok": True,
+                "needPay": False,
                 "orderId": "LK-MCP",
                 "pickupCode": "8800",
-                "payWith": "coupon",
+                "qrUrl": QR_URL,
+                "storeName": "瑞幸咖啡（陆家嘴店）",
+                "payUrl": "https://pay.weixin.qq.com/nope",
                 "couponCodeList": ["HIDDEN-COUPON"],
             }
 
+        self.library.luckin.forget_menu()
         self.library.luckin.poster = place_coupon
         error, created = self._call(self.other["token"], "diaodu_luckin_claim", {
+            "drink_id": "coconut_latte",
             "city": "上海",
             "shop_name": "瑞幸咖啡（陆家嘴店）",
             "phone": PHONE,
@@ -891,7 +1084,11 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(error, created)
         self.assertEqual(created["status"], "ready")
         self.assertEqual(created["pickupCode"], "8800")
-        self.assertNotIn("HIDDEN-COUPON", json.dumps(created, ensure_ascii=False))
+        self.assertEqual(created["qrUrl"], QR_URL)
+        self.assertEqual(created["storeName"], "瑞幸咖啡（陆家嘴店）")
+        blob = json.dumps(created, ensure_ascii=False)
+        self.assertNotIn("HIDDEN-COUPON", blob)
+        self.assertNotIn("pay.weixin", blob)
         error, status = self._call(self.other["token"], "diaodu_luckin_claim_status", {"claim_id": created["claimId"]})
         self.assertFalse(error, status)
         self.assertEqual(status["status"], "ready")
@@ -901,13 +1098,20 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(by_token["pickupCode"], "8800")
         self.assertEqual(by_token["resultUrl"], created["resultUrl"])
 
-        def place_neither(url, payload):
-            if payload["payWith"] == "coupon":
-                return {"ok": False, "code": "no_coupon", "reason": "没有可用券", "couponCodeList": ["HIDDEN-COUPON"]}
-            return {"ok": False, "code": "no_balance", "reason": "余额不足"}
+        def place_need_pay(url, payload):
+            if payload.get("action") == "menu":
+                return SAMPLE_MENU
+            return {
+                "ok": False,
+                "needPay": True,
+                "failReason": "这杯需要另外支付，不能下单。",
+                "qrUrl": "weixin://wxpay/secret",
+                "payUrl": "https://pay.weixin.qq.com/checkout",
+            }
 
-        self.library.luckin.poster = place_neither
+        self.library.luckin.poster = place_need_pay
         error, failed = self._call(self.other["token"], "diaodu_luckin_claim", {
+            "drink_id": "americano",
             "city": "上海",
             "shop_name": "瑞幸咖啡（陆家嘴店）",
             "phone": PHONE_B,
@@ -915,11 +1119,13 @@ class HttpTests(unittest.TestCase):
         })
         self.assertFalse(error, failed)
         self.assertEqual(failed["status"], "failed")
-        self.assertEqual(failed["failReason"], "余额不足")
+        self.assertEqual(failed["failReason"], "这杯需要另外支付，不能下单。")
+        self.assertNotIn("wxpay", json.dumps(failed, ensure_ascii=False))
+        self.assertNotIn("pay.weixin", json.dumps(failed, ensure_ascii=False))
         error, failed_status = self._call(self.other["token"], "diaodu_luckin_claim_status", {"claim_id": failed["claimId"]})
         self.assertFalse(error, failed_status)
         self.assertEqual(failed_status["status"], "failed")
-        self.assertEqual(failed_status["failReason"], "余额不足")
+        self.assertEqual(failed_status["failReason"], "这杯需要另外支付，不能下单。")
         self.assertNotIn("HIDDEN-COUPON", json.dumps(failed_status, ensure_ascii=False))
         error, quota = self._call(self.other["token"], "diaodu_luckin_quota")
         self.assertEqual(quota["remaining"], 1)
