@@ -90,8 +90,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
         library.mailbox = mailbox
         from diaodu.outreach import Outreach
         library.outreach = Outreach(mailbox,(public_origin or "http://127.0.0.1")+library.public_base_path,identity)
-        from diaodu.luckin import Luckin
-        library.luckin = Luckin(library.root, library.public_base_path, public_origin)
     class Handler(BaseHTTPRequestHandler):
         def _actor(self, mutation=False, kind=None):
             authorization = self.headers.get("Authorization", "")
@@ -142,18 +140,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self.send_header('Content-Length', '0')
                 self.end_headers()
                 return
-            if parsed.path == '/luckin':
-                self.send_response(308)
-                self.send_header('Location', base_path + '/luckin/')
-                self.send_header('Content-Length', '0')
-                self.end_headers()
-                return
-            if parsed.path == '/luckin/':
-                self._luckin_page(False)
-                return
-            if re.fullmatch(r'/luckin/r/[A-Za-z0-9_\-]{16,200}', parsed.path):
-                self._luckin_page(True)
-                return
             bare = re.fullmatch(r'/conversations/(C-[pt][0-9a-f]{8})', parsed.path)
             if bare:
                 self.send_response(308)
@@ -184,8 +170,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 '/conversations/': 'conversations.html',
                 '/conversations/conversations.js': 'conversations.js',
                 '/conversations/conversations.css': 'conversations.css',
-                '/luckin/luckin.js': 'luckin.js',
-                '/luckin/luckin.css': 'luckin.css',
             }
             if parsed.path in static_files:
                 self._file(STATIC / static_files[parsed.path])
@@ -302,10 +286,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             try:
                 if design_mcp.is_design_path(parsed.path):
                     design_mcp.handle(self, 'HEAD' if getattr(self, '_head_only', False) else 'GET')
-                    return
-                if parsed.path == '/v1/luckin' or parsed.path.startswith('/v1/luckin/'):
-                    from diaodu import luckin_http
-                    luckin_http.get(self, library, identity, parsed)
                     return
                 if parsed.path == '/v1/public/reports.json' or parsed.path.startswith('/v1/public/reports/'):
                     from diaodu import report_public_http
@@ -452,10 +432,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 if design_mcp.is_design_path(urlparse(self.path).path):
                     design_mcp.handle(self, 'POST')
                     return
-                if parts[:2] == ['v1', 'luckin']:
-                    from diaodu import luckin_http
-                    luckin_http.post(self, library, identity, parts)
-                    return
                 if parts[:3] == ['v1', 'relay', 'teams']:
                     from diaodu import relay_teams_http
                     relay_teams_http.post(self, library, parts)
@@ -512,10 +488,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                     body = self._body()
                     result = identity.connect(body.get("alias"),body.get("agent_type","访客"),body.get("member_kind","agent"),body.get("email"),body.get("contact_consent",False))
                     result["csrf"] = digest("csrf:"+result["token"])
-                    if getattr(library, "luckin", None) is not None:
-                        offer = library.luckin.offer()
-                        result["luckin"] = offer
-                        result["onboarding"] = offer["message"]
                     self._json(201,result,{"Set-Cookie":self._cookie(result["token"])})
                     return
                 if len(parts)==4 and parts[:2]==['v1','tasks'] and parts[3]=='view':
@@ -815,16 +787,10 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             if not getattr(self,"_head_only",False):self.wfile.write(data)
 
         def _discovery(self, path):
-            offer = None
-            if getattr(library, "luckin", None) is not None:
-                try:
-                    offer = library.luckin.offer()
-                except Exception:
-                    offer = None
             if path.endswith("mcp.json"):
-                self._json(200, discovery.mcp_card(offer))
+                self._json(200, discovery.mcp_card())
                 return
-            data = discovery.llms_text(offer).encode("utf-8")
+            data = discovery.llms_text().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -873,28 +839,6 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
                 self._json(500, {"error": "服务暂时不可用，请稍后重试"})
             except (BrokenPipeError, ConnectionResetError):
                 pass
-
-        def _luckin_page(self, result):
-            """Serve the claim shell. Asset links stay relative so /task is preserved."""
-            up = "../../" if result else "../"
-            here = "../" if result else "./"
-            text = (STATIC / "luckin.html").read_text(encoding="utf-8")
-            text = text.replace("__FAVICON__", up + "favicon.svg")
-            text = text.replace("__TOKENS__", up + "tokens.css?v=20261031-luckin-menu")
-            text = text.replace("__CSS__", here + "luckin.css?v=20261031-luckin-menu")
-            text = text.replace("__JS__", here + "luckin.js?v=20261031-luckin-menu")
-            text = text.replace("__HOME__", up)
-            text = text.replace("__CONVO__", up + "conversations/")
-            text = text.replace("__RELAY__", up + "relay/")
-            text = text.replace("__SELF__", "../" if result else "./")
-            data = text.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            if not getattr(self, "_head_only", False):
-                self.wfile.write(data)
 
         def _file(self, path: Path):
             if not path.is_file():
