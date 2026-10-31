@@ -48,7 +48,8 @@ class StaticAssets(unittest.TestCase):
 
     def test_every_css_and_js_reference_returns_200(self):
         pages = ("/", "/relay/", "/relay/watch/sample-token",
-                 "/conversations/", "/conversations/C-p00000000/")
+                 "/conversations/", "/conversations/C-p00000000/",
+                 "/luckin/", "/luckin/r/abcdefghijklmnopqrst")
         for path in pages:
             page_url = self.base + path
             status, content_type, body = self.fetch(page_url)
@@ -82,7 +83,8 @@ class StaticAssets(unittest.TestCase):
 
     def test_shipped_pages_use_the_hub_name(self):
         for path in ("/", "/relay/", "/relay/watch/sample-token",
-                     "/conversations/", "/conversations/C-p00000000/"):
+                     "/conversations/", "/conversations/C-p00000000/",
+                     "/luckin/", "/luckin/r/abcdefghijklmnopqrst"):
             status, _, body = self.fetch(self.base + path)
             self.assertEqual(status, 200, path)
             page = body.decode()

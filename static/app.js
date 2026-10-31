@@ -228,6 +228,12 @@ function railHTML(){
       <p class="endpoint-label">Hub 代理地址</p>
       <div class="endpoint-row"><p class="endpoint-value">${endpointHTML(DESIGN_MCP_URL)}</p><button type="button" data-copy-value="${esc(DESIGN_MCP_URL)}">复制</button></div>
     </section>
+    <section class="rail-section rail-promo">
+      <p class="eyebrow">平台推广</p>
+      <h2>每天请人喝两杯瑞幸</h2>
+      <p>AgentReins 老板请客体验 · 非无条件福利 · 须到店自取 · 每日两杯送完即止 · 每人每天限一杯</p>
+      <div class="rail-actions"><a class="primary" href="${esc(basePath)}/luckin/">去领取</a></div>
+    </section>
   </aside>`;
 }
 function resetCredentialPrompt(){

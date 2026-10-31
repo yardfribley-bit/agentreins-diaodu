@@ -22,7 +22,7 @@ def described(spec, description):
     return merged
 S={'type':'string'};A={'type':'array','items':S}
 TASK={'task':described(S,'Task id (tk_…) or short number such as T000017.')}
-READONLY={'list_tasks','read_task','read_chat','read_review','relay_list','relay_read','relay_download','mail_inbox','mail_read','outreach_assignments','outreach_status','relay_team_list','relay_team_get','relay_team_read','relay_team_who_is_leader','relay_team_list_online','relay_team_task_list','relay_team_report_read','relay_team_invites','relay_team_gate_get','relay_team_download'}
+READONLY={'list_tasks','read_task','read_chat','read_review','relay_list','relay_read','relay_download','mail_inbox','mail_read','outreach_assignments','outreach_status','relay_team_list','relay_team_get','relay_team_read','relay_team_who_is_leader','relay_team_list_online','relay_team_task_list','relay_team_report_read','relay_team_invites','relay_team_gate_get','relay_team_download','luckin_claims'}
 DESTRUCTIVE={'relay_revoke','relay_state','relay_team_revoke','relay_team_state','relay_team_invite_reset','relay_team_gate_close'}
 TOOLS=[
  ('outreach_reply','仅在邮箱本人另行开启基础答疑自动发送后，回复真实已联系客户的邮件。收件人取实际来信，最多3封/客户/24小时；报价或承诺须本人处理。Requires a connected mailbox.',{'owner_id':S,'reply_id':S,'text':S},['reply_id','text']),
@@ -49,6 +49,8 @@ from diaodu.relay_mcp import TOOLS as RELAY_TOOLS
 TOOLS.extend(RELAY_TOOLS)
 from diaodu.relay_teams_mcp import TOOLS as TEAM_TOOLS
 TOOLS.extend(TEAM_TOOLS)
+from diaodu.luckin_mcp import TOOLS as LUCKIN_TOOLS
+TOOLS.extend(LUCKIN_TOOLS)
 
 def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip=None):
  method=request.get('method');rid=request.get('id');params=request.get('params') or {}
@@ -73,7 +75,10 @@ def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip
    with identity.db() as db: row=db.execute('SELECT name,type,member_kind FROM agents WHERE id=?',(actor['agent_id'],)).fetchone()
    actor=dict(actor,agent_name=row['name'],user_name=row['name'],agent_type=row['type'],member_kind=row['member_kind'])
   if method=='ping':result={}
-  elif method=='tools/list':result={'tools':[tool_spec(item) for item in TOOLS]}
+  elif method=='tools/list':
+   from diaodu.luckin import is_fulfiller
+   visible=TOOLS if is_fulfiller(actor) else [item for item in TOOLS if not item[0].startswith('luckin_')]
+   result={'tools':[tool_spec(item) for item in visible]}
   elif method=='resources/list':result={'resources':[]}
   elif method=='resources/templates/list':result={'resourceTemplates':[{'uriTemplate':'diaodu://task/{task}','name':'task','mimeType':'application/json'}]}
   elif method=='resources/read':
@@ -113,6 +118,9 @@ def handle(request,session_id,actor,identity,library,base_url,throttle,client_ip
      payload={k:v for k,v in connected.items() if k!='csrf'}
      payload['credential_storage']=SAVE_TOKEN
      payload['token_handling']='Shown once. Save outside the chat transcript.'
+   elif name.startswith('luckin_'):
+    from diaodu.luckin_mcp import call as luckin_call
+    payload=luckin_call(name,args,actor,library.luckin,identity)
    elif name.startswith('relay_team_'):
     from diaodu.relay_teams_mcp import call as team_call
     payload=team_call(name,args,actor,library.teams,identity,client_ip=client_ip)
