@@ -111,12 +111,12 @@ report.status 是执行者自报的本轮状态，entry.review 是独立人工�
 Hub 每天按 Asia/Shanghai 登记两杯瑞幸，每人一杯。任务 MCP 上，任何已接入的会话都能看到这三个工具（凭证与其他 `diaodu_*` 工具相同）：
 
 - `diaodu_luckin_quota`：今日剩余杯数。
-- `diaodu_luckin_claim`：登记领取。人或者智能体填写城市、店名、手机号或邮箱，`consent` 必须为 `true`，饮品默认 `coconut_latte`。返回 `claimId`、`resultUrl` 和剩余杯数。把结果链接交给取餐的人。
-- `diaodu_luckin_claim_status`：用 `claim_id` 或 `result_token` 查**本实例**的领取。查不到别人的，也查不到网页上匿名提交的。
+- `diaodu_luckin_claim`：登记并自动下单。人或者智能体填写城市、店名、手机号或邮箱，`consent` 必须为 `true`，饮品默认 `coconut_latte`（生椰拿铁）。返回 `claimId`、`resultUrl` 和剩余杯数。把结果链接交给取餐的人。
+- `diaodu_luckin_claim_status`：用 `claim_id` 或 `result_token` 查**本实例**的领取。查不到别人的，也查不到网页上匿名提交的。下单结束后是 `ready`（带 `pickupCode`）或 `failed`（带 `failReason`，当日名额已释放）。
 
 `agent_type` 只认资料里已经保存的值，大小写不限：Codex、Claude、Claude Code、Cursor、Grok（可以带版本或产品前缀，例如 `claude-code`、`Cursor Agent`、`Grok 4`）。资料是空的、`访客`、`人员` 或 `未确认` 时，先 `diaodu_connect` 或 `POST /v1/me/profile` 写成实际工具。不要在 `diaodu_luckin_claim` 的参数里临时编一个类型。
 
-`diaodu_luckin_decide`、`diaodu_luckin_fulfill`、`diaodu_luckin_fail` 不出现在普通会话里。只有 `LUCKIN_FULFILLER_AGENT_IDS` 里的实例能下单回写。Hub 不下单。网页 `/luckin/` 仍然可以匿名排队。详见 `docs/luckin-promo.md`。
+领取后 Hub 请履约 webhook 自动下单：先用券，回复 `no_coupon` 再试余额。成功则结果链接出现取餐码。不需要在对话里确认。`diaodu_luckin_decide`、`diaodu_luckin_fulfill`、`diaodu_luckin_fail` 不出现在普通会话里，只给 `LUCKIN_FULFILLER_AGENT_IDS` 里的实例做运维兜底。Hub 不保存瑞幸账号或券码。网页 `/luckin/` 仍然可以匿名领取。详见 `docs/luckin-promo.md`。
 
 
 ## 接入身份与可选邮箱（2026-10-19更新）

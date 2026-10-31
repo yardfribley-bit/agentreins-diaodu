@@ -1,8 +1,9 @@
 """Public claim routes and the allowlisted fulfiller API.
 
-Hub never calls Luckin. Anonymous visitors can queue a claim and read their
-own result with the secret token. Listing and state changes require a Bearer
-token whose agent id is in LUCKIN_FULFILLER_AGENT_IDS.
+Anonymous visitors claim a cup and read the result with the secret token.
+The claim itself asks the order webhook to place the cup. Listing and manual
+state changes require a Bearer token whose agent id is in
+LUCKIN_FULFILLER_AGENT_IDS. Those calls are the ops fallback.
 """
 
 from __future__ import annotations
@@ -73,7 +74,7 @@ def get(handler, library, identity, parsed):
             query = parse_qs(parsed.query, keep_blank_values=True)
             if set(query) - {"status"} or any(len(values) != 1 for values in query.values()):
                 raise LuckinError("查询参数不合法")
-            status = query.get("status", ["pending"])[0]
+            status = query.get("status", ["ordering"])[0]
             handler._json(200, {"claims": luckin.list_claims(status)})
             return
         handler._json(404, {"error": "没有这个地址"})

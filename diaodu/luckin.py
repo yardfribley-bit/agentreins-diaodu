@@ -1,8 +1,14 @@
-"""Luckin promo queue. Hub records claims only.
+"""Luckin promo. A claim places the cup through the media order webhook.
 
-This module never calls Luckin and never reads Luckin credentials. Ordering
-happens later, outside the process, after a person on the media team confirms
-the claim. Contacts are stored sealed; public JSON only gets a mask.
+Hub does not store Luckin account tokens or coupon codes, and it does not
+speak the Luckin API. The order webhook (media's allowlisted worker) runs
+preview then createOrder. Hub tries the coupon pay path first and, only when
+that reply is ``no_coupon``, tries balance. A pickup code marks the claim
+ready. A definite failure writes the reason and frees the day's cup. Chat
+confirmation is not part of this path.
+
+Contacts are stored sealed. Public JSON only gets a mask. Coupon codes that
+arrive on a webhook reply are dropped and never stored.
 """
 
 from __future__ import annotations
@@ -31,13 +37,17 @@ PERSON_LIMIT = 1
 ACTIVE = ("pending", "ordering", "ready")
 STATUSES = ("pending", "ordering", "ready", "failed", "rejected", "cancelled")
 LABELS = {
-    "pending": "排队中，等待人工确认",
-    "ordering": "已确认，正在下单",
+    "pending": "正在下单",
+    "ordering": "正在下单",
     "ready": "可取餐",
     "failed": "下单未成功，今日名额已释放",
     "rejected": "未通过，今日名额已释放",
     "cancelled": "已取消，今日名额已释放",
 }
+PAY_COUPON = "coupon"
+PAY_BALANCE = "balance"
+PAY_POLICY = "coupon_then_balance"
+NO_COUPON = "no_coupon"
 
 # Chinese names are what the page shows. product_id / sku are for the media
 # team only; v1 has a confirmed sku for the default drink.
@@ -65,9 +75,14 @@ _CODING_AGENT_PHRASES = ("claude code", "codex", "claude", "cursor", "grok")
 _CODING_AGENT_JOINED = ("claudecode", "cursoragent", "cursorcloudagent")
 
 CLAIM_FIELDS = {"phone", "email", "city", "shopName", "locationNote", "lat", "lng", "drink", "consent"}
-WEBHOOK_FIELDS = {
-    "claimId", "contactMasked", "city", "shopName", "locationNote",
-    "drink", "tasteNote", "createdAt", "resultUrl",
+# Fields the media worker needs to call Luckin previewOrder / createOrder.
+# No phone, email, coupon code, or Luckin token. resultUrl is the guest's
+# short link; the worker must keep that endpoint private.
+ORDER_FIELDS = {
+    "action", "payWith", "payPolicy", "claimId", "resultUrl", "contactMasked",
+    "city", "shopName", "locationNote", "latitude", "longitude",
+    "drink", "drinkId", "productId", "skuCode", "amount", "spec",
+    "productList", "createdAt",
 }
 
 
@@ -81,6 +96,15 @@ class LuckinError(Exception):
 def fulfiller_ids():
     raw = os.environ.get("LUCKIN_FULFILLER_AGENT_IDS", "")
     return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def order_webhook_url():
+    """Media order endpoint. The new name wins; the pending URL still works."""
+    return (
+        os.environ.get("LUCKIN_ORDER_WEBHOOK_URL")
+        or os.environ.get("LUCKIN_PENDING_WEBHOOK_URL")
+        or ""
+    ).strip()
 
 
 def is_fulfiller(actor):
@@ -389,6 +413,12 @@ class Luckin:
                 raise LuckinError("今日两杯已送完，请明天再来。", 409, code="quota_full")
             if self._count(db, day, person) >= PERSON_LIMIT:
                 raise LuckinError("今天已经领过一杯，请明天再来。", 409, code="already_claimed")
+            if not drink["product_id"] or not drink["sku"]:
+                raise LuckinError(
+                    "这款饮品还不能自动下单，请改选生椰拿铁。",
+                    400,
+                    code="drink_unavailable",
+                )
             sealed = self._seal(contact)
             db.execute(
                 """INSERT INTO claims (
@@ -401,14 +431,14 @@ class Luckin:
                     claim_id, person, kind, masked, sealed,
                     city, shop, note, lat_v, lng_v,
                     drink_id, drink["name"], drink["product_id"], drink["sku"], drink["spec"],
-                    "pending", day, now, now, token_hash, agent_id,
+                    "ordering", day, now, now, token_hash, agent_id,
                 ),
             )
+        self._auto_order(claim_id, token, origin)
+        with self._connect() as db:
             row = dict(db.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone())
-            payload = self._webhook_payload(row, token, origin, contact)
-        self._notify(payload)
         shown = self._public(row, token=token, origin=origin)
-        shown["message"] = "已排队。媒体部人工确认后才会下单，请保存结果链接查看取餐码。"
+        shown["message"] = _guest_message(shown)
         return shown
 
     def public_by_token(self, token):
@@ -516,22 +546,7 @@ class Luckin:
         shop = _clean(_first(body, "shopName", "shop_name", default=""), "门店", 80, required=False)
         hint = _clean(_first(body, "readyHint", "ready_hint", default=""), "取餐提示", 200, required=False)
         raw = _clean(_first(body, "rawNote", "raw_note", default=""), "履约备注", 2000, required=False)
-        with self._txn() as db:
-            row = self._locked(db, claim_id)
-            if row["status"] == "ready":
-                if row["order_id"] == order_id and row["pickup_code"] == pickup:
-                    return self._fulfiller(dict(row))
-                raise LuckinError("这笔领取已经写过别的取餐码", 409, code="invalid_state")
-            if row["status"] != "ordering":
-                raise LuckinError("只有确认下单后的领取可以写回取餐码", 409, code="invalid_state")
-            now = self.clock()
-            db.execute(
-                """UPDATE claims SET status='ready', order_id=?, pickup_code=?, fulfill_shop=?,
-                   ready_hint=?, raw_note=?, ready_at=?, updated=? WHERE id=?""",
-                (order_id, pickup, shop, hint, raw, now, now, claim_id),
-            )
-            row = dict(db.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone())
-        return self._fulfiller(row)
+        return self._mark_ready(claim_id, order_id, pickup, shop, hint, raw)
 
     def fail(self, claim_id, reason):
         text = _clean(reason, "失败原因", 500)
@@ -641,6 +656,8 @@ class Luckin:
             shown["orderTime"] = iso_shanghai(row["ready_at"])
             if row["ready_hint"]:
                 shown["readyHint"] = row["ready_hint"]
+        if row["status"] == "failed" and row["fail_reason"]:
+            shown["failReason"] = self._hide(row["fail_reason"], contact, masked)
         if token:
             shown["resultToken"] = token
             shown["resultUrl"] = self.result_url(token, origin)
@@ -679,45 +696,142 @@ class Luckin:
             shown["rawNote"] = row["raw_note"]
         return shown
 
-    def _webhook_payload(self, row, token, origin, contact):
+    def _mark_ready(self, claim_id, order_id, pickup, shop, hint, raw, staff_note=""):
+        note = ""
+        if staff_note:
+            note = _clean(staff_note, "备注", 200, required=False)
+        with self._txn() as db:
+            row = self._locked(db, claim_id)
+            if row["status"] == "ready":
+                if row["order_id"] == order_id and row["pickup_code"] == pickup:
+                    return self._fulfiller(dict(row))
+                raise LuckinError("这笔领取已经写过别的取餐码", 409, code="invalid_state")
+            if row["status"] not in ("pending", "ordering"):
+                raise LuckinError("这笔领取现在不能写入取餐码", 409, code="invalid_state")
+            now = self.clock()
+            db.execute(
+                """UPDATE claims SET status='ready', order_id=?, pickup_code=?, fulfill_shop=?,
+                   ready_hint=?, raw_note=?, ready_at=?, updated=?,
+                   staff_note=CASE WHEN ?!='' THEN ? ELSE staff_note END
+                   WHERE id=?""",
+                (order_id, pickup, shop, hint, raw, now, now, note, note, claim_id),
+            )
+            row = dict(db.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone())
+        return self._fulfiller(row)
+
+    def _auto_order(self, claim_id, token, origin):
+        """Ask the media webhook to place the cup. Never persist its secrets."""
+        with self._connect() as db:
+            found = db.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+            row = dict(found) if found is not None else None
+        if row is None or row["status"] not in ("pending", "ordering"):
+            return
+        contact = self._open(row["contact_sealed"])
         masked = row["contact_masked"]
-        parts = []
-        if row["location_note"]:
-            parts.append(self._hide(row["location_note"], contact, masked))
-        if row["lat"] is not None and row["lng"] is not None:
-            parts.append(f"{row['lat']:.6f},{row['lng']:.6f}")
+        for pay_with in (PAY_COUPON, PAY_BALANCE):
+            try:
+                payload = self._order_payload(row, token, origin, contact, pay_with)
+            except LuckinError:
+                self._fail_quietly(claim_id, "自动下单参数不正确", contact, masked)
+                return
+            result = self._exchange(payload)
+            if result.get("code") == NO_COUPON and pay_with == PAY_COUPON and not result.get("pickupCode"):
+                continue
+            if result.get("accepted") and not result.get("pickupCode"):
+                return
+            if result.get("ok") and result.get("orderId") and result.get("pickupCode"):
+                self._ready_quietly(claim_id, result, pay_with, contact, masked)
+                return
+            if result.get("ok") and result.get("orderId"):
+                return
+            reason = result.get("reason") or _FAIL_TEXT.get(result.get("code") or "", "自动下单失败")
+            if pay_with == PAY_BALANCE and result.get("code") in (NO_COUPON, "no_balance", None) and not result.get("reason"):
+                reason = "没有可用券，余额也不足以支付"
+            self._fail_quietly(claim_id, reason, contact, masked)
+            return
+
+    def _ready_quietly(self, claim_id, result, pay_with, contact, masked):
+        paid = result.get("payWith") if result.get("payWith") in (PAY_COUPON, PAY_BALANCE) else pay_with
+        shop = result.get("shopName") or ""
+        hint = result.get("readyHint") or "请到店报取餐码"
+        try:
+            self._mark_ready(
+                claim_id,
+                _clean(self._safe_reason(result["orderId"], contact, masked), "订单号", 64),
+                _clean(self._safe_reason(result["pickupCode"], contact, masked), "取餐码", 64),
+                _clean(self._safe_reason(shop, contact, masked), "门店", 80, required=False) if shop else "",
+                _clean(self._safe_reason(hint, contact, masked), "取餐提示", 200, required=False),
+                "",
+                staff_note="auto:" + paid,
+            )
+        except LuckinError:
+            print("luckin auto ready failed claim=" + claim_id, file=sys.stderr)
+
+    def _fail_quietly(self, claim_id, reason, contact, masked):
+        try:
+            text = _clean(self._safe_reason(reason, contact, masked), "失败原因", 500)
+            self.fail(claim_id, text)
+        except LuckinError:
+            print("luckin auto fail failed claim=" + claim_id, file=sys.stderr)
+
+    def _order_payload(self, row, token, origin, contact, pay_with):
+        masked = row["contact_masked"]
+        product_id = int(row["product_id"])
         payload = {
+            "action": "place",
+            "payWith": pay_with,
+            "payPolicy": PAY_POLICY,
             "claimId": row["id"],
+            "resultUrl": self.result_url(token, origin),
             "contactMasked": masked,
             "city": self._hide(row["city"], contact, masked),
             "shopName": self._hide(row["shop_name"], contact, masked),
             "drink": row["drink_name"],
+            "drinkId": row["drink_id"],
+            "productId": product_id,
+            "skuCode": row["sku"],
+            "amount": 1,
+            "spec": row["drink_spec"],
+            "productList": [{"amount": 1, "productId": product_id, "skuCode": row["sku"]}],
             "createdAt": iso_shanghai(row["created"]),
-            "resultUrl": self.result_url(token, origin),
         }
-        if parts:
-            payload["locationNote"] = " ".join(parts)
-        leaked = set(payload) - WEBHOOK_FIELDS
+        note = self._hide(row["location_note"], contact, masked)
+        if note:
+            payload["locationNote"] = note
+        if row["lat"] is not None and row["lng"] is not None:
+            payload["latitude"] = row["lat"]
+            payload["longitude"] = row["lng"]
+        leaked = set(payload) - ORDER_FIELDS
         blob = json.dumps(payload, ensure_ascii=False)
         if leaked or contact in blob:
             raise LuckinError("通知不能包含原始联系方式", 500, code="server_error")
         return payload
 
-    def _notify(self, payload):
-        url = os.environ.get("LUCKIN_PENDING_WEBHOOK_URL", "").strip()
+    def _exchange(self, payload):
+        url = order_webhook_url()
         if not url:
-            return
+            return {"ok": False, "code": "not_configured", "reason": "自动下单未配置"}
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             print("luckin webhook skipped: unsupported scheme", file=sys.stderr)
-            return
+            return {"ok": False, "code": "not_configured", "reason": "自动下单地址不正确"}
         try:
             if self.poster is not None:
-                self.poster(url, payload)
+                raw = self.poster(url, payload)
             else:
-                _post_json(url, payload)
+                raw = _post_json(url, payload)
         except Exception:
             print("luckin webhook failed claim=" + str(payload.get("claimId", "")), file=sys.stderr)
+            return {"ok": False, "code": "api", "reason": "自动下单通知失败"}
+        return _order_response(raw)
+
+    def _safe_reason(self, text, contact, masked):
+        if not isinstance(text, str):
+            return ""
+        cleaned = self._hide(text, contact, masked)
+        if re.search(r"coupon|token|secret|bearer", cleaned, re.I):
+            return "下单失败"
+        return cleaned
 
 
 def _owned(stored, agent_id):
@@ -746,6 +860,77 @@ def _xor(key, nonce, data):
     return bytes(out)
 
 
+def _guest_message(shown):
+    if shown.get("status") == "ready":
+        return "已下单。取餐码在结果链接上，到店报这个码即可。"
+    if shown.get("status") == "failed":
+        return shown.get("failReason") or "下单未成功，今日名额已释放。可以再提交一次。"
+    return "正在下单。请保存结果链接，取餐码会写在这一页。"
+
+
+_FAIL_TEXT = {
+    "not_configured": "自动下单未配置",
+    "no_coupon": "没有可用的抖音或团购券",
+    "no_balance": "没有可用券，余额也不足以支付",
+    "shop": "没有匹配到可下单的门店",
+    "api": "自动下单失败",
+}
+
+_RESPONSE_KEYS = {
+    "ok": "ok",
+    "accepted": "accepted",
+    "code": "code",
+    "reason": "reason",
+    "paywith": "payWith",
+    "orderid": "orderId",
+    "pickupcode": "pickupCode",
+    "shopname": "shopName",
+    "readyhint": "readyHint",
+}
+
+
+def _order_response(data):
+    """Keep only order fields. Coupon codes and tokens never leave this function."""
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return {"ok": False, "code": "api", "reason": "自动下单返回无法识别"}
+    out = {}
+    for key, value in data.items():
+        mapped = _RESPONSE_KEYS.get(str(key).replace("_", "").lower())
+        if mapped is None:
+            mapped = _RESPONSE_KEYS.get(str(key).lower())
+        if mapped:
+            out[mapped] = value
+    if "ok" in out:
+        out["ok"] = out["ok"] is True
+    if "accepted" in out:
+        out["accepted"] = out["accepted"] is True
+    if "reason" in out:
+        if not isinstance(out["reason"], str):
+            out.pop("reason")
+        else:
+            out["reason"] = " ".join(out["reason"].split())[:500]
+    if "code" in out:
+        if not isinstance(out["code"], str) or not re.fullmatch(r"[a-z0-9_]{1,40}", out["code"]):
+            out.pop("code", None)
+    for key in ("orderId", "pickupCode", "shopName", "readyHint", "payWith"):
+        if key not in out:
+            continue
+        value = out[key]
+        if isinstance(value, bool) or value is None:
+            out.pop(key)
+        elif isinstance(value, int):
+            out[key] = str(value)
+        elif isinstance(value, float) and value.is_integer():
+            out[key] = str(int(value))
+        elif isinstance(value, str):
+            out[key] = " ".join(value.split())
+        else:
+            out.pop(key)
+    return out
+
+
 def _post_json(url, payload):
     data = json.dumps(payload, ensure_ascii=False).encode()
     request = urllib.request.Request(
@@ -758,5 +943,14 @@ def _post_json(url, payload):
         method="POST",
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=3) as response:
-        response.read(1024)
+    with opener.open(request, timeout=20) as response:
+        raw = response.read(65536)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("order webhook returned an unreadable body") from exc
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed

@@ -870,9 +870,9 @@ def make_handler(service, library=None, identity=None, secure_cookies=False, pub
             here = "../" if result else "./"
             text = (STATIC / "luckin.html").read_text(encoding="utf-8")
             text = text.replace("__FAVICON__", up + "favicon.svg")
-            text = text.replace("__TOKENS__", up + "tokens.css?v=20261030-luckin")
-            text = text.replace("__CSS__", here + "luckin.css?v=20261030-luckin")
-            text = text.replace("__JS__", here + "luckin.js?v=20261030-luckin")
+            text = text.replace("__TOKENS__", up + "tokens.css?v=20261031-luckin")
+            text = text.replace("__CSS__", here + "luckin.css?v=20261031-luckin")
+            text = text.replace("__JS__", here + "luckin.js?v=20261031-luckin")
             text = text.replace("__HOME__", up)
             text = text.replace("__CONVO__", up + "conversations/")
             text = text.replace("__RELAY__", up + "relay/")
