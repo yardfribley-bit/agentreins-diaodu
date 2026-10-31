@@ -108,6 +108,8 @@ class StaticAssets(unittest.TestCase):
             "不要在消息中粘贴",
             "一对一 Topic",
             "团队席位",
+            "授权 Agent",
+            'id="delegation-token"',
         ):
             self.assertIn(snippet, page)
         _, _, script = self.fetch(self.base + "/relay/relay.js")
@@ -119,6 +121,8 @@ class StaticAssets(unittest.TestCase):
             "searchParams.delete('invite')",
             "relay/join",
             "relay/teams/join",
+            "relay/delegations",
+            "clearDelegationSecret",
             "全体执行端",
             "progress",
             "result",

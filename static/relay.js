@@ -21,7 +21,12 @@
   let generation = 0, pollController = null, listGeneration = 0, listController = null;
   let retryTimer = null, heartbeatAt = 0, replyTo = null, outgoing = null, mutationBusy = false;
   let sending = false, createBusy = false, joinBusy = false, uploading = false, stopped = false, confirmTask = null, unread = 0;
-  let pendingFiles = [], joinLookup = null, joinTimer = null;
+  let pendingFiles = [], joinLookup = null, joinTimer = null, delegationOwner = '';
+  const grantActions = {
+    mint: '签发', revoke_grant: '撤销授权', create: '创建 Topic', list: '查询会话',
+    invite: '邀请', topic_code: '重置配对码', send: '代发消息', read: '读取',
+    state: '更改状态', revoke_seat: '撤销席位'
+  };
   let partnerKey = '', partnerWarning = {id: '', text: ''};
   const events = new Map();
   const PUBLIC_ID = /^C-[pt][0-9a-f]{8}$/;
@@ -281,6 +286,59 @@
     $('identity').textContent = label;
     $('identity').title = label;
     $('refresh-sessions').disabled = !identity;
+    const key = identity ? (identity.agent_id || identity.user_id || identity.username || 'self') : '';
+    if (key !== delegationOwner) {
+      delegationOwner = key;
+      clearDelegationSecret();
+      loadDelegations();
+    }
+  }
+  function clearDelegationSecret() {
+    const box = $('delegation-token');
+    const once = $('delegation-once');
+    if (box) box.value = '';
+    if (once) once.hidden = true;
+  }
+  function renderDelegations(payload) {
+    const list = $('delegation-list');
+    const audit = $('delegation-audit');
+    if (!list || !audit) return;
+    list.replaceChildren(...array(payload.grants).map(item => {
+      const row = element('li', null, 'delegation-item' + (item.revoked ? ' revoked' : ''));
+      const label = text(item.label) || '授权';
+      const when = item.last_used_at ? '最近使用 ' + date(item.last_used_at) : '尚未使用';
+      const who = text(item.last_actor_name);
+      row.append(element('span', label + (item.revoked ? ' · 已撤销' : ' · ' + when + (who ? ' · ' + who : ''))));
+      if (!item.revoked && item.id) {
+        const button = element('button', '撤销');
+        button.type = 'button';
+        button.addEventListener('click', () => revokeDelegation(item.id));
+        row.append(button);
+      }
+      return row;
+    }));
+    audit.replaceChildren(...array(payload.audit).slice(0, 5).map(item => element(
+      'li', text(item.actor_name) + ' · ' + (grantActions[item.action] || text(item.action))
+        + (text(item.session_id) ? ' · ' + text(item.session_id) : ''))));
+  }
+  async function loadDelegations() {
+    const panel = $('delegation');
+    if (!panel) return;
+    if (!identity) {panel.hidden = true; clearDelegationSecret(); return;}
+    panel.hidden = false;
+    try {
+      renderDelegations(await api('relay/delegations'));
+    } catch (error) {
+      if (error.status !== 401) formError('delegation-error', error.message);
+    }
+  }
+  async function revokeDelegation(id) {
+    if (!id || !identity) return;
+    try {
+      await api('relay/delegations/' + encodeURIComponent(id) + '/revoke', {});
+      notify('已撤销这枚授权。之后的代操作会失败。');
+      await loadDelegations();
+    } catch (error) {formError('delegation-error', error.message);}
   }
   function exportTranscript() {
     if (!current) return;
@@ -292,7 +350,8 @@
       if (event.kind !== 'message') continue;
       const message = event.message || {};
       const who = text(event.sender?.name) || roles[event.sender?.role] || '成员';
-      lines.push('#' + event.seq + ' ' + (kinds[message.kind] || '消息') + ' ' + who + ' ' + date(event.created_at));
+      const via = text(event.delegated_by && event.delegated_by.name);
+      lines.push('#' + event.seq + ' ' + (kinds[message.kind] || '消息') + ' ' + who + (via ? '（经由 ' + via + '）' : '') + ' ' + date(event.created_at));
       if (message.reply_to) lines.push('回复 #' + message.reply_to);
       lines.push(text(message.text));
       lines.push('');
@@ -873,6 +932,8 @@
     const meta = element('div', null, 'turn-head');
     meta.append(avatar, element('span', who + seatLabel, 'speaker'));
     if (roles[sender.role]) meta.append(element('span', roles[sender.role], 'role-chip'));
+    const via = text(event.delegated_by && event.delegated_by.name);
+    if (via) meta.append(element('span', '经由 ' + via, 'role-chip'));
     if (isLeader(sender)) meta.append(element('span', '领导者', 'leader-chip'));
     const stamp = element('time', date(event.created_at));
     stamp.dateTime = text(event.created_at);
@@ -1501,6 +1562,28 @@
     await selectSession(id);
     return current?.id === id;
   }
+  $('delegation-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!identity) return;
+    const label = $('delegation-label').value.trim();
+    $('delegation-submit').disabled = true; formError('delegation-error');
+    try {
+      const value = await api('relay/delegations', label ? {label} : {});
+      if (!value.token || !String(value.token).startsWith('dg_')) throw new Error('未收到授权凭证。');
+      $('delegation-token').value = value.token;
+      $('delegation-once').hidden = false;
+      $('delegation-label').value = '';
+      notify('授权已签发。请立即复制，刷新后不再显示。');
+      await loadDelegations();
+    } catch (error) {formError('delegation-error', error.message);}
+    finally {$('delegation-submit').disabled = false;}
+  });
+  $('delegation-copy').addEventListener('click', async () => {
+    const token = $('delegation-token').value;
+    if (!token) return;
+    try {await navigator.clipboard.writeText(token); $('delegation-copy').textContent = '已复制';}
+    catch (_) {$('delegation-token').select(); notify('剪贴板不可用，请手动复制。', true);}
+  });
   $('identity-form').addEventListener('submit',async event => {
     event.preventDefault(); const alias = $('identity-alias').value.trim(); if (!alias) return;
     $('identity-submit').disabled = true; formError('identity-error');
@@ -1644,7 +1727,7 @@
   $('new-events').addEventListener('click',() => {$('feed').scrollTop = $('feed').scrollHeight; unread = 0; $('new-events').hidden = true;});
   $('feed').addEventListener('scroll',() => {const feed = $('feed'); if (feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80) {unread = 0; $('new-events').hidden = true;}});
   window.addEventListener('online',() => {if (current && !stopped) selectSession(current.id);});
-  window.addEventListener('pagehide',() => {stopped = true; stopPolling(); listController?.abort(); clearPairing(); clearJoinForm();});
+  window.addEventListener('pagehide',() => {stopped = true; stopPolling(); listController?.abort(); clearPairing(); clearJoinForm(); clearDelegationSecret();});
   (async () => {
     const leaked = stripSecretQuery();
     try {identity = await api('me'); csrf = text(identity.csrf);}

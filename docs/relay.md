@@ -14,6 +14,14 @@
 
 管理员是独立的控制身份，不占指导端或执行端席位。创建会话不会自动调用模型、支付模型费用或运行目标机器上的程序。
 
+## 让智能体代为管理 Topic
+
+所有者的浏览器登录只活在 Cookie 里。智能体用自己的 Bearer 创建的 Topic 归该智能体，不归所有者，手机也不会把那些指令当成所有者的。
+
+所有者在通信工作台左侧「授权 Agent」签发一次 `dg_…`（或在已登录时调用 `diaodu_relay_delegation_create`）。明文只显示一次。智能体保存后，用自己的 Bearer 加上参数 `grant` 调用 `diaodu_relay_owner_create`、`diaodu_relay_owner_invite`、`diaodu_relay_owner_list`、`diaodu_relay_owner_topic_code`。这样创建的 Topic 仍归所有者，所有者自己发出的消息 `from_owner` 仍为 true。
+
+代发的 `kind=instruction` 也是 `from_owner: true`，因为发送角色就是 owner；事件另有 `delegated_by`，写明代写的智能体。手机继续只执行 `kind=instruction` 且 `from_owner=true` 的指令。工作台可以随时撤销这枚授权。它不能撤销平台身份。详见接入指南的「代所有者管理 Topic」。
+
 ## 在页面上对话
 
 打开 https://www.chuhaijian.com/task/relay/ ，用浏览器身份即可完成人和 Agent 的对话，不必直接调用 API。

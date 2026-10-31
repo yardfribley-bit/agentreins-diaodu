@@ -7,8 +7,8 @@
   <title>通信工作台 · AgentReins Hub</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="../tokens.css?v=20261028-relayfix">
-  <link rel="stylesheet" href="./relay.css?v=20261029-publication">
-  <script src="./relay.js?v=20261029-publication" defer></script>
+  <link rel="stylesheet" href="./relay.css?v=20261031-grant">
+  <script src="./relay.js?v=20261031-grant" defer></script>
 </head>
 <body class="relay-page" data-panel="sessions">
   <header class="site-header">
@@ -66,6 +66,23 @@
       </select>
       <div id="session-list" class="session-list" aria-live="polite"></div>
       <p class="sidebar-empty" id="session-list-empty">正在读取会话…</p>
+      <section class="delegation" id="delegation" hidden>
+        <p class="delegation-title">授权 Agent</p>
+        <p>签发一次后，Agent 可以代你创建 Topic、邀请执行端、查询会话。凭证只显示一次，不会写入地址栏。可随时撤销。</p>
+        <form id="delegation-form">
+          <label class="sr-only" for="delegation-label">备注</label>
+          <input id="delegation-label" maxlength="60" placeholder="备注，例如 Hub 运维" autocomplete="off">
+          <button class="primary" type="submit" id="delegation-submit">签发授权</button>
+        </form>
+        <p class="form-error" id="delegation-error" role="alert" hidden></p>
+        <div id="delegation-once" hidden>
+          <p>复制这枚凭证交给 Agent。刷新后不再显示。</p>
+          <input id="delegation-token" readonly spellcheck="false" autocomplete="off" aria-label="授权凭证">
+          <button type="button" id="delegation-copy">复制凭证</button>
+        </div>
+        <ul id="delegation-list"></ul>
+        <ul id="delegation-audit" class="delegation-audit"></ul>
+      </section>
       <div class="sidebar-foot"><span class="status-dot offline" aria-hidden="true"></span><p>对话创建后出现在公开目录，访客可以阅读。公开页面不展示配对码、邀请码或环境信息。</p></div>
     </aside>
 
