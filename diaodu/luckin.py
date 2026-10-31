@@ -56,6 +56,14 @@ DRINKS = {
 }
 DEFAULT_DRINK = "coconut_latte"
 
+# MCP claims are limited to these self-reported coding agents. Match is
+# case-insensitive. Empty, 访客, 人员, and 未确认 mean the profile was never
+# set — ask the caller to fix it. Do not invent a type inside the claim call.
+CODING_AGENT_ALLOWLIST = ("Codex", "Claude", "Claude Code", "Cursor", "Grok")
+_UNSET_AGENT_TYPES = frozenset({"访客", "人员", "工具未确认", "未确认", "unknown", "none", "n/a", "na"})
+_CODING_AGENT_PHRASES = ("claude code", "codex", "claude", "cursor", "grok")
+_CODING_AGENT_JOINED = ("claudecode", "cursoragent", "cursorcloudagent")
+
 CLAIM_FIELDS = {"phone", "email", "city", "shopName", "locationNote", "lat", "lng", "drink", "consent"}
 WEBHOOK_FIELDS = {
     "claimId", "contactMasked", "city", "shopName", "locationNote",
@@ -80,6 +88,57 @@ def is_fulfiller(actor):
         return False
     agent_id = actor.get("agent_id") or ""
     return bool(agent_id) and agent_id in fulfiller_ids()
+
+
+def _agent_type_text(agent_type):
+    if not isinstance(agent_type, str):
+        return ""
+    text = agent_type.strip().casefold().replace("－", "-").replace("—", "-")
+    text = re.sub(r"[-_/]+", " ", text)
+    return " ".join(text.split())
+
+
+def coding_agent_status(agent_type):
+    """Return ok, unset, or denied for a profile agent_type.
+
+    A type matches the allowlist when a known phrase appears as whole words
+    after casefolding and treating hyphens, underscores, and slashes as spaces.
+    Digits may follow the name (Grok 4, grok-4). Joined spellings ClaudeCode
+    and CursorAgent match as well. The claim arguments cannot supply this value.
+    """
+    spaced = _agent_type_text(agent_type)
+    if not spaced or spaced in _UNSET_AGENT_TYPES:
+        return "unset"
+    for phrase in _CODING_AGENT_PHRASES:
+        if re.search(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z])", spaced):
+            return "ok"
+    squashed = spaced.replace(" ", "")
+    if any(token in squashed for token in _CODING_AGENT_JOINED):
+        return "ok"
+    return "denied"
+
+
+def coding_agent_error(agent_type):
+    """LuckinError when this profile may not open an MCP claim, else None."""
+    status = coding_agent_status(agent_type)
+    if status == "ok":
+        return None
+    names = "、".join(CODING_AGENT_ALLOWLIST)
+    if status == "unset":
+        return LuckinError(
+            "资料里的 agent_type 还没填写。请用 POST /v1/me/profile 或 diaodu_connect "
+            "写成实际工具（" + names + "，大小写不限）。"
+            "不要在 diaodu_luckin_claim 的参数里临时编一个类型。",
+            403,
+            code="agent_type_required",
+        )
+    return LuckinError(
+        "瑞幸 MCP 领取只对编程助手开放，允许的 agent_type：" + names
+        + "（大小写不限，可以写成 Claude Code、claude-code、Cursor Agent、Grok 4）。"
+        "请用 POST /v1/me/profile 把资料改成实际工具。",
+        403,
+        code="agent_type_not_allowed",
+    )
 
 
 def normalize_phone(value):
@@ -203,13 +262,21 @@ class Luckin:
                   created REAL NOT NULL,
                   updated REAL NOT NULL,
                   ready_at REAL,
-                  result_token_hash TEXT NOT NULL UNIQUE
+                  result_token_hash TEXT NOT NULL UNIQUE,
+                  agent_id TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS claims_day ON claims(day, status);
                 CREATE INDEX IF NOT EXISTS claims_person ON claims(person_hash, day, status);
                 """
             )
+            self._migrate(db)
+            db.execute("CREATE INDEX IF NOT EXISTS claims_agent ON claims(agent_id)")
         os.chmod(self.path, 0o600)
+
+    def _migrate(self, db):
+        columns = {row[1] for row in db.execute("PRAGMA table_info(claims)")}
+        if "agent_id" not in columns:
+            db.execute("ALTER TABLE claims ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def _connect(self):
@@ -267,7 +334,7 @@ class Luckin:
             "remaining": max(0, DAILY_LIMIT - used),
         }
 
-    def create(self, body, origin):
+    def create(self, body, origin, *, agent_id=""):
         if not isinstance(body, dict):
             raise LuckinError("请求不正确")
         extra = sorted(set(body) - CLAIM_FIELDS)
@@ -305,6 +372,10 @@ class Luckin:
         if not isinstance(drink_id, str) or drink_id not in DRINKS:
             raise LuckinError("请选择列出的饮品")
         drink = DRINKS[drink_id]
+        if agent_id is None:
+            agent_id = ""
+        if not isinstance(agent_id, str) or (agent_id and not re.fullmatch(r"ag_[0-9a-f]{24}", agent_id)):
+            raise LuckinError("领取身份不正确", 500, code="server_error")
         self.limit("person", hashlib.sha256(key.encode()).hexdigest()[:16], self.claim_person_limit)
         now = self.clock()
         day = shanghai_day(now)
@@ -324,13 +395,13 @@ class Luckin:
                     id, person_hash, contact_kind, contact_masked, contact_sealed,
                     city, shop_name, location_note, lat, lng,
                     drink_id, drink_name, product_id, sku, drink_spec,
-                    status, day, created, updated, result_token_hash
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    status, day, created, updated, result_token_hash, agent_id
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     claim_id, person, kind, masked, sealed,
                     city, shop, note, lat_v, lng_v,
                     drink_id, drink["name"], drink["product_id"], drink["sku"], drink["spec"],
-                    "pending", day, now, now, token_hash,
+                    "pending", day, now, now, token_hash, agent_id,
                 ),
             )
             row = dict(db.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone())
@@ -350,6 +421,40 @@ class Luckin:
         if row is None:
             raise LuckinError("没有这笔领取", 404, code="not_found")
         return self._public(row)
+
+    def claim_for_agent(self, agent_id, claim_id="", result_token="", origin=""):
+        """Public view of one claim owned by this agent instance.
+
+        HTML claims have no agent_id, so they stay on the result link only.
+        A miss and someone else's claim use the same not-found error.
+        """
+        if not isinstance(agent_id, str) or not re.fullmatch(r"ag_[0-9a-f]{24}", agent_id):
+            raise LuckinError("没有这笔领取", 404, code="not_found")
+        has_id = claim_id not in (None, "")
+        has_token = result_token not in (None, "")
+        if not has_id and not has_token:
+            raise LuckinError("请提供 claim_id 或 result_token")
+        if has_id and (not isinstance(claim_id, str) or not re.fullmatch(r"lk_[0-9a-f]{16}", claim_id)):
+            raise LuckinError("没有这笔领取", 404, code="not_found")
+        if has_token and (not isinstance(result_token, str) or not re.fullmatch(r"[A-Za-z0-9_\-]{20,128}", result_token)):
+            raise LuckinError("没有这笔领取", 404, code="not_found")
+        with self._connect() as db:
+            if has_id:
+                found = db.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+            else:
+                digest = hashlib.sha256(result_token.encode()).hexdigest()
+                found = db.execute("SELECT * FROM claims WHERE result_token_hash=?", (digest,)).fetchone()
+            row = dict(found) if found is not None else None
+            if row is not None and has_id and has_token:
+                digest = hashlib.sha256(result_token.encode()).hexdigest()
+                if not hmac.compare_digest(row["result_token_hash"], digest):
+                    row = None
+            if row is None or not _owned(row.get("agent_id") or "", agent_id):
+                raise LuckinError("没有这笔领取", 404, code="not_found")
+        shown = self._public(row)
+        if has_token:
+            shown["resultUrl"] = self.result_url(result_token, origin)
+        return shown
 
     def list_claims(self, status="pending"):
         if status not in STATUSES:
@@ -613,6 +718,12 @@ class Luckin:
                 _post_json(url, payload)
         except Exception:
             print("luckin webhook failed claim=" + str(payload.get("claimId", "")), file=sys.stderr)
+
+
+def _owned(stored, agent_id):
+    if not stored or not agent_id or len(stored) != len(agent_id):
+        return False
+    return hmac.compare_digest(stored, agent_id)
 
 
 def _first(body, *names, default=None):
