@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>咖啡数字地图 · 天通苑 | AgentReins Hub</title>
+<link rel="stylesheet" href="./leaflet/leaflet.css">
+<script src="./leaflet/leaflet.js"></script>
+<style>
+:root{--bg:#f6f3ef;--card:#fff;--ink:#2b2420;--sub:#7a6e66;--line:#ece6df;--brand:#6b4226;--accent:#e8743b;--ok:#1f9d55;--real:#1565c0;--demo:#b26a00;}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;font-family:-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;color:var(--ink);background:var(--bg)}
+body{display:flex;flex-direction:column}
+header{background:linear-gradient(120deg,#3e2716,#6b4226);color:#fff;padding:12px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.logo{width:38px;height:38px;border-radius:10px;background:#fff2;display:grid;place-items:center;font-size:22px}
+header h1{font-size:19px;font-weight:700;letter-spacing:.5px}
+header .subt{font-size:12px;opacity:.85;margin-top:2px}
+header .right{margin-left:auto;font-size:12px;opacity:.9;text-align:right}
+.demo-banner{background:#fff4e0;border-bottom:1px solid #f3d9a8;color:#7a4b00;font-size:12.5px;padding:7px 20px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.demo-banner b{color:#a35a00}
+.flow{background:#fff;border-bottom:1px solid var(--line);padding:8px 20px;display:flex;align-items:center;gap:6px;font-size:12.5px;overflow-x:auto;white-space:nowrap}
+.step{display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;background:#f2eee9;color:var(--sub);transition:.3s}
+.step .dot{width:8px;height:8px;border-radius:50%;background:#c9bfb5}
+.step.done{background:#e7f6ee;color:var(--ok)}.step.done .dot{background:var(--ok)}
+.step.active{background:#fff0e6;color:var(--accent);font-weight:600}.step.active .dot{background:var(--accent);animation:pulse 1s infinite}
+.arrow{color:#c9bfb5}
+.flow .meta{margin-left:auto;color:var(--sub);padding-left:14px}
+.flow button{margin-left:8px;border:1px solid var(--line);background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--brand)}
+@keyframes pulse{50%{opacity:.3}}
+main{flex:1;display:flex;min-height:0}
+aside{width:380px;background:var(--card);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.filters{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:9px}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.row label{font-size:12px;color:var(--sub);width:34px}
+.chip{border:1px solid var(--line);background:#faf8f5;border-radius:999px;padding:4px 11px;font-size:12.5px;cursor:pointer;user-select:none}
+.chip.on{background:var(--brand);border-color:var(--brand);color:#fff}
+.summary{padding:8px 14px;font-size:12px;color:var(--sub);border-bottom:1px solid var(--line);background:#fcfaf8}
+.list{flex:1;overflow-y:auto}
+.item{display:flex;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line);cursor:pointer;transition:background .15s}
+.item:hover{background:#faf6f1}.item.sel{background:#fff0e6}
+.badge{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;color:#fff;font-weight:700;font-size:13px;flex-shrink:0}
+.item .info{flex:1;min-width:0}
+.item .name{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.item .addr{font-size:12px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.item .tags{margin-top:4px;display:flex;gap:4px;flex-wrap:wrap}
+.tag{white-space:nowrap;display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:4px;border:1px solid}
+.tag.real{color:var(--real);border-color:#b7d0ee;background:#eef5fd}
+.tag.demo{color:var(--demo);border-color:#f0d3a0;background:#fff7e8}
+.tag.gray{color:var(--sub);border-color:var(--line);background:#f7f4f0}
+.item .price{text-align:right;flex-shrink:0}
+.item .price b{font-size:18px;color:var(--accent)}
+.item .price small{display:block;font-size:11px;color:var(--sub)}
+#map{flex:1;min-height:0}
+.pin{background:none;border:none}
+.pin div{transform:translate(-50%,-100%);position:absolute;left:0;top:0;background:#fff;border:2px solid var(--c);color:var(--ink);font-weight:700;font-size:12px;padding:2px 7px;border-radius:999px;white-space:nowrap;box-shadow:0 2px 6px #0003}
+.pin div::after{content:"";position:absolute;left:50%;bottom:-7px;transform:translateX(-50%);border:6px solid transparent;border-top-color:var(--c)}
+.pin div i{font-style:normal;display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--c);margin-right:4px}
+.pin.sel div{background:var(--c);color:#fff;z-index:999;transform:translate(-50%,-100%) scale(1.15)}
+.pin.sel div i{background:#fff}
+.card{position:absolute;right:16px;top:16px;width:430px;max-height:calc(100% - 32px);overflow-y:auto;background:#fff;border-radius:14px;box-shadow:0 10px 30px #0003;z-index:1000;display:none}
+.card.show{display:block}
+.card .hd{padding:14px 16px 10px;border-bottom:1px solid var(--line);position:relative}
+.card .hd h2{font-size:17px;padding-right:28px}
+.card .hd p{font-size:12.5px;color:var(--sub);margin-top:4px}
+.close{position:absolute;right:12px;top:10px;border:none;background:#f2eee9;width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:14px}
+.card .bd{padding:10px 16px 14px}
+.card h3{font-size:13.5px;margin:10px 0 6px;display:flex;justify-content:space-between;align-items:baseline}
+.card h3 span{font-size:11.5px;color:var(--sub);font-weight:400}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{font-weight:500;color:var(--sub);text-align:left;padding:5px 4px;border-bottom:1px solid var(--line);font-size:11.5px}
+td{padding:6px 4px;border-bottom:1px dashed var(--line);vertical-align:middle}
+td.p{font-weight:700;text-align:right;white-space:nowrap}
+td.p s{color:#b3a79c;font-weight:400;font-size:11px;margin-right:3px}
+tr.best{background:#fff0e6}
+tr.best td.p{color:var(--accent)}
+.besttag{font-size:10px;background:var(--accent);color:#fff;border-radius:3px;padding:0 4px;margin-left:4px}
+td.na{color:#c2b8ae;text-align:right}
+td.t{font-size:11px;color:var(--sub);white-space:nowrap}
+.note{font-size:11.5px;color:var(--sub);margin-top:10px;line-height:1.6;background:#faf8f5;border-radius:8px;padding:8px 10px}
+.legend{position:absolute;left:12px;bottom:22px;z-index:900;background:#fffffff0;border-radius:10px;padding:8px 10px;font-size:11.5px;box-shadow:0 2px 8px #0002;line-height:1.8}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+.mapwrap{flex:1;position:relative;display:flex}
+.toggle{display:none}
+@media (max-width:820px){
+ main{flex-direction:column-reverse}
+ aside{width:100%;height:45%;border-right:none;border-top:1px solid var(--line)}
+ .card{left:8px;right:8px;width:auto;top:8px;max-height:calc(100% - 16px)}
+ header .right{display:none}
+ .legend{bottom:8px}
+ .flow .meta{display:none}
+ .demo-banner{font-size:11.5px;padding:6px 12px}
+ .demo-banner .long{display:none}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">☕</div>
+  <div>
+    <h1>咖啡数字地图 · 天通苑</h1>
+    <div class="subt">由 AgentReins Hub + AgentReins 手机端采集</div>
+  </div>
+  <div class="right">www.chuhaijian.com<br>原型 v0.1</div>
+</header>
+<div class="demo-banner">⚠️ <b>原型说明：</b><span class="short" style="display:none"></span>瑞幸 8 家门店的位置与官方价格为<b>真实数据</b><span class="long">（瑞幸官方接口，<span id="realTime"></span>）</span>；其他咖啡馆以及美团外卖 / 淘宝闪购 / 京东秒送 / 抖音团购的价格均为<b>示例数据</b>，仅用于展示效果，不代表实际价格。</div>
+<div class="flow" id="flow">
+  <div class="step" data-i="0"><span class="dot"></span>Hub 下发任务</div><span class="arrow">→</span>
+  <div class="step" data-i="1"><span class="dot"></span>手机采集</div><span class="arrow">→</span>
+  <div class="step" data-i="2"><span class="dot"></span>回传</div><span class="arrow">→</span>
+  <div class="step" data-i="3"><span class="dot"></span>更新地图</div>
+  <span class="meta" id="flowMeta">任务 #CM-TTY-001 · 只读采集，不下单</span>
+  <button id="replay">模拟刷新</button>
+</div>
+<main>
+  <aside>
+    <div class="filters">
+      <div class="row"><label>饮品</label><span class="chip on" data-drink="美式">美式</span><span class="chip" data-drink="拿铁">拿铁</span></div>
+      <div class="row"><label>品牌</label><div class="row" id="brandChips"></div></div>
+      <div class="row"><label>排序</label><span class="chip on" data-sort="price">价格最低</span><span class="chip" data-sort="dist">距离最近</span></div>
+    </div>
+    <div class="summary" id="summary"></div>
+    <div class="list" id="list"></div>
+  </aside>
+  <div class="mapwrap">
+    <div id="map"></div>
+    <div class="legend" id="legend"></div>
+    <div class="card" id="card"></div>
+  </div>
+</main>
+<script>
+// ===== 数据 =====
+// 坐标为 GCJ-02（与高德瓦片一致）。中心：天通苑
+const CENTER=[40.07,116.42];
+const REAL_TIME='2026-11-01 21:45';   // 北京时间，瑞幸接口查询时间
+const DEMO_TIME='2026-11-01 21:30';   // 示例数据的模拟采集时间
+const PLATFORMS=[
+  {k:'official',n:'品牌官方'},
+  {k:'meituan',n:'美团外卖'},
+  {k:'taobao',n:'淘宝闪购'},
+  {k:'jd',n:'京东秒送'},
+  {k:'douyin',n:'抖音团购(抖省省)'}
+];
+const BRANDS={
+  '瑞幸':{c:'#1a4fa0',s:'瑞'},
+  '库迪':{c:'#d9381e',s:'库'},
+  '星巴克':{c:'#00704a',s:'星'},
+  'Manner':{c:'#7a1f1f',s:'M'},
+  '幸运咖':{c:'#e53935',s:'幸'},
+  '独立咖啡馆':{c:'#8d6e63',s:'独'}
+};
+// 瑞幸：真实门店（queryShopList）+ 真实官方价（searchProductForMcp，大杯 标准美式 / 拿铁）
+// initialPrice = 标价, estimatePrice = App 预估到手价
+const luckinReal=[
+ {id:389043,name:'瑞幸咖啡（天通苑北一区店）',addr:'昌平区太平庄中二街天通苑甲5号底商',lat:40.075971,lng:116.414246,hours:'07:00-22:00'},
+ {id:385558,name:'瑞幸咖啡（华联天通苑店）',addr:'昌平区东三旗路28号华联天通苑购物中心负一层B1-ZD-24号',lat:40.070308,lng:116.414877,hours:'09:00-21:00'},
+ {id:607210,name:'瑞幸咖啡（天通苑站B口临街店）',addr:'昌平区东小口镇天通苑西苑三区36号楼一层3单元102',lat:40.074488,lng:116.41209,hours:'07:00-21:30'},
+ {id:604175,name:'瑞幸咖啡（天通西苑店）',addr:'昌平区太平庄中街天通西苑一区25号楼一层102',lat:40.067692,lng:116.410346,hours:'07:00-21:00'},
+ {id:378023,name:'瑞幸咖啡（新华未来城B座店）',addr:'昌平区立汤路175号新华未来城大厦一层大堂',lat:40.063946,lng:116.412292,hours:'07:00-18:30'},
+ {id:618778,name:'瑞幸咖啡（天通苑北三区店）',addr:'昌平区北七家镇天通北苑三区6号楼5单元102',lat:40.076955,lng:116.429043,hours:'07:00-21:00'},
+ {id:614691,name:'瑞幸咖啡（龙德广场地下一层店）',addr:'昌平区东小口镇立汤路186号院1号楼龙德广场负一层B1009',lat:40.060095,lng:116.415782,hours:'10:00-21:30'},
+ {id:378710,name:'瑞幸咖啡（龙德广场店）',addr:'昌平区立汤路186号龙德广场四层20号',lat:40.059723,lng:116.415535,hours:'10:00-21:00'}
+];
+const LUCKIN_PRICE={'美式':{list:15,est:12.45,prod:'标准美式 大杯'},'拿铁':{list:17,est:13.9,prod:'拿铁 大杯'}};
+
+// 简单可复现的伪随机，用于生成示例平台价
+let seed=7;function rnd(){seed=(seed*9301+49297)%233280;return seed/233280}
+function demoPrice(base,spread){return Math.round((base+(rnd()-0.5)*spread)*10)/10}
+function cell(p,src,real,time,orig){return p==null?null:{p,src,real,time,orig}}
+function demoPlatforms(baseA,baseL,opts={}){
+  const out={'美式':{},'拿铁':{}};
+  for(const [d,b] of [['美式',baseA],['拿铁',baseL]]){
+    out[d].meituan=cell(demoPrice(b*0.92,3),'手机端·美团外卖',false,DEMO_TIME);
+    out[d].taobao=opts.noTaobao?null:cell(demoPrice(b*0.9,3),'手机端·淘宝闪购',false,DEMO_TIME);
+    out[d].jd=opts.noJd?null:cell(demoPrice(b*0.95,3),'手机端·京东秒送',false,DEMO_TIME);
+    out[d].douyin=opts.noDy?null:cell(demoPrice(b*0.8,2.5),'手机端·抖音团购',false,DEMO_TIME);
+  }
+  return out;
+}
+const cafes=[];
+luckinReal.forEach((s,i)=>{
+  const pr=demoPlatforms(13.5,15.5,{noDy:i%3===1,noJd:i%4===2});
+  for(const d of ['美式','拿铁']) pr[d].official=cell(LUCKIN_PRICE[d].est,'瑞幸官方接口（真实）',true,REAL_TIME,LUCKIN_PRICE[d].list);
+  cafes.push({...s,brand:'瑞幸',realLoc:true,prices:pr,prodNote:'瑞幸官方价：标准美式 / 拿铁，大杯，App 预估到手价（划线为标价）'});
+});
+// 示例门店（位置与价格均为示例）
+const demoShops=[
+ ['库迪咖啡（示例门店A）','库迪',40.0728,116.4188,9.9,12.9,{}],
+ ['库迪咖啡（示例门店B）','库迪',40.0655,116.4238,9.9,12.9,{noJd:true}],
+ ['库迪咖啡（示例门店C）','库迪',40.0790,116.4232,9.9,12.9,{}],
+ ['星巴克（示例门店A）','星巴克',40.0612,116.4170,30,33,{noTaobao:true}],
+ ['星巴克（示例门店B）','星巴克',40.0705,116.4140,30,33,{}],
+ ['Manner Coffee（示例门店）','Manner',40.0600,116.4140,15,20,{noDy:true}],
+ ['幸运咖（示例门店）','幸运咖',40.0745,116.4265,8,10,{noJd:true}],
+ ['独立咖啡馆（示例·街角烘焙）','独立咖啡馆',40.0682,116.4282,22,26,{noTaobao:true,noJd:true}],
+ ['独立咖啡馆（示例·社区小店）','独立咖啡馆',40.0770,116.4110,18,22,{noJd:true}]
+];
+demoShops.forEach(([name,brand,lat,lng,a,l,opts],i)=>{
+  const pr=demoPlatforms(a,l,opts);
+  pr['美式'].official=cell(a,'品牌官方（示例）',false,DEMO_TIME);
+  pr['拿铁'].official=cell(l,'品牌官方（示例）',false,DEMO_TIME);
+  cafes.push({id:'demo'+i,name,brand,addr:'天通苑附近（示例位置，待高德 POI 替换）',lat,lng,hours:'—',realLoc:false,prices:pr,prodNote:'示例价格：大杯美式 / 拿铁'});
+});
+function dist(a,b){const R=6371e3,toR=x=>x*Math.PI/180;const dLat=toR(b[0]-a[0]),dLng=toR(b[1]-a[1]);const h=Math.sin(dLat/2)**2+Math.cos(toR(a[0]))*Math.cos(toR(b[0]))*Math.sin(dLng/2)**2;return 2*R*Math.asin(Math.sqrt(h))}
+cafes.forEach(c=>c.dist=dist(CENTER,[c.lat,c.lng]));
+function cheapest(c,d){let best=null;for(const pf of PLATFORMS){const x=c.prices[d][pf.k];if(x&&(!best||x.p<best.p))best={...x,k:pf.k,n:pf.n}}return best}
+const fmtD=m=>m<1000?Math.round(m)+' m':(m/1000).toFixed(2)+' km';
+const fmtP=p=>'¥'+String(+p.toFixed(2));
+
+// ===== 状态 =====
+const state={drink:'美式',sort:'price',brands:new Set(Object.keys(BRANDS)),sel:null};
+
+// ===== 地图 =====
+const map=L.map('map',{zoomControl:true,attributionControl:true}).setView(CENTER,15);
+L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',{subdomains:['1','2','3','4'],maxZoom:18,attribution:'© 高德地图'}).addTo(map);
+L.circleMarker(CENTER,{radius:7,color:'#fff',weight:3,fillColor:'#e8743b',fillOpacity:1}).addTo(map).bindTooltip('天通苑（中心）',{direction:'top'});
+L.circle(CENTER,{radius:1500,color:'#6b4226',weight:1,dashArray:'4 6',fill:false}).addTo(map);
+const markers={};
+
+function render(){
+  const d=state.drink;
+  let rows=cafes.filter(c=>state.brands.has(c.brand)).map(c=>({c,best:cheapest(c,d)}));
+  rows.sort((a,b)=>state.sort==='price'?(a.best.p-b.best.p||a.c.dist-b.c.dist):(a.c.dist-b.c.dist));
+  // 列表
+  const list=document.getElementById('list');list.innerHTML='';
+  rows.forEach(({c,best})=>{
+    const el=document.createElement('div');el.className='item'+(state.sel===c.id?' sel':'');
+    const b=BRANDS[c.brand];
+    el.innerHTML=`<div class="badge" style="background:${b.c}">${b.s}</div>
+      <div class="info"><div class="name">${c.name}</div><div class="addr">${fmtD(c.dist)} · ${c.addr}</div>
+      <div class="tags">${c.realLoc?'<span class="tag real">位置真实</span><span class="tag real">官方价真实</span><span class="tag demo">平台价示例</span>':'<span class="tag demo">示例数据</span>'}</div></div>
+      <div class="price"><b>${fmtP(best.p)}</b><small>${best.n}</small>${best.real?'':'<small style="color:var(--demo)">示例</small>'}</div>`;
+    el.onclick=()=>select(c.id,true);
+    list.appendChild(el);
+  });
+  const all=rows.map(r=>r.best.p);
+  document.getElementById('summary').innerHTML=rows.length?`共 <b>${rows.length}</b> 家 · ${d}最低 <b style="color:var(--accent)">${fmtP(Math.min(...all))}</b> · 中位 ${fmtP(all.slice().sort((a,b)=>a-b)[Math.floor(all.length/2)])} · 1.5km 范围`:'没有符合条件的门店';
+  // 标记
+  Object.values(markers).forEach(m=>map.removeLayer(m));
+  rows.forEach(({c,best})=>{
+    const b=BRANDS[c.brand];
+    const icon=L.divIcon({className:'pin'+(state.sel===c.id?' sel':''),html:`<div style="--c:${b.c}"><i></i>${fmtP(best.p)}</div>`,iconSize:[0,0]});
+    const m=L.marker([c.lat,c.lng],{icon,zIndexOffset:state.sel===c.id?1000:0,title:c.name}).addTo(map);
+    m.on('click',()=>select(c.id,false));
+    markers[c.id]=m;
+  });
+  if(state.sel)showCard(cafes.find(c=>c.id===state.sel));
+}
+function select(id,pan){state.sel=id;const c=cafes.find(x=>x.id===id);if(pan)map.panTo([c.lat,c.lng]);render()}
+function showCard(c){
+  const card=document.getElementById('card');
+  const tbl=d=>{
+    const best=cheapest(c,d);
+    return `<h3>${d}<span>最低 ${fmtP(best.p)} · ${best.n}</span></h3><table><tr><th>平台</th><th style="text-align:right">价格</th><th>来源</th><th>更新</th></tr>`+
+    PLATFORMS.map(pf=>{const x=c.prices[d][pf.k];
+      if(!x)return `<tr><td>${pf.n}</td><td class="na">未上架</td><td>—</td><td class="t">—</td></tr>`;
+      const isBest=x.p===best.p;
+      return `<tr class="${isBest?'best':''}"><td>${pf.n}${isBest?'<span class="besttag">最低</span>':''}</td><td class="p">${x.orig?`<s>¥${x.orig}</s>`:''}${fmtP(x.p)}</td><td>${x.src} <span class="tag ${x.real?'real':'demo'}">${x.real?'真实':'示例数据'}</span></td><td class="t">${x.time.slice(5)}</td></tr>`}).join('')+'</table>';
+  };
+  card.innerHTML=`<div class="hd"><button class="close" onclick="closeCard()">✕</button><h2>${c.name}</h2>
+   <p>📍 ${c.addr}</p><p>🚶 距天通苑中心 ${fmtD(c.dist)} · 🕘 ${c.hours} ${c.realLoc?'<span class="tag real">位置：瑞幸官方（真实）</span>':'<span class="tag demo">位置：示例</span>'}</p></div>
+   <div class="bd">${tbl('美式')}${tbl('拿铁')}
+   <div class="note">${c.prodNote}。<br>平台价由 AgentReins 手机端按定位在各 App 内<b>只读</b>查看后回传 Hub（当前为示例数据）；全程不下单、不领券、按正常浏览节奏采集。时间为北京时间。</div></div>`;
+  card.classList.add('show');
+}
+function closeCard(){state.sel=null;document.getElementById('card').classList.remove('show');render()}
+
+// ===== 筛选 =====
+const bc=document.getElementById('brandChips');
+Object.keys(BRANDS).forEach(b=>{const s=document.createElement('span');s.className='chip on';s.textContent=b;s.onclick=()=>{state.brands.has(b)?state.brands.delete(b):state.brands.add(b);s.classList.toggle('on');render()};bc.appendChild(s)});
+document.querySelectorAll('[data-drink]').forEach(el=>el.onclick=()=>{document.querySelectorAll('[data-drink]').forEach(e=>e.classList.remove('on'));el.classList.add('on');state.drink=el.dataset.drink;render()});
+document.querySelectorAll('[data-sort]').forEach(el=>el.onclick=()=>{document.querySelectorAll('[data-sort]').forEach(e=>e.classList.remove('on'));el.classList.add('on');state.sort=el.dataset.sort;render()});
+document.getElementById('legend').innerHTML=Object.entries(BRANDS).map(([k,v])=>`<div><i style="background:${v.c}"></i>${k}</div>`).join('')+'<div style="color:#7a6e66;margin-top:2px">标签 = 该店最低价</div>';
+document.getElementById('realTime').textContent='查询于 '+REAL_TIME+' 北京时间';
+
+// ===== 任务流程（模拟）=====
+const flowTexts=['Hub 已下发任务 #CM-TTY-001（天通苑 · 4 个平台）','手机端采集中：美团外卖 → 淘宝闪购 → 京东秒送 → 抖音团购','回传 17 家门店 / 136 条价格到 Hub','地图已更新 · '+DEMO_TIME+'（示例）'];
+function runFlow(final){
+  const steps=[...document.querySelectorAll('.step')];const meta=document.getElementById('flowMeta');
+  if(final){steps.forEach(s=>{s.className='step done'});meta.textContent=flowTexts[3];return}
+  let i=0;steps.forEach(s=>s.className='step');
+  (function tick(){steps.forEach((s,j)=>s.className='step'+(j<i?' done':j===i?' active':''));meta.textContent=flowTexts[i];
+    if(i<3){i++;setTimeout(tick,1100)}else setTimeout(()=>runFlow(true),900)})();
+}
+document.getElementById('replay').onclick=()=>runFlow(false);
+render();
+if(location.hash==='#static'){runFlow(true)}else runFlow(false);
+if(location.hash==='#static'||location.search.includes('demo=card'))select(389043,false);
+</script>
+</body>
+</html>
